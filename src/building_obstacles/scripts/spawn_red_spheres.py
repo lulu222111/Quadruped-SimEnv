@@ -1,18 +1,88 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import rospy
 import random
 import json
+import os
 from gazebo_msgs.srv import SpawnModel, GetModelState
 from geometry_msgs.msg import Pose
 import tf.transformations as tf
 
+BUILDING_CONFIG_PATH = "./building_config.json"
+TRUTH_PATH = "./results/danger_truth.json"
+
+
+def _source_sdf(name, shape, color, radius=None, size=None):
+    color_map = {
+        "red": "1 0 0 1",
+        "green": "0 1 0 1",
+    }
+    material = color_map.get(color, "1 1 1 1")
+    if shape == "sphere":
+        geometry = f"<sphere><radius>{float(radius or 0.15):.3f}</radius></sphere>"
+    elif shape == "box":
+        sx, sy, sz = size or [0.3, 0.3, 0.3]
+        geometry = f"<box><size>{float(sx):.3f} {float(sy):.3f} {float(sz):.3f}</size></box>"
+    else:
+        raise ValueError(f"unsupported source shape: {shape}")
+    return f"""<?xml version="1.0" ?>
+<sdf version="1.6">
+  <model name="{name}">
+    <static>true</static>
+    <link name="link">
+      <collision name="collision"><geometry>{geometry}</geometry></collision>
+      <visual name="visual">
+        <geometry>{geometry}</geometry>
+        <material><ambient>{material}</ambient><diffuse>{material}</diffuse></material>
+      </visual>
+    </link>
+  </model>
+</sdf>"""
+
+
+def _load_truth_sources():
+    truth_path = os.path.join(os.getcwd(), TRUTH_PATH)
+    if not os.path.exists(truth_path):
+        return None
+    with open(truth_path, 'r') as f:
+        truth_data = json.load(f)
+    return truth_data.get("danger_sources", []) + truth_data.get("distraction_sources", [])
+
+
+def _spawn_sources_from_truth(sources):
+    rospy.wait_for_service('/gazebo/spawn_sdf_model')
+    spawn_model = rospy.ServiceProxy('/gazebo/spawn_sdf_model', SpawnModel)
+    spawned = 0
+    for source in sources:
+        pose = Pose()
+        pose.position.x = float(source["position"][0])
+        pose.position.y = float(source["position"][1])
+        pose.position.z = float(source["position"][2])
+        pose.orientation.w = 1.0
+        name = source.get("model_name") or f"source_{source.get('id', spawned)}"
+        sdf = _source_sdf(
+            name,
+            source.get("shape", "sphere"),
+            source.get("color", "red"),
+            radius=source.get("radius"),
+            size=source.get("size"),
+        )
+        try:
+            resp = spawn_model(name, sdf, "", pose, "world")
+            if resp.success:
+                spawned += 1
+            else:
+                rospy.logwarn(f"跳过或生成源 {name} 失败: {resp.status_message}")
+        except rospy.ServiceException as exc:
+            rospy.logerr(f"服务调用失败: {exc}")
+    rospy.loginfo(f"已根据真值文件补生成 {spawned} 个源模型。")
+
 def quaternion_rotate_vector(q, v):
-    """用四元数 q 旋转向量 v"""
     return tf.quaternion_multiply(tf.quaternion_multiply(q, [v[0], v[1], v[2], 0]), tf.quaternion_conjugate(q))[:3]
 
 def get_model_pose(model_name):
-    """获取模型的位姿（位置和四元数）"""
     rospy.wait_for_service('/gazebo/get_model_state')
     try:
         get_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
@@ -26,8 +96,28 @@ def get_model_pose(model_name):
         rospy.logerr(f"服务调用失败: {e}")
         return None
 
+def load_building_config():
+    config_path = os.path.join(os.path.dirname(__file__), '..', '..', BUILDING_CONFIG_PATH)
+    config_path = os.path.normpath(config_path)
+
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    return None
+
+def get_floor_heights_from_config(config):
+    if config and 'floor_heights' in config:
+        return config['floor_heights']
+    return [0.25, 1.75, 3.15, 4.65]
+
+def get_building_bounds_from_config(config):
+    if config and 'building_width' in config and 'building_depth' in config:
+        bw = config['building_width']
+        bd = config['building_depth']
+        return -bw/2 + 0.5, bw/2 - 0.5, -bd/2 + 0.5, bd/2 - 0.5
+    return -3.2, 3.2, -3.2, 3.2
+
 def spawn_red_sphere(name, world_pose):
-    """生成红色球体（危险源）"""
     sphere_sdf = f"""<?xml version="1.0" ?>
 <sdf version="1.6">
   <model name="{name}">
@@ -59,8 +149,6 @@ def spawn_red_sphere(name, world_pose):
         spawn_model = rospy.ServiceProxy('/gazebo/spawn_sdf_model', SpawnModel)
         resp = spawn_model(name, sphere_sdf, "", world_pose, "world")
         if resp.success:
-            # rospy.loginfo(f"成功生成红色球体（危险源） {name} 在 ({world_pose.position.x:.2f}, {world_pose.position.y:.2f}, {world_pose.position.z:.2f})")
-            # rospy.loginfo(f"成功生成红色球体（危险源）")
             pass
         else:
             rospy.logwarn(f"生成红色球体 {name} 失败: {resp.status_message}")
@@ -68,7 +156,6 @@ def spawn_red_sphere(name, world_pose):
         rospy.logerr(f"服务调用失败: {e}")
 
 def spawn_green_sphere(name, world_pose):
-    """生成绿色球体（干扰源）"""
     sphere_sdf = f"""<?xml version="1.0" ?>
 <sdf version="1.6">
   <model name="{name}">
@@ -100,8 +187,6 @@ def spawn_green_sphere(name, world_pose):
         spawn_model = rospy.ServiceProxy('/gazebo/spawn_sdf_model', SpawnModel)
         resp = spawn_model(name, sphere_sdf, "", world_pose, "world")
         if resp.success:
-            # rospy.loginfo(f"成功生成绿色球体（干扰源） {name} 在 ({world_pose.position.x:.2f}, {world_pose.position.y:.2f}, {world_pose.position.z:.2f})")
-            # rospy.loginfo(f"成功生成绿色球体（干扰源）")
             pass
         else:
             rospy.logwarn(f"生成绿色球体 {name} 失败: {resp.status_message}")
@@ -109,7 +194,6 @@ def spawn_green_sphere(name, world_pose):
         rospy.logerr(f"服务调用失败: {e}")
 
 def spawn_red_box(name, world_pose):
-    """生成红色方块（干扰源）"""
     box_sdf = f"""<?xml version="1.0" ?>
 <sdf version="1.6">
   <model name="{name}">
@@ -141,8 +225,6 @@ def spawn_red_box(name, world_pose):
         spawn_model = rospy.ServiceProxy('/gazebo/spawn_sdf_model', SpawnModel)
         resp = spawn_model(name, box_sdf, "", world_pose, "world")
         if resp.success:
-            # rospy.loginfo(f"成功生成红色方块（干扰源） {name} 在 ({world_pose.position.x:.2f}, {world_pose.position.y:.2f}, {world_pose.position.z:.2f})")
-            #  rospy.loginfo(f"成功生成红色方块（干扰源）")
             pass
         else:
             rospy.logwarn(f"生成红色方块 {name} 失败: {resp.status_message}")
@@ -151,63 +233,69 @@ def spawn_red_box(name, world_pose):
 
 def main():
     rospy.init_node('spawn_obstacles_inside')
-
-    # 获取 Buliding 模型的当前位姿（注意拼写）
-    model_name = 'Buliding'
-    model_pose = get_model_pose(model_name)
-    if model_pose is None:
-        rospy.logerr("无法获取模型位姿，退出。")
+    truth_sources = _load_truth_sources()
+    if truth_sources is not None:
+        _spawn_sources_from_truth(truth_sources)
         return
 
-    # 提取位置和四元数
+    config = load_building_config()
+    num_floors = config['num_floors'] if config else 4
+    floor_heights = get_floor_heights_from_config(config)
+    x_min, x_max, y_min, y_max = get_building_bounds_from_config(config)
+
+    model_name = 'HotelBuilding'
+    model_pose = get_model_pose(model_name)
+
+    if model_pose is None:
+        model_name = 'MultiFloorBuilding'
+        model_pose = get_model_pose(model_name)
+        if model_pose is None:
+            model_name = 'Buliding'
+            model_pose = get_model_pose(model_name)
+            if model_pose is None:
+                rospy.logwarn("无法获取建筑模型位姿，使用默认位置 (0,0,0)")
+            from geometry_msgs.msg import Pose
+            model_pose = Pose()
+            model_pose.position.x = 0
+            model_pose.position.y = 0
+            model_pose.position.z = 0
+            model_pose.orientation.w = 1
+
     pos = model_pose.position
     quat = [model_pose.orientation.x, model_pose.orientation.y,
             model_pose.orientation.z, model_pose.orientation.w]
 
-    # rospy.loginfo(f"Buliding 位姿: 位置({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f}), 四元数({quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f})")
+    if not quat or all(q == 0 for q in quat):
+        quat = [0, 0, 0, 1]
 
-    # 定义在模型局部坐标系下的可生成区域（单位：米）
-    floor_heights = [0.25, 1.75, 3.15, 4.65]  # 0.25 + 1.5*(n-1)
-    x_min_local, x_max_local = -3.2, 3.2
-    y_min_local, y_max_local = -3.2, 3.2
-
-    # 随机生成障碍物总数量
     num_obstacles = random.randint(5, 15)
-    # rospy.loginfo(f"将生成 {num_obstacles} 个障碍物（红色球体危险源、绿色球体干扰源、红色方块干扰源）...")
 
-    # 用于保存真值数据的列表
-    danger_sources = []      # 危险源：红色球体
-    distraction_sources = [] # 干扰源：绿色球体 + 红色方块
-    object_id = 0             # 全局唯一ID
+    danger_sources = []
+    distraction_sources = []
+    object_id = 0
 
     for i in range(num_obstacles):
-        # 随机选择楼层（0~3）
-        floor = random.randint(0, 3)
-        z_local = floor_heights[floor]
+        floor = random.randint(0, num_floors - 1)
+        z_local = floor_heights[floor] if floor < len(floor_heights) else floor_heights[-1] + 0.5 * (floor - len(floor_heights) + 1)
 
-        # 随机生成局部坐标
-        x_local = random.uniform(x_min_local, x_max_local)
-        y_local = random.uniform(y_min_local, y_max_local)
+        x_local = random.uniform(x_min, x_max)
+        y_local = random.uniform(y_min, y_max)
 
-        # 将局部坐标转换为世界坐标
         local_vec = [x_local, y_local, z_local]
         world_vec = quaternion_rotate_vector(quat, local_vec)
         world_x = pos.x + world_vec[0]
         world_y = pos.y + world_vec[1]
         world_z = pos.z + world_vec[2]
 
-        # 构造世界坐标系下的位姿
         obstacle_pose = Pose()
         obstacle_pose.position.x = world_x
         obstacle_pose.position.y = world_y
         obstacle_pose.position.z = world_z
         obstacle_pose.orientation.w = 1.0
 
-        # 随机选择障碍物类型：0=红色球体（危险源），1=绿色球体（干扰源），2=红色方块（干扰源）
         obj_type = random.randint(0, 2)
         name_suffix = f"{i}_{random.randint(1000,9999)}"
 
-        # 公共位置信息（相对于机器人出发点，假设为世界原点）
         position = [round(world_x, 2), round(world_y, 2), round(world_z, 2)]
 
         if obj_type == 0:
@@ -242,16 +330,18 @@ def main():
             })
 
         object_id += 1
-        rospy.sleep(0.1)
+        rospy.sleep(0.05)
 
-    rospy.loginfo("所有障碍物生成完毕。")
+    rospy.loginfo(f"所有障碍物生成完毕。共生成 {len(danger_sources)} 个危险源，{len(distraction_sources)} 个干扰源。")
 
-    # 写入真值 JSON 文件
     truth_data = {
+        "num_floors": num_floors,
+        "floor_heights": floor_heights,
         "danger_sources": danger_sources,
         "distraction_sources": distraction_sources
     }
 
+    os.makedirs("./results", exist_ok=True)
     json_filename = "./results/danger_truth.json"
     with open(json_filename, 'w') as f:
         json.dump(truth_data, f, indent=2)

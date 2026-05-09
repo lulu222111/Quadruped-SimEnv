@@ -11,6 +11,8 @@ import json
 import numpy as np
 from scipy.spatial import KDTree, distance
 import sys
+import argparse
+from pathlib import Path
 
 # ==================== 配置区 ====================
 # 请根据实际情况修改以下配置
@@ -67,32 +69,27 @@ def evaluate_detection(truth_positions, detected_positions, threshold, verbose=F
     if m_detected == 0:
         return 0, n_truth, 0
 
-    # 使用 KDTree 进行最近邻匹配
-    tree = KDTree(detected_positions)
+    # 在阈值内按距离从小到大做一对一匹配，避免单个检测点被多个真值重复使用。
+    candidate_pairs = []
+    for truth_idx, truth_pos in enumerate(truth_positions):
+        for detected_idx, detected_pos in enumerate(detected_positions):
+            dist = float(np.linalg.norm(truth_pos - detected_pos))
+            if dist <= threshold:
+                candidate_pairs.append((dist, truth_idx, detected_idx))
+    candidate_pairs.sort(key=lambda item: item[0])
+
     matched_truth = set()
     matched_detected = set()
-
-    # 对每个真值，寻找最近且距离 ≤ 阈值的检测点
-    for i, t_pos in enumerate(truth_positions):
-        dist, idx = tree.query(t_pos)
-        if dist <= threshold:
-            if idx not in matched_detected:
-                matched_truth.add(i)
-                matched_detected.add(idx)
-                if verbose:
-                    print(f"匹配：真值{i} {t_pos} <-> 检测{idx} {detected_positions[idx]}, 距离={dist:.3f}")
-            else:
-                # 该检测点已被其他真值匹配，寻找次近可用点
-                unmatched_indices = [j for j in range(m_detected) if j not in matched_detected]
-                if unmatched_indices:
-                    sub_tree = KDTree(detected_positions[unmatched_indices])
-                    d2, idx2 = sub_tree.query(t_pos)
-                    if d2 <= threshold:
-                        actual_idx = unmatched_indices[idx2]
-                        matched_truth.add(i)
-                        matched_detected.add(actual_idx)
-                        if verbose:
-                            print(f"匹配：真值{i} {t_pos} <-> 检测{actual_idx} {detected_positions[actual_idx]}, 距离={d2:.3f}")
+    for dist, truth_idx, detected_idx in candidate_pairs:
+        if truth_idx in matched_truth or detected_idx in matched_detected:
+            continue
+        matched_truth.add(truth_idx)
+        matched_detected.add(detected_idx)
+        if verbose:
+            print(
+                f"匹配：真值{truth_idx} {truth_positions[truth_idx]} <-> "
+                f"检测{detected_idx} {detected_positions[detected_idx]}, 距离={dist:.3f}"
+            )
 
     correct = len(matched_truth)
     missed = n_truth - correct
@@ -134,11 +131,24 @@ def compute_scores(exploration_time, correct, truth_count, false_alarms, detecte
 
     return time_score, prob_score, far_score
 
-def main():
+def _build_parser():
+    parser = argparse.ArgumentParser(description="Evaluate competition danger-source detection results.")
+    parser.add_argument("--truth-file", default=truth_file)
+    parser.add_argument("--detected-file", default=detected_file)
+    parser.add_argument("--output-file", default="./results/evaluation_result.json")
+    parser.add_argument("--threshold", type=float, default=fixed_threshold)
+    parser.add_argument("--scene-size", type=float)
+    parser.add_argument("--use-scene-ratio", action="store_true", help="Use 5% of scene size instead of fixed threshold.")
+    parser.add_argument("--verbose", action="store_true")
+    return parser
+
+
+def main(argv=None):
+    args = _build_parser().parse_args(argv)
     # 读取真值危险源位置
-    truth_positions = load_positions_from_json(truth_file, 'danger_sources', 'position')
+    truth_positions = load_positions_from_json(args.truth_file, 'danger_sources', 'position')
     # 读取选手检测结果
-    with open(detected_file, 'r') as f:
+    with open(args.detected_file, 'r') as f:
         detected_data = json.load(f)
     # 提取探索时间
     if 'exploration_time' not in detected_data:
@@ -155,15 +165,17 @@ def main():
     detected_positions = np.array(detected_positions, dtype=float)
 
     # 确定阈值
-    if use_fixed_threshold:
-        threshold = fixed_threshold
+    if not args.use_scene_ratio:
+        threshold = args.threshold
         print(f"使用固定阈值 = {threshold:.3f} 米")
     else:
         # 使用场景尺寸的5%
-        if 'scene_size' not in globals():
+        if args.scene_size is None:
             # 如果未定义 scene_size，则根据真值估算
             scene_size = compute_scene_diagonal(truth_positions)
             print(f"未指定 scene_size，根据真值计算场景对角线 = {scene_size:.2f} 米")
+        else:
+            scene_size = args.scene_size
         threshold = scene_size * 0.05
         print(f"使用场景尺寸 {scene_size:.2f} 米，阈值 = {threshold:.3f} 米")
 
@@ -173,7 +185,7 @@ def main():
 
     # 评估检测
     correct, missed, false_alarms = evaluate_detection(
-        truth_positions, detected_positions, threshold, verbose
+        truth_positions, detected_positions, threshold, args.verbose or verbose
     )
     print(f"正确识别数: {correct}")
     print(f"漏报数: {missed}")
@@ -209,6 +221,10 @@ def main():
             "technical_objective_total": round(tech_score, 2)
         }
     }
+    output_path = Path(args.output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"评估结果已保存至: {output_path}")
 
 if __name__ == '__main__':
     main()
