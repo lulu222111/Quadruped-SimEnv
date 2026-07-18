@@ -30,3 +30,7 @@ cmake_install.cmake
 
 # Local setup logs, reports, downloads and temporary files
 /artifacts/
+
+# Local Docker Compose settings
+
+/.env
