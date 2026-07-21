@@ -108,12 +108,16 @@ pkill -f "junior_ctrl" 2>/dev/null || true
 pkill -f "virtual_joy.py" 2>/dev/null || true
 
 echo "Sourcing ROS environment..."
+set +u
 source /opt/ros/noetic/setup.bash
+set -u
 if [ ! -f "$WORKSPACE_DIR/devel/setup.bash" ]; then
   echo "Missing $WORKSPACE_DIR/devel/setup.bash. Run catkin_make in this workspace before starting the simulation." >&2
   exit 1
 fi
+set +u
 source "$WORKSPACE_DIR/devel/setup.bash"
+set -u
 export ROS_PACKAGE_PATH="$WORKSPACE_DIR/src:${ROS_PACKAGE_PATH:-}"
 export CMAKE_PREFIX_PATH="$WORKSPACE_DIR/devel:${CMAKE_PREFIX_PATH:-}"
 export PYTHONPATH="$WORKSPACE_DIR/src/building_generator_classic:$WORKSPACE_DIR/src/building_generator_core:${PYTHONPATH:-}"
@@ -200,6 +204,7 @@ fi
 echo "Launching Gazebo, Unitree A1 model, sensors, and ROS interfaces..."
 roslaunch unitree_guide multi_floor_gazeboSim.launch \
   gui:="$GUI" \
+  debug:="${GAZEBO_DEBUG:-false}" \
   paused:="$PAUSED" \
   user_debug:=False \
   rname:=a1 \

@@ -33,12 +33,8 @@ LivoxOdeMultiRayShape::LivoxOdeMultiRayShape(CollisionPtr _parent)
     dGeomSetCategoryBits((dGeomID) this->raySpaceId, GZ_SENSOR_COLLIDE);
     dGeomSetCollideBits((dGeomID) this->raySpaceId, ~GZ_SENSOR_COLLIDE);
 
-    // These three lines may be unessecary
-    ODELinkPtr pLink =
-        boost::static_pointer_cast<ODELink>(this->collisionParent->GetLink());
-    pLink->SetSpaceId(this->raySpaceId);
-    boost::static_pointer_cast<ODECollision>(this->collisionParent)->SetSpaceId(
-        this->raySpaceId);
+    // Keep the parent link and collision in the world ODE space.
+    // Gazebo 11 assigns only the individual ray collisions to raySpaceId.
 }
 
 //////////////////////////////////////////////////

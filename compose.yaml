@@ -1,0 +1,42 @@
+services:
+  simenv:
+    image: simenv:noetic-cu128
+
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      network: host
+      args:
+        USER_UID: "${LOCAL_UID:-1000}"
+        USER_GID: "${LOCAL_GID:-1000}"
+
+    container_name: simenv-dev
+    hostname: simenv-dev
+
+    extra_hosts:
+      - "simenv-dev:127.0.0.1"
+
+    network_mode: host
+    shm_size: "2gb"
+    init: true
+
+    gpus: all
+
+    environment:
+      DISPLAY: "${SIMENV_DISPLAY:-:1}"
+      XAUTHORITY: /tmp/.Xauthority
+      QT_X11_NO_MITSHM: "1"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+      ROS_HOME: /workspace/SimEnv/artifacts/ros
+
+    volumes:
+      - .:/workspace/SimEnv
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${SIMENV_XAUTHORITY:-/run/user/1000/gdm/Xauthority}:/tmp/.Xauthority:ro
+
+    working_dir: /workspace/SimEnv
+    stdin_open: true
+    tty: true
+
+    command: bash

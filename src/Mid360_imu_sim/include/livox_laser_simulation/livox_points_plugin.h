@@ -6,6 +6,7 @@
 #define SRC_GAZEBO_LIVOX_POINTS_PLUGIN_H
 #include <ros/node_handle.h>
 #include <tf/transform_broadcaster.h>
+#include <gazebo/common/Event.hh>
 #include <gazebo/plugins/RayPlugin.hh>
 #include "livox_ode_multiray_shape.h"
 
@@ -80,6 +81,8 @@ class LivoxPointsPlugin : public RayPlugin {
 
     void SendRosTf(const ignition::math::Pose3d& pose, const std::string& father_frame, const std::string& child_frame);
 
+    void OnWorldUpdateEnd();
+
     boost::shared_ptr<physics::LivoxOdeMultiRayShape> rayShape;
     gazebo::physics::CollisionPtr laserCollision;
     physics::EntityPtr parentEntity;
@@ -98,6 +101,15 @@ class LivoxPointsPlugin : public RayPlugin {
     int64_t currStartIndex = 0;
     int64_t maxPointSize = 1000;
     int64_t downSample = 1;
+
+    // Startup gate: sensor deactivated in Load, re-activated via
+    // WorldUpdateEnd callback after startupDelay_ seconds of sim time
+    // so that robot collision meshes finish loading before ODE ray queries.
+    double startupDelay_ = 1.0;
+    bool activationTimeRecorded_ = false;
+    double activationSimTime_ = 0.0;
+    bool resumeSensorActive_ = false;
+    event::ConnectionPtr startupConnection_;
 
     double maxDist = 400.0;
     double minDist = 0.1;
