@@ -13,6 +13,9 @@ services:
     container_name: simenv-dev
     hostname: simenv-dev
 
+    extra_hosts:
+      - "simenv-dev:127.0.0.1"
+
     network_mode: host
     shm_size: "2gb"
     init: true
