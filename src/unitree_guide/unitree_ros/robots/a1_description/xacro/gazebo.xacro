@@ -357,6 +357,7 @@
                     <downsample>1</downsample>
                     <csv_file_name>package://a1_description/scan_mode/mid360.csv</csv_file_name>
                     <ros_topic>/scan</ros_topic>
+                    <startup_delay>1.0</startup_delay>
                     <frameName>laser_livox</frameName>
                 </plugin>
             </sensor>
