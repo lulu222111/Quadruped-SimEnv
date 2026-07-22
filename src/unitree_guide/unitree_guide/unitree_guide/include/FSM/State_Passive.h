@@ -16,6 +16,7 @@ public:
 
 private:
     bool _simHoldEnabled = false;
+    bool _autoStandDone = false;
     void setSimDownCommand();
 };
 

@@ -46,6 +46,25 @@ float readStandSettleDuration()
     return duration;
 }
 
+bool autoCmdVelEnabled()
+{
+#ifdef COMPILE_WITH_SIMULATION
+    static const bool enabled = []() -> bool {
+        const char *envValue = std::getenv("UNITREE_AUTO_CMD_VEL");
+        if(envValue == nullptr || envValue[0] == '\0'){
+            return false;
+        }
+        std::string value(envValue);
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return !(value == "0" || value == "false" || value == "no" || value == "off");
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
 float smoothStep(float value)
 {
     if(value <= 0.0f){
@@ -171,6 +190,11 @@ FSMStateName State_FixedStand::checkChange(){
 #endif  // COMPILE_WITH_MOVE_BASE
     else if(_lowState->userCmd == UserCommand::RL ||
             _lowState->userCmd == UserCommand::RL_KEYBOARD){
+        return FSMStateName::RL;
+    }
+    else if(autoCmdVelEnabled() && _percent >= 1.0f){
+        std::cout << "[INFO] UNITREE_AUTO_CMD_VEL: stand complete, "
+                     "auto-entering RL /cmd_vel mode." << std::endl;
         return FSMStateName::RL;
     }
     else{
