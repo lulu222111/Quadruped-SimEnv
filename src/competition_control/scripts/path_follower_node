@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""path_follower_node — execute a planned path by publishing to /competition/raw_cmd_vel.
+
+SKELETON ONLY — algorithm not implemented.
+
+This node publishes to /competition/raw_cmd_vel ONLY, never directly to /cmd_vel.
+The cmd_vel_guard_node is the sole publisher of /cmd_vel.
+"""
+
+from __future__ import annotations
+
+import rospy
+import geometry_msgs.msg
+from competition_interfaces.msg import ModuleStatus
+
+
+def main():
+    rospy.init_node("path_follower", log_level=rospy.INFO)
+
+    # Publisher for raw velocity (NOT /cmd_vel!)
+    raw_vel_pub = rospy.Publisher(
+        "/competition/raw_cmd_vel", geometry_msgs.msg.Twist, queue_size=1
+    )
+    status_pub = rospy.Publisher(
+        "/competition/control/status", ModuleStatus, queue_size=10, latch=True
+    )
+
+    rospy.loginfo(
+        "path_follower_node: skeleton only / algorithm not implemented. "
+        "Publishing zero velocity to /competition/raw_cmd_vel."
+    )
+
+    rate = rospy.Rate(10)  # 10 Hz
+    while not rospy.is_shutdown():
+        # Always publish zero velocity (safe default)
+        cmd = geometry_msgs.msg.Twist()
+        cmd.linear.x = 0.0
+        cmd.linear.y = 0.0
+        cmd.angular.z = 0.0
+        raw_vel_pub.publish(cmd)
+
+        msg = ModuleStatus()
+        msg.header.stamp = rospy.Time.now()
+        msg.state = ModuleStatus.STARTING
+        msg.valid = False
+        msg.confidence = 0.0
+        msg.detail = "skeleton only / algorithm not implemented"
+        status_pub.publish(msg)
+
+        rate.sleep()
+
+
+if __name__ == "__main__":
+    main()

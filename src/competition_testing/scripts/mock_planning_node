@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""mock_planning_node — publish synthetic navigation goals for integration testing.
+
+ALL data is hard-coded. Requires test_mode=true.
+"""
+
+from __future__ import annotations
+
+import sys
+
+import rospy
+import geometry_msgs.msg
+import nav_msgs.msg
+from competition_interfaces.msg import ModuleStatus
+
+
+# Hard-coded exploration waypoints in world frame
+MOCK_WAYPOINTS = [
+    (2.0, 0.0, 0.0),
+    (4.0, 0.0, 0.0),
+    (4.0, 2.0, 0.0),
+    (0.0, 2.0, 0.0),
+    (0.0, 0.0, 0.0),
+    (2.0, 4.0, 0.0),
+]
+
+
+def main():
+    rospy.init_node("mock_planning", log_level=rospy.INFO)
+
+    test_mode = rospy.get_param("/competition_loop/competition_mode", True)
+    if not test_mode:
+        rospy.logerr("mock_planning: test_mode=false, refusing to run!")
+        sys.exit(1)
+
+    rospy.loginfo("mock_planning: publishing synthetic goals (TEST MODE ONLY).")
+
+    goal_pub = rospy.Publisher(
+        "/competition/navigation_goal", geometry_msgs.msg.PoseStamped, queue_size=10
+    )
+    path_pub = rospy.Publisher(
+        "/competition/path", nav_msgs.msg.Path, queue_size=10
+    )
+    status_pub = rospy.Publisher(
+        "/competition/planning/status", ModuleStatus, queue_size=10, latch=True
+    )
+
+    status = ModuleStatus()
+    status.header.stamp = rospy.Time.now()
+    status.state = ModuleStatus.RUNNING
+    status.valid = True
+    status.confidence = 1.0
+    status.detail = "mock planning (test mode only)"
+    status_pub.publish(status)
+
+    rate = rospy.Rate(0.2)  # 0.2 Hz — slow rotation through waypoints
+    idx = 0
+    while not rospy.is_shutdown():
+        x, y, z = MOCK_WAYPOINTS[idx % len(MOCK_WAYPOINTS)]
+
+        goal = geometry_msgs.msg.PoseStamped()
+        goal.header.stamp = rospy.Time.now()
+        goal.header.frame_id = "world"
+        goal.pose.position.x = x
+        goal.pose.position.y = y
+        goal.pose.position.z = z
+        goal.pose.orientation.w = 1.0
+        goal_pub.publish(goal)
+
+        # Also publish a trivial path
+        path = nav_msgs.msg.Path()
+        path.header.stamp = rospy.Time.now()
+        path.header.frame_id = "world"
+        p0 = geometry_msgs.msg.PoseStamped()
+        p0.header.frame_id = "world"
+        p0.pose.position.x = 0.0
+        p0.pose.position.y = -3.2
+        p0.pose.position.z = 0.0
+        p0.pose.orientation.w = 1.0
+        p1 = geometry_msgs.msg.PoseStamped()
+        p1.header.frame_id = "world"
+        p1.pose.position.x = x
+        p1.pose.position.y = y
+        p1.pose.position.z = z
+        p1.pose.orientation.w = 1.0
+        path.poses = [p0, p1]
+        path_pub.publish(path)
+
+        idx += 1
+        rate.sleep()
+
+
+if __name__ == "__main__":
+    main()

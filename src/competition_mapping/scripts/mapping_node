@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""mapping_node — occupancy grid mapping from Livox point clouds.
+
+SKELETON ONLY — algorithm not implemented.
+
+Dependencies:
+  - Legitimate localization (/competition/localization/odom)
+  - Point cloud input (/scan or /livox/Pointcloud2)
+  - TF tree
+
+Forbidden:
+  Ground truth topics
+  scene_manifest.json or layout_metadata.json for map priors
+"""
+
+from __future__ import annotations
+
+import rospy
+from competition_interfaces.msg import ModuleStatus
+
+
+def main():
+    rospy.init_node("mapping_node", log_level=rospy.INFO)
+
+    status_pub = rospy.Publisher(
+        "/competition/mapping/status", ModuleStatus, queue_size=10, latch=True
+    )
+
+    rospy.loginfo(
+        "mapping_node: skeleton only / algorithm not implemented. "
+        "Publishing ModuleStatus(state=STARTING, valid=false)."
+    )
+
+    rate = rospy.Rate(1)
+    while not rospy.is_shutdown():
+        msg = ModuleStatus()
+        msg.header.stamp = rospy.Time.now()
+        msg.state = ModuleStatus.STARTING
+        msg.valid = False
+        msg.confidence = 0.0
+        msg.detail = "skeleton only / algorithm not implemented"
+        status_pub.publish(msg)
+        rate.sleep()
+
+
+if __name__ == "__main__":
+    main()

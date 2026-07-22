@@ -1,0 +1,76 @@
+<launch>
+  <!--
+    competition_system.launch — unified competition system startup.
+
+    Competition mode (default):
+      roslaunch competition_bringup competition_system.launch
+
+    Test mode (with mock inputs):
+      roslaunch competition_bringup competition_system.launch competition_mode:=false use_mocks:=true
+
+    Recommended environment for competition mode:
+      ENABLE_GROUND_TRUTH=false
+      ENABLE_REFEREE_ODOM=false
+      WRITE_GENERATED_TRUTH_COPY=0
+      UNITREE_AUTO_CMD_VEL=1
+      CONTROLLER_FOREGROUND=0
+  -->
+
+  <!-- === Parameters === -->
+  <arg name="competition_mode" default="true" />
+  <arg name="use_mocks" default="false" />
+  <arg name="auto_start" default="true" />
+
+  <rosparam command="load" file="$(find competition_bringup)/config/default.yaml" />
+
+  <!-- Override competition_mode and auto_start from launch args -->
+  <param name="/competition_loop/competition_mode" value="$(arg competition_mode)" />
+  <param name="/competition_loop/auto_start" value="$(arg auto_start)" />
+
+  <!-- === Competition Loop (state machine) === -->
+  <node pkg="competition_loop" type="competition_loop_node" name="competition_loop"
+        output="screen" respawn="false">
+    <param name="max_time" value="600.0" />
+    <param name="start_delay" value="5.0" />
+    <param name="auto_start" value="$(arg auto_start)" />
+    <param name="competition_mode" value="$(arg competition_mode)" />
+  </node>
+
+  <!-- === cmd_vel Guard (safety gateway — ALWAYS start) === -->
+  <node pkg="competition_control" type="cmd_vel_guard_node" name="cmd_vel_guard"
+        output="screen" respawn="true">
+    <param name="cmd_vel_timeout" value="0.5" />
+    <param name="max_linear_x" value="0.5" />
+    <param name="max_linear_y" value="0.3" />
+    <param name="max_angular_z" value="1.0" />
+  </node>
+
+  <!-- === Mock subsystem (test mode only) === -->
+  <group if="$(arg use_mocks)">
+    <include file="$(find competition_testing)/launch/mock_system.launch" />
+  </group>
+
+  <!-- === Production modules (competition mode or when mocks disabled) === -->
+  <group unless="$(arg use_mocks)">
+    <!-- Localization -->
+    <node pkg="competition_localization" type="localization_node" name="localization"
+          output="screen" respawn="true" />
+
+    <!-- Perception -->
+    <node pkg="competition_perception" type="perception_node" name="perception"
+          output="screen" respawn="true" />
+
+    <!-- Mapping -->
+    <node pkg="competition_mapping" type="mapping_node" name="mapping"
+          output="screen" respawn="true" />
+
+    <!-- Planning -->
+    <node pkg="competition_planning" type="planning_node" name="planning"
+          output="screen" respawn="true" />
+
+    <!-- Path follower (skeleton) -->
+    <node pkg="competition_control" type="path_follower_node" name="path_follower"
+          output="screen" respawn="true" />
+  </group>
+
+</launch>
