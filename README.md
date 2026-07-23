@@ -54,6 +54,22 @@ ENABLE_SENSOR_DATA=0 ENABLE_REALSENSE=1 ./auto.sh
 ENABLE_SENSOR_DATA=0 ENABLE_LIVOX=1 ./auto.sh
 ```
 
+## 自动启动
+
+默认情况下，`junior_ctrl` 启动后需要人工按键 `2`（站立）再按键 `6`（进入 `/cmd_vel` 模式）。设置以下环境变量可启用全自动启动，便于无人值守的闭环测试：
+
+```bash
+UNITREE_AUTO_CMD_VEL=1 ./auto.sh
+```
+
+**行为说明**:
+- 开启后，控制器在 Gazebo joint 反馈就绪后自动完成站立并进入 `/cmd_vel` 模式。
+- 自动站立仅在控制器进程生命周期内触发一次；若机器人摔倒后安全保护切回趴下状态，不会自动重复站立。
+- 人工按键 `2` 和 `6` 的优先级高于自动流程，随时可手动接管。
+- 不设置该变量或设为 `0`、`false`、`no`、`off` 时，行为保持原样。
+
+> **安全限制**: `UNITREE_AUTO_CMD_VEL` 仅在 `COMPILE_WITH_SIMULATION`（Gazebo 仿真）构建目标中生效。非仿真构建（实体机器人）中该功能被编译期硬禁用，即使设置环境变量也不会自动站立或进入 `/cmd_vel` 模式。
+
 ## 算法接口
 
 | 接口 | 类型 | 用途 |

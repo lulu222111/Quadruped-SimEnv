@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""localization_node — robot pose estimation using allowed sensors only.
+
+SKELETON ONLY — algorithm not implemented.
+
+Allowed inputs:
+  /trunk_imu     (sensor_msgs/Imu)
+  /livox/imu     (sensor_msgs/Imu)
+  /scan          (sensor_msgs/PointCloud)
+  /livox/Pointcloud2 (sensor_msgs/PointCloud2)
+
+Forbidden inputs (must never subscribe):
+  /Odometry_gazebo
+  /ground_truth/base_w
+  /ground_truth/base_trunk
+  /ground_truth/FL_foot, FR_foot, RL_foot, RR_foot
+  Gazebo get_model_state service
+  Any file under results/ or generated_building/ except team_scene_info.json
+
+This skeleton publishes only ModuleStatus with state=STARTING, valid=false.
+It does NOT publish fake odometry or pose estimates.
+"""
+
+from __future__ import annotations
+
+import rospy
+from competition_interfaces.msg import ModuleStatus
+
+
+def main():
+    rospy.init_node("localization_node", log_level=rospy.INFO)
+
+    status_pub = rospy.Publisher(
+        "/competition/localization/status", ModuleStatus, queue_size=10, latch=True
+    )
+
+    rospy.loginfo(
+        "localization_node: skeleton only / algorithm not implemented. "
+        "Publishing ModuleStatus(state=STARTING, valid=false)."
+    )
+
+    rate = rospy.Rate(1)  # 1 Hz status heartbeat
+    while not rospy.is_shutdown():
+        msg = ModuleStatus()
+        msg.header.stamp = rospy.Time.now()
+        msg.state = ModuleStatus.STARTING
+        msg.valid = False
+        msg.confidence = 0.0
+        msg.detail = "skeleton only / algorithm not implemented"
+        status_pub.publish(msg)
+        rate.sleep()
+
+
+if __name__ == "__main__":
+    main()

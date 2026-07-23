@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""planning_node — frontier extraction, exploration goal selection, path planning.
+
+SKELETON ONLY — algorithm not implemented.
+
+Dependencies:
+  - /competition/map          (nav_msgs/OccupancyGrid)
+  - /competition/localization/odom  (nav_msgs/Odometry)
+
+Forbidden:
+  layout_metadata.json for room/goal locations
+  danger_truth.json for source positions
+"""
+
+from __future__ import annotations
+
+import rospy
+from competition_interfaces.msg import ModuleStatus
+
+
+def main():
+    rospy.init_node("planning_node", log_level=rospy.INFO)
+
+    status_pub = rospy.Publisher(
+        "/competition/planning/status", ModuleStatus, queue_size=10, latch=True
+    )
+
+    rospy.loginfo(
+        "planning_node: skeleton only / algorithm not implemented. "
+        "Publishing ModuleStatus(state=STARTING, valid=false)."
+    )
+
+    rate = rospy.Rate(1)
+    while not rospy.is_shutdown():
+        msg = ModuleStatus()
+        msg.header.stamp = rospy.Time.now()
+        msg.state = ModuleStatus.STARTING
+        msg.valid = False
+        msg.confidence = 0.0
+        msg.detail = "skeleton only / algorithm not implemented"
+        status_pub.publish(msg)
+        rate.sleep()
+
+
+if __name__ == "__main__":
+    main()

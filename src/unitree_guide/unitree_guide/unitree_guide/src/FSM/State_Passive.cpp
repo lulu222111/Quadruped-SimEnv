@@ -21,6 +21,25 @@ bool simPassiveHoldEnabled()
     return !(value == "0" || value == "false" || value == "no" || value == "off");
 }
 
+bool autoCmdVelEnabled()
+{
+#ifdef COMPILE_WITH_SIMULATION
+    static const bool enabled = []() -> bool {
+        const char *envValue = std::getenv("UNITREE_AUTO_CMD_VEL");
+        if(envValue == nullptr || envValue[0] == '\0'){
+            return false;
+        }
+        std::string value(envValue);
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return !(value == "0" || value == "false" || value == "no" || value == "off");
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
 const float downPos[12] = {-0.35f, 1.36f, -2.65f, 0.35f, 1.36f, -2.65f,
                            -0.50f, 1.36f, -2.65f, 0.50f, 1.36f, -2.65f};
 }
@@ -76,6 +95,13 @@ void State_Passive::exit(){
 
 FSMStateName State_Passive::checkChange(){
     if(_lowState->userCmd == UserCommand::L2_A){
+        return FSMStateName::FIXEDSTAND;
+    }
+    else if(autoCmdVelEnabled() && !_autoStandDone){
+        _autoStandDone = true;
+        std::cout << "[INFO] UNITREE_AUTO_CMD_VEL: auto-entering fixed stand "
+                     "(one-shot; will not repeat after fall or passive re-entry)."
+                  << std::endl;
         return FSMStateName::FIXEDSTAND;
     }
     else{
