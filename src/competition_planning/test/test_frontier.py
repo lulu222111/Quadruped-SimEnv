@@ -12,6 +12,7 @@ from frontier import (  # noqa: E402
     cluster_frontier_cells,
     extract_frontier_cells,
     grid_cell_to_world,
+    select_best_frontier_cluster,
     select_frontier_representative,
 )
 
@@ -179,6 +180,71 @@ class GridCellToWorldTest(unittest.TestCase):
     def test_rejects_non_positive_resolution(self):
         with self.assertRaises(ValueError):
             grid_cell_to_world((0, 0), resolution=0.0)
+
+class SelectBestFrontierClusterTest(unittest.TestCase):
+    def test_prefers_nearby_cluster_when_sizes_are_equal(self):
+        near_cluster = [(1, 0), (1, 1)]
+        far_cluster = [(10, 0), (10, 1)]
+
+        selected = select_best_frontier_cluster(
+            [far_cluster, near_cluster],
+            robot_cell=(0, 0),
+        )
+
+        self.assertEqual(selected, near_cluster)
+
+    def test_can_prefer_larger_cluster(self):
+        small_cluster = [(1, 0)]
+        large_cluster = [
+            (4, 0),
+            (4, 1),
+            (4, 2),
+            (5, 0),
+            (5, 1),
+            (5, 2),
+        ]
+
+        selected = select_best_frontier_cluster(
+            [small_cluster, large_cluster],
+            robot_cell=(0, 0),
+            size_weight=2.0,
+            distance_weight=1.0,
+        )
+
+        self.assertEqual(selected, large_cluster)
+
+    def test_returns_none_when_no_clusters_exist(self):
+        selected = select_best_frontier_cluster(
+            [],
+            robot_cell=(0, 0),
+        )
+
+        self.assertIsNone(selected)
+
+    def test_ignores_empty_clusters(self):
+        valid_cluster = [(2, 2)]
+
+        selected = select_best_frontier_cluster(
+            [[], valid_cluster],
+            robot_cell=(0, 0),
+        )
+
+        self.assertEqual(selected, valid_cluster)
+
+    def test_rejects_negative_weights(self):
+        with self.assertRaises(ValueError):
+            select_best_frontier_cluster(
+                [[(1, 1)]],
+                robot_cell=(0, 0),
+                size_weight=-1.0,
+            )
+
+        with self.assertRaises(ValueError):
+            select_best_frontier_cluster(
+                [[(1, 1)]],
+                robot_cell=(0, 0),
+                distance_weight=-1.0,
+            )
 
 if __name__ == "__main__":
     unittest.main()

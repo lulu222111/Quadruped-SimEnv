@@ -152,3 +152,49 @@ def grid_cell_to_world(
     )
 
     return world_x, world_y
+
+def select_best_frontier_cluster(
+    clusters,
+    robot_cell,
+    size_weight=1.0,
+    distance_weight=1.0,
+):
+    """Select a frontier cluster by balancing size and travel distance."""
+    if size_weight < 0.0:
+        raise ValueError("size_weight must not be negative")
+    if distance_weight < 0.0:
+        raise ValueError("distance_weight must not be negative")
+    if not clusters:
+        return None
+
+    from math import hypot
+
+    robot_x, robot_y = robot_cell
+    candidates = []
+
+    for cluster in clusters:
+        if not cluster:
+            continue
+
+        representative = select_frontier_representative(cluster)
+        distance = hypot(
+            representative[0] - robot_x,
+            representative[1] - robot_y,
+        )
+        score = size_weight * len(cluster) - distance_weight * distance
+
+        candidates.append(
+            (
+                -score,
+                distance,
+                representative[0],
+                representative[1],
+                cluster,
+            )
+        )
+
+    if not candidates:
+        return None
+
+    candidates.sort()
+    return candidates[0][4]
