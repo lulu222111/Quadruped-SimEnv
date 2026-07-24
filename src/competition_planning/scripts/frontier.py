@@ -65,3 +65,42 @@ def extract_frontier_cells(
                     break
 
     return frontier_cells
+
+def cluster_frontier_cells(frontier_cells, min_size=1):
+    """Group 8-connected frontier cells and discard undersized groups."""
+    if min_size < 1:
+        raise ValueError("min_size must be at least 1")
+
+    remaining = set(frontier_cells)
+    clusters = []
+
+    neighbor_offsets = (
+        (-1, -1), (0, -1), (1, -1),
+        (-1, 0),           (1, 0),
+        (-1, 1),  (0, 1),  (1, 1),
+    )
+
+    while remaining:
+        start = min(remaining)
+        remaining.remove(start)
+
+        stack = [start]
+        cluster = []
+
+        while stack:
+            cell = stack.pop()
+            cluster.append(cell)
+            x, y = cell
+
+            for dx, dy in neighbor_offsets:
+                neighbor = (x + dx, y + dy)
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    stack.append(neighbor)
+
+        cluster.sort()
+        if len(cluster) >= min_size:
+            clusters.append(cluster)
+
+    clusters.sort(key=lambda cluster: cluster[0])
+    return clusters

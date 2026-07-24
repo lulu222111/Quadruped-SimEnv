@@ -9,7 +9,7 @@ PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS_DIR = os.path.join(PACKAGE_DIR, "scripts")
 sys.path.insert(0, SCRIPTS_DIR)
 
-from frontier import extract_frontier_cells
+from frontier import cluster_frontier_cells, extract_frontier_cells
 
 
 class ExtractFrontierCellsTest(unittest.TestCase):
@@ -59,6 +59,41 @@ class ExtractFrontierCellsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             extract_frontier_cells([0, 0, 0], width=2, height=2)
 
+class ClusterFrontierCellsTest(unittest.TestCase):
+    def test_groups_adjacent_cells(self):
+        cells = [(1, 1), (2, 1), (2, 2)]
+
+        clusters = cluster_frontier_cells(cells)
+
+        self.assertEqual(clusters, [[(1, 1), (2, 1), (2, 2)]])
+
+    def test_uses_eight_connected_neighbors(self):
+        cells = [(1, 1), (2, 2)]
+
+        clusters = cluster_frontier_cells(cells)
+
+        self.assertEqual(clusters, [[(1, 1), (2, 2)]])
+
+    def test_keeps_separate_regions_separate(self):
+        cells = [(1, 1), (2, 1), (10, 10), (11, 10)]
+
+        clusters = cluster_frontier_cells(cells)
+
+        self.assertEqual(
+            clusters,
+            [[(1, 1), (2, 1)], [(10, 10), (11, 10)]],
+        )
+
+    def test_filters_clusters_smaller_than_minimum(self):
+        cells = [(1, 1), (2, 1), (10, 10)]
+
+        clusters = cluster_frontier_cells(cells, min_size=2)
+
+        self.assertEqual(clusters, [[(1, 1), (2, 1)]])
+
+    def test_rejects_invalid_minimum_size(self):
+        with self.assertRaises(ValueError):
+            cluster_frontier_cells([], min_size=0)
 
 if __name__ == "__main__":
     unittest.main()
