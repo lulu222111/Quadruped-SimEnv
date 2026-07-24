@@ -1,45 +1,278 @@
 #!/usr/bin/env python3
-"""planning_node — frontier extraction, exploration goal selection, path planning.
 
-SKELETON ONLY — algorithm not implemented.
-
-Dependencies:
-  - /competition/map          (nav_msgs/OccupancyGrid)
-  - /competition/localization/odom  (nav_msgs/Odometry)
-
-Forbidden:
-  layout_metadata.json for room/goal locations
-  danger_truth.json for source positions
-"""
+"""ROS node for frontier exploration and grid-based path planning."""
 
 from __future__ import annotations
 
+from math import atan2, ceil
+
 import rospy
 from competition_interfaces.msg import ModuleStatus
+from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
+
+from frontier import grid_cell_to_world, world_to_grid_cell
+from planning_core import plan_to_frontier
+
+
+def quaternion_to_yaw(quaternion):
+    """Return planar yaw from a geometry_msgs Quaternion."""
+    sin_yaw = 2.0 * (
+        quaternion.w * quaternion.z
+        + quaternion.x * quaternion.y
+    )
+    cos_yaw = 1.0 - 2.0 * (
+        quaternion.y * quaternion.y
+        + quaternion.z * quaternion.z
+    )
+    return atan2(sin_yaw, cos_yaw)
+
+
+class PlanningNode:
+    def __init__(self):
+        self.map_msg = None
+        self.odom_msg = None
+
+        self.frontier_min_size = int(
+            rospy.get_param("~frontier_min_size", 5)
+        )
+        self.replan_interval = float(
+            rospy.get_param("~replan_interval", 2.0)
+        )
+        self.inflation_radius = float(
+            rospy.get_param("~inflation_radius", 0.25)
+        )
+        self.size_weight = float(
+            rospy.get_param("~size_weight", 1.0)
+        )
+        self.distance_weight = float(
+            rospy.get_param("~distance_weight", 1.0)
+        )
+        self.obstacle_threshold = int(
+            rospy.get_param("~obstacle_threshold", 50)
+        )
+
+        if self.replan_interval <= 0.0:
+            raise ValueError("replan_interval must be positive")
+        if self.inflation_radius < 0.0:
+            raise ValueError("inflation_radius must not be negative")
+
+        self.status_pub = rospy.Publisher(
+            "/competition/planning/status",
+            ModuleStatus,
+            queue_size=10,
+            latch=True,
+        )
+        self.goal_pub = rospy.Publisher(
+            "/competition/navigation_goal",
+            PoseStamped,
+            queue_size=1,
+            latch=True,
+        )
+        self.path_pub = rospy.Publisher(
+            "/competition/path",
+            Path,
+            queue_size=1,
+            latch=True,
+        )
+
+        self.map_sub = rospy.Subscriber(
+            "/competition/map",
+            OccupancyGrid,
+            self.map_callback,
+            queue_size=1,
+        )
+        self.odom_sub = rospy.Subscriber(
+            "/competition/localization/odom",
+            Odometry,
+            self.odom_callback,
+            queue_size=1,
+        )
+
+        self.timer = rospy.Timer(
+            rospy.Duration(self.replan_interval),
+            self.plan_callback,
+        )
+
+        self.publish_status(
+            ModuleStatus.STARTING,
+            False,
+            0.0,
+            "waiting for map and localization",
+        )
+
+        rospy.loginfo(
+            "planning_node started: waiting for "
+            "/competition/map and "
+            "/competition/localization/odom"
+        )
+
+    def map_callback(self, msg):
+        self.map_msg = msg
+
+    def odom_callback(self, msg):
+        self.odom_msg = msg
+
+    def publish_status(self, state, valid, confidence, detail):
+        msg = ModuleStatus()
+        msg.header.stamp = rospy.Time.now()
+        msg.state = state
+        msg.valid = valid
+        msg.confidence = confidence
+        msg.detail = detail
+        self.status_pub.publish(msg)
+
+    def plan_callback(self, _event):
+        map_msg = self.map_msg
+        odom_msg = self.odom_msg
+
+        if map_msg is None or odom_msg is None:
+            missing = []
+            if map_msg is None:
+                missing.append("map")
+            if odom_msg is None:
+                missing.append("localization")
+
+            self.publish_status(
+                ModuleStatus.STARTING,
+                False,
+                0.0,
+                "waiting for " + " and ".join(missing),
+            )
+            return
+
+        try:
+            self.plan_and_publish(map_msg, odom_msg)
+        except (TypeError, ValueError) as error:
+            rospy.logerr_throttle(
+                5.0,
+                "planning failed: %s",
+                str(error),
+            )
+            self.publish_status(
+                ModuleStatus.FAILED,
+                False,
+                0.0,
+                str(error),
+            )
+
+    def plan_and_publish(self, map_msg, odom_msg):
+        info = map_msg.info
+
+        if info.resolution <= 0.0:
+            raise ValueError("map resolution must be positive")
+
+        origin = info.origin
+        origin_yaw = quaternion_to_yaw(origin.orientation)
+
+        robot_position = odom_msg.pose.pose.position
+        robot_cell = world_to_grid_cell(
+            (robot_position.x, robot_position.y),
+            resolution=info.resolution,
+            origin_x=origin.position.x,
+            origin_y=origin.position.y,
+            origin_yaw=origin_yaw,
+        )
+
+        inflation_radius_cells = int(
+            ceil(self.inflation_radius / info.resolution)
+        )
+
+        result = plan_to_frontier(
+            list(map_msg.data),
+            width=info.width,
+            height=info.height,
+            robot_cell=robot_cell,
+            min_frontier_size=self.frontier_min_size,
+            inflation_radius_cells=inflation_radius_cells,
+            size_weight=self.size_weight,
+            distance_weight=self.distance_weight,
+            obstacle_threshold=self.obstacle_threshold,
+        )
+
+        if result is None:
+            rospy.logwarn_throttle(
+                5.0,
+                "planning_node: no reachable frontier",
+            )
+            self.publish_status(
+                ModuleStatus.BLOCKED,
+                False,
+                0.0,
+                "no reachable frontier",
+            )
+            return
+
+        frame_id = map_msg.header.frame_id or "map"
+        stamp = rospy.Time.now()
+
+        goal_msg = self.make_pose(
+            result["goal_cell"],
+            info,
+            origin_yaw,
+            frame_id,
+            stamp,
+        )
+
+        path_msg = Path()
+        path_msg.header.stamp = stamp
+        path_msg.header.frame_id = frame_id
+        path_msg.poses = [
+            self.make_pose(
+                cell,
+                info,
+                origin_yaw,
+                frame_id,
+                stamp,
+            )
+            for cell in result["path"]
+        ]
+
+        self.goal_pub.publish(goal_msg)
+        self.path_pub.publish(path_msg)
+
+        detail = (
+            "planned path with {} poses to frontier {}; "
+            "{} frontier cells detected"
+        ).format(
+            len(result["path"]),
+            result["goal_cell"],
+            result["frontier_count"],
+        )
+
+        self.publish_status(
+            ModuleStatus.RUNNING,
+            True,
+            1.0,
+            detail,
+        )
+
+        rospy.loginfo_throttle(5.0, detail)
+
+    @staticmethod
+    def make_pose(cell, info, origin_yaw, frame_id, stamp):
+        world_x, world_y = grid_cell_to_world(
+            cell,
+            resolution=info.resolution,
+            origin_x=info.origin.position.x,
+            origin_y=info.origin.position.y,
+            origin_yaw=origin_yaw,
+        )
+
+        pose = PoseStamped()
+        pose.header.stamp = stamp
+        pose.header.frame_id = frame_id
+        pose.pose.position.x = world_x
+        pose.pose.position.y = world_y
+        pose.pose.position.z = 0.0
+        pose.pose.orientation.w = 1.0
+        return pose
 
 
 def main():
     rospy.init_node("planning_node", log_level=rospy.INFO)
-
-    status_pub = rospy.Publisher(
-        "/competition/planning/status", ModuleStatus, queue_size=10, latch=True
-    )
-
-    rospy.loginfo(
-        "planning_node: skeleton only / algorithm not implemented. "
-        "Publishing ModuleStatus(state=STARTING, valid=false)."
-    )
-
-    rate = rospy.Rate(1)
-    while not rospy.is_shutdown():
-        msg = ModuleStatus()
-        msg.header.stamp = rospy.Time.now()
-        msg.state = ModuleStatus.STARTING
-        msg.valid = False
-        msg.confidence = 0.0
-        msg.detail = "skeleton only / algorithm not implemented"
-        status_pub.publish(msg)
-        rate.sleep()
+    PlanningNode()
+    rospy.spin()
 
 
 if __name__ == "__main__":
