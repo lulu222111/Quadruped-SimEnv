@@ -107,3 +107,55 @@ def astar_path(
             )
 
     return None
+
+def inflate_obstacles(
+    data,
+    width,
+    height,
+    radius_cells,
+    obstacle_threshold=50,
+    inflated_value=100,
+):
+    """Expand occupied cells by a circular safety radius."""
+    if width <= 0 or height <= 0:
+        raise ValueError("width and height must be positive")
+    if len(data) != width * height:
+        raise ValueError("grid data length does not match width * height")
+    if radius_cells < 0:
+        raise ValueError("radius_cells must not be negative")
+    if obstacle_threshold <= 0:
+        raise ValueError("obstacle_threshold must be positive")
+
+    inflated = list(data)
+
+    obstacle_cells = []
+    for y in range(height):
+        for x in range(width):
+            value = data[y * width + x]
+            if value >= obstacle_threshold:
+                obstacle_cells.append((x, y))
+
+    radius_squared = radius_cells * radius_cells
+
+    for obstacle_x, obstacle_y in obstacle_cells:
+        for offset_y in range(-radius_cells, radius_cells + 1):
+            for offset_x in range(-radius_cells, radius_cells + 1):
+                if (
+                    offset_x * offset_x + offset_y * offset_y
+                    > radius_squared
+                ):
+                    continue
+
+                x = obstacle_x + offset_x
+                y = obstacle_y + offset_y
+
+                if not (0 <= x < width and 0 <= y < height):
+                    continue
+
+                index = y * width + x
+
+                # Unknown cells remain unknown; they are already non-traversable.
+                if inflated[index] >= 0:
+                    inflated[index] = inflated_value
+
+    return inflated

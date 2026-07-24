@@ -8,7 +8,7 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from path_planner import astar_path  # noqa: E402
+from path_planner import astar_path, inflate_obstacles  # noqa: E402
 
 
 class AStarPathTest(unittest.TestCase):
@@ -141,6 +141,92 @@ class AStarPathTest(unittest.TestCase):
                 height=2,
                 start=(0, 0),
                 goal=(2, 1),
+            )
+
+
+class InflateObstaclesTest(unittest.TestCase):
+    def test_inflates_obstacle_by_one_cell(self):
+        data = [
+            0, 0,   0,
+            0, 100, 0,
+            0, 0,   0,
+        ]
+
+        inflated = inflate_obstacles(
+            data,
+            width=3,
+            height=3,
+            radius_cells=1,
+        )
+
+        self.assertEqual(
+            inflated,
+            [
+                0,   100, 0,
+                100, 100, 100,
+                0,   100, 0,
+            ],
+        )
+
+    def test_zero_radius_keeps_original_shape(self):
+        data = [
+            0, 100,
+            0,   0,
+        ]
+
+        inflated = inflate_obstacles(
+            data,
+            width=2,
+            height=2,
+            radius_cells=0,
+        )
+
+        self.assertEqual(inflated, data)
+        self.assertIsNot(inflated, data)
+
+    def test_handles_obstacle_at_map_edge(self):
+        data = [
+            100, 0,
+            0,   0,
+        ]
+
+        inflated = inflate_obstacles(
+            data,
+            width=2,
+            height=2,
+            radius_cells=1,
+        )
+
+        self.assertEqual(
+            inflated,
+            [
+                100, 100,
+                100,   0,
+            ],
+        )
+
+    def test_preserves_unknown_cells(self):
+        data = [
+            100, -1,
+            0,    0,
+        ]
+
+        inflated = inflate_obstacles(
+            data,
+            width=2,
+            height=2,
+            radius_cells=1,
+        )
+
+        self.assertEqual(inflated[1], -1)
+
+    def test_rejects_negative_radius(self):
+        with self.assertRaises(ValueError):
+            inflate_obstacles(
+                [0],
+                width=1,
+                height=1,
+                radius_cells=-1,
             )
 
 
