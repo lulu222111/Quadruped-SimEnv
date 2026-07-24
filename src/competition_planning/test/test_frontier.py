@@ -11,6 +11,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from frontier import (  # noqa: E402
     cluster_frontier_cells,
     extract_frontier_cells,
+    grid_cell_to_world,
     select_frontier_representative,
 )
 
@@ -130,6 +131,54 @@ class SelectFrontierRepresentativeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             select_frontier_representative([])
 
+
+class GridCellToWorldTest(unittest.TestCase):
+    def test_uses_cell_center(self):
+        world_x, world_y = grid_cell_to_world(
+            (0, 0),
+            resolution=1.0,
+        )
+
+        self.assertAlmostEqual(world_x, 0.5)
+        self.assertAlmostEqual(world_y, 0.5)
+
+    def test_applies_map_resolution(self):
+        world_x, world_y = grid_cell_to_world(
+            (4, 7),
+            resolution=0.5,
+        )
+
+        self.assertAlmostEqual(world_x, 2.25)
+        self.assertAlmostEqual(world_y, 3.75)
+
+    def test_applies_map_origin(self):
+        world_x, world_y = grid_cell_to_world(
+            (1, 2),
+            resolution=1.0,
+            origin_x=10.0,
+            origin_y=-3.0,
+        )
+
+        self.assertAlmostEqual(world_x, 11.5)
+        self.assertAlmostEqual(world_y, -0.5)
+
+    def test_applies_map_origin_rotation(self):
+        from math import pi
+
+        world_x, world_y = grid_cell_to_world(
+            (0, 0),
+            resolution=2.0,
+            origin_x=10.0,
+            origin_y=20.0,
+            origin_yaw=pi / 2.0,
+        )
+
+        self.assertAlmostEqual(world_x, 9.0)
+        self.assertAlmostEqual(world_y, 21.0)
+
+    def test_rejects_non_positive_resolution(self):
+        with self.assertRaises(ValueError):
+            grid_cell_to_world((0, 0), resolution=0.0)
 
 if __name__ == "__main__":
     unittest.main()

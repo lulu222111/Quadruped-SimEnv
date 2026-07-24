@@ -121,3 +121,34 @@ def select_frontier_representative(cluster):
             cell[1],
         ),
     )
+
+def grid_cell_to_world(
+    cell,
+    resolution,
+    origin_x=0.0,
+    origin_y=0.0,
+    origin_yaw=0.0,
+):
+    """Convert a grid cell to the world position at the cell center."""
+    if resolution <= 0.0:
+        raise ValueError("resolution must be positive")
+
+    from math import cos, sin
+
+    cell_x, cell_y = cell
+
+    local_x = (cell_x + 0.5) * resolution
+    local_y = (cell_y + 0.5) * resolution
+
+    world_x = (
+        origin_x
+        + cos(origin_yaw) * local_x
+        - sin(origin_yaw) * local_y
+    )
+    world_y = (
+        origin_y
+        + sin(origin_yaw) * local_x
+        + cos(origin_yaw) * local_y
+    )
+
+    return world_x, world_y
