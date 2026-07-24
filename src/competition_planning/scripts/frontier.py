@@ -198,3 +198,35 @@ def select_best_frontier_cluster(
 
     candidates.sort()
     return candidates[0][4]
+
+def world_to_grid_cell(
+    world_position,
+    resolution,
+    origin_x=0.0,
+    origin_y=0.0,
+    origin_yaw=0.0,
+):
+    """Convert a world position to its containing occupancy-grid cell."""
+    if resolution <= 0.0:
+        raise ValueError("resolution must be positive")
+
+    from math import cos, floor, sin
+
+    world_x, world_y = world_position
+    delta_x = world_x - origin_x
+    delta_y = world_y - origin_y
+
+    # Apply the inverse rotation of the map origin.
+    local_x = (
+        cos(origin_yaw) * delta_x
+        + sin(origin_yaw) * delta_y
+    )
+    local_y = (
+        -sin(origin_yaw) * delta_x
+        + cos(origin_yaw) * delta_y
+    )
+
+    cell_x = int(floor(local_x / resolution))
+    cell_y = int(floor(local_y / resolution))
+
+    return cell_x, cell_y

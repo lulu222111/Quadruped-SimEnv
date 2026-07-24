@@ -14,6 +14,7 @@ from frontier import (  # noqa: E402
     grid_cell_to_world,
     select_best_frontier_cluster,
     select_frontier_representative,
+    world_to_grid_cell,
 )
 
 
@@ -244,6 +245,65 @@ class SelectBestFrontierClusterTest(unittest.TestCase):
                 [[(1, 1)]],
                 robot_cell=(0, 0),
                 distance_weight=-1.0,
+            )
+
+class WorldToGridCellTest(unittest.TestCase):
+    def test_converts_world_position_to_cell(self):
+        cell = world_to_grid_cell(
+            (2.25, 3.75),
+            resolution=0.5,
+        )
+
+        self.assertEqual(cell, (4, 7))
+
+    def test_applies_map_origin(self):
+        cell = world_to_grid_cell(
+            (11.5, -0.5),
+            resolution=1.0,
+            origin_x=10.0,
+            origin_y=-3.0,
+        )
+
+        self.assertEqual(cell, (1, 2))
+
+    def test_applies_inverse_map_rotation(self):
+        from math import pi
+
+        cell = world_to_grid_cell(
+            (9.0, 21.0),
+            resolution=2.0,
+            origin_x=10.0,
+            origin_y=20.0,
+            origin_yaw=pi / 2.0,
+        )
+
+        self.assertEqual(cell, (0, 0))
+
+    def test_grid_to_world_round_trip(self):
+        original_cell = (4, 7)
+        world_position = grid_cell_to_world(
+            original_cell,
+            resolution=0.25,
+            origin_x=-2.0,
+            origin_y=3.0,
+            origin_yaw=0.4,
+        )
+
+        recovered_cell = world_to_grid_cell(
+            world_position,
+            resolution=0.25,
+            origin_x=-2.0,
+            origin_y=3.0,
+            origin_yaw=0.4,
+        )
+
+        self.assertEqual(recovered_cell, original_cell)
+
+    def test_rejects_non_positive_resolution(self):
+        with self.assertRaises(ValueError):
+            world_to_grid_cell(
+                (0.0, 0.0),
+                resolution=0.0,
             )
 
 if __name__ == "__main__":
