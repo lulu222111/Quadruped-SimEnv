@@ -104,3 +104,20 @@ def cluster_frontier_cells(frontier_cells, min_size=1):
 
     clusters.sort(key=lambda cluster: cluster[0])
     return clusters
+
+def select_frontier_representative(cluster):
+    """Return the frontier cell nearest to the cluster centroid."""
+    if not cluster:
+        raise ValueError("cluster must not be empty")
+
+    center_x = sum(cell[0] for cell in cluster) / float(len(cluster))
+    center_y = sum(cell[1] for cell in cluster) / float(len(cluster))
+
+    return min(
+        cluster,
+        key=lambda cell: (
+            (cell[0] - center_x) ** 2 + (cell[1] - center_y) ** 2,
+            cell[0],
+            cell[1],
+        ),
+    )
