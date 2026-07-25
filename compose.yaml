@@ -1,6 +1,6 @@
 services:
   simenv:
-    image: simenv:noetic-cu128
+    image: ${SIMENV_IMAGE:-simenv:noetic-cu128}
 
     build:
       context: .
@@ -10,11 +10,11 @@ services:
         USER_UID: "${LOCAL_UID:-1000}"
         USER_GID: "${LOCAL_GID:-1000}"
 
-    container_name: simenv-dev
-    hostname: simenv-dev
+    container_name: ${SIMENV_CONTAINER_NAME:-simenv-dev}
+    hostname: ${SIMENV_HOSTNAME:-simenv-dev}
 
     extra_hosts:
-      - "simenv-dev:127.0.0.1"
+      - "${SIMENV_HOSTNAME:-simenv-dev}:127.0.0.1"
 
     network_mode: host
     shm_size: "2gb"
@@ -31,7 +31,7 @@ services:
       ROS_HOME: /workspace/SimEnv/artifacts/ros
 
     volumes:
-      - .:/workspace/SimEnv
+      - ${SIMENV_WORKSPACE:-.}:/workspace/SimEnv
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - ${SIMENV_XAUTHORITY:-/run/user/1000/gdm/Xauthority}:/tmp/.Xauthority:ro
 

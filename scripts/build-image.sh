@@ -8,9 +8,15 @@ mkdir -p artifacts/logs
 
 LOG="$REPO_ROOT/artifacts/logs/docker-build-$(date +%Y%m%d-%H%M%S).log"
 
+# 读取目标镜像名称（与 compose.yaml 中 ${SIMENV_IMAGE:-simenv:noetic-cu128} 一致）
+SIMENV_IMAGE="$(sudo docker compose --file compose.yaml config 2>/dev/null \
+    | sed -n 's/^ *image: *//p' | head -1)"
+SIMENV_IMAGE="${SIMENV_IMAGE:-simenv:noetic-cu128}"
+
 echo "项目目录：$REPO_ROOT"
+echo "目标镜像：$SIMENV_IMAGE"
 echo "构建日志：$LOG"
-echo "开始构建 simenv:noetic-cu128"
+echo "开始构建 $SIMENV_IMAGE"
 
 set +e
 sudo docker compose \
@@ -32,4 +38,4 @@ if [ "$BUILD_STATUS" -ne 0 ]; then
     exit "$BUILD_STATUS"
 fi
 
-echo "Docker镜像构建成功。"
+echo "Docker镜像构建成功：$SIMENV_IMAGE"
