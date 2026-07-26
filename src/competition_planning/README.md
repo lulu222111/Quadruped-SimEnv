@@ -59,21 +59,32 @@
 
 ## 当前状态说明
 
-模块已经完成个人分支中的核心算法和 ROS 话题接入。
+模块已经完成个人分支中的核心算法、ROS 话题接入以及标准个人容器内的独立验证。
 
 已完成的验证：
 
 - Python 语法检查通过；
-- 46 项 `unittest` 自动测试通过；
-- Git 差异格式检查通过；
-- 输入输出话题与 `competition_interfaces/ModuleStatus` 字段已核对。
+- 46 项 `unittest` 自动测试在标准个人 Docker 容器中通过；
+- ROS Noetic 工作区 `catkin_make` 编译通过；
+- `rospack find competition_planning` 能够正确识别规划包；
+- `planning_node` 能够在真实 ROS Master 中启动；
+- 缺少地图和定位输入时，模块保持 `STARTING`、`valid=false`，不发布伪造规划结果；
+- `GUI=false` 无界面 Gazebo、Unitree A1、传感器和控制器启动通过；
+- 使用合规 mock `OccupancyGrid` 和 `Odometry` 完成 ROS 话题闭环验证；
+- mock 验证中检测到 12 个 Frontier 格子，发布目标 `(1.5, 2.5)` 和包含 2 个位姿的路径；
+- `/competition/navigation_goal` 类型为 `geometry_msgs/PoseStamped`；
+- `/competition/path` 类型为 `nav_msgs/Path`；
+- 导航目标和路径的坐标系均为 `map`；
+- Git 差异格式检查通过。
 
-尚待负责人在统一 Docker 环境中完成：
+尚待团队联调和性能验证：
 
-- ROS Noetic `catkin_make` 编译；
-- 与 mapping、localization、control 模块的话题联调；
-- Gazebo 场景中的路径安全性和重规划验证；
-- 20×36 m 场景性能测试。
+- 使用 mapping 模块提供的真实 `/competition/map` 联调；
+- 使用 localization 模块提供的真实 `/competition/localization/odom` 联调；
+- 与 control 模块验证目标、路径消费和重规划行为；
+- 在真实 Gazebo 地图中验证路径安全性、不可达目标处理和动态重规划；
+- 完成 20×36 m 场景性能和覆盖率测试；
+- 按需使用 RViz 和 Gazebo GUI 完成可视化验证。
 
 ## 自动测试
 
