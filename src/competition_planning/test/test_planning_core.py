@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+import statistics
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -84,6 +86,62 @@ class PlanToFrontierTest(unittest.TestCase):
 
         for x, y in result["path"]:
             self.assertEqual(data[y * 5 + x], 0)
+
+    def test_planning_time_is_below_500_ms_on_20_by_36_m_map(self):
+        resolution = 0.1
+        width = int(20.0 / resolution)
+        height = int(36.0 / resolution)
+        unknown_border = 10
+
+        data = [-1] * (width * height)
+
+        for y in range(unknown_border, height - unknown_border):
+            row_start = y * width
+
+            for x in range(unknown_border, width - unknown_border):
+                data[row_start + x] = 0
+
+        robot_cell = (width // 2, height // 2)
+
+        def run_planner():
+            return plan_to_frontier(
+                data,
+                width=width,
+                height=height,
+                robot_cell=robot_cell,
+                min_frontier_size=5,
+                inflation_radius_cells=2,
+            )
+
+        warmup_result = run_planner()
+        self.assertIsNotNone(warmup_result)
+
+        durations = []
+
+        for _ in range(5):
+            start_time = time.perf_counter()
+            result = run_planner()
+            durations.append(time.perf_counter() - start_time)
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["path"][0], robot_cell)
+            self.assertEqual(result["path"][-1], result["goal_cell"])
+
+            for x, y in result["path"]:
+                self.assertEqual(data[y * width + x], 0)
+
+        median_seconds = statistics.median(durations)
+        median_ms = median_seconds * 1000.0
+
+        self.assertLess(
+            median_seconds,
+            0.5,
+            msg=(
+                "Median planning time was "
+                f"{median_ms:.1f} ms; expected less than 500 ms. "
+                f"All runs: {[round(value * 1000.0, 1) for value in durations]} ms"
+            ),
+        )
 
 
 if __name__ == "__main__":
