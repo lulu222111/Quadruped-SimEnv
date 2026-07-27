@@ -55,7 +55,7 @@
 - [x] 当前候选目标不可达时尝试下一片 Frontier
 - [x] 接入地图和定位 ROS 话题
 - [x] 发布导航目标、路径和模块状态
-- [x] 47 项无 ROS 依赖的自动测试通过
+- [x] 50 项无 ROS 依赖的自动测试通过
 
 ## 当前状态说明
 
@@ -101,7 +101,7 @@ python3 -m unittest discover \
 当前预期结果：
 
 ```text
-Ran 47 tests
+Ran 50 tests
 OK
 ```
 
@@ -150,7 +150,7 @@ rosrun competition_planning planning_node
 - [ ] 与真实 mapping 输出联调
 - [ ] 与 localization 输出联调
 - [ ] 与 control 路径消费者联调
-- [ ] 区分“探索完成”和“暂时不可达”
+- [x] 区分“探索完成”和“暂时不可达”
 - [ ] 完善目标到达与重复目标抑制
 - [ ] 多楼层、电梯和返回起点策略
 - [x] 验证规划时间小于 500 ms

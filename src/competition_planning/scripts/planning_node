@@ -12,7 +12,12 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 
 from frontier import grid_cell_to_world, world_to_grid_cell
-from planning_core import plan_to_frontier
+from planning_core import (
+    PLAN_NO_FRONTIER,
+    PLAN_SUCCESS,
+    PLAN_UNREACHABLE,
+    plan_to_frontier_with_status,
+)
 
 
 def quaternion_to_yaw(quaternion):
@@ -178,7 +183,7 @@ class PlanningNode:
             ceil(self.inflation_radius / info.resolution)
         )
 
-        result = plan_to_frontier(
+        result = plan_to_frontier_with_status(
             list(map_msg.data),
             width=info.width,
             height=info.height,
@@ -190,18 +195,36 @@ class PlanningNode:
             obstacle_threshold=self.obstacle_threshold,
         )
 
-        if result is None:
-            rospy.logwarn_throttle(
-                5.0,
-                "planning_node: no reachable frontier",
+        if result["status"] == PLAN_NO_FRONTIER:
+            detail = "exploration complete: no usable frontier"
+            rospy.loginfo_throttle(5.0, detail)
+            self.publish_status(
+                ModuleStatus.SUCCEEDED,
+                False,
+                1.0,
+                detail,
             )
+            return
+
+        if result["status"] == PLAN_UNREACHABLE:
+            detail = (
+                "frontiers detected but none is currently reachable"
+            )
+            rospy.logwarn_throttle(5.0, detail)
             self.publish_status(
                 ModuleStatus.BLOCKED,
                 False,
                 0.0,
-                "no reachable frontier",
+                detail,
             )
             return
+
+        if result["status"] != PLAN_SUCCESS:
+            raise ValueError(
+                "unknown planning status: {}".format(
+                    result["status"]
+                )
+            )
 
         frame_id = map_msg.header.frame_id or "map"
         stamp = rospy.Time.now()

@@ -11,7 +11,12 @@ from frontier import (
 from path_planner import astar_path, inflate_obstacles
 
 
-def plan_to_frontier(
+PLAN_SUCCESS = "success"
+PLAN_NO_FRONTIER = "no_frontier"
+PLAN_UNREACHABLE = "unreachable"
+
+
+def plan_to_frontier_with_status(
     data,
     width,
     height,
@@ -23,11 +28,14 @@ def plan_to_frontier(
     obstacle_threshold=50,
 ):
     """
-    Select a reachable frontier and plan a collision-free grid path.
+    Select a reachable frontier and report an explicit planning status.
 
     Returns:
-        A dictionary containing goal_cell, path, cluster and frontier_count.
-        Returns None when no reachable frontier exists.
+        A dictionary whose ``status`` is one of:
+
+        - ``PLAN_SUCCESS``: a reachable frontier and path were found.
+        - ``PLAN_NO_FRONTIER``: no usable frontier cluster exists.
+        - ``PLAN_UNREACHABLE``: frontier clusters exist, but none is reachable.
     """
     frontier_cells = extract_frontier_cells(
         data,
@@ -40,7 +48,13 @@ def plan_to_frontier(
     )
 
     if not clusters:
-        return None
+        return {
+            "status": PLAN_NO_FRONTIER,
+            "goal_cell": None,
+            "path": None,
+            "cluster": None,
+            "frontier_count": len(frontier_cells),
+        }
 
     planning_grid = inflate_obstacles(
         data,
@@ -61,7 +75,7 @@ def plan_to_frontier(
         )
 
         if selected_cluster is None:
-            return None
+            break
 
         goal_cell = select_frontier_representative(selected_cluster)
         path = astar_path(
@@ -75,6 +89,7 @@ def plan_to_frontier(
 
         if path is not None:
             return {
+                "status": PLAN_SUCCESS,
                 "goal_cell": goal_cell,
                 "path": path,
                 "cluster": selected_cluster,
@@ -83,4 +98,52 @@ def plan_to_frontier(
 
         remaining_clusters.remove(selected_cluster)
 
-    return None
+    return {
+        "status": PLAN_UNREACHABLE,
+        "goal_cell": None,
+        "path": None,
+        "cluster": None,
+        "frontier_count": len(frontier_cells),
+    }
+
+
+def plan_to_frontier(
+    data,
+    width,
+    height,
+    robot_cell,
+    min_frontier_size=5,
+    inflation_radius_cells=0,
+    size_weight=1.0,
+    distance_weight=1.0,
+    obstacle_threshold=50,
+):
+    """
+    Select a reachable frontier and plan a collision-free grid path.
+
+    This compatibility interface keeps the original behavior:
+
+    - returns a planning dictionary when successful;
+    - returns ``None`` when no reachable frontier exists.
+    """
+    result = plan_to_frontier_with_status(
+        data,
+        width,
+        height,
+        robot_cell,
+        min_frontier_size=min_frontier_size,
+        inflation_radius_cells=inflation_radius_cells,
+        size_weight=size_weight,
+        distance_weight=distance_weight,
+        obstacle_threshold=obstacle_threshold,
+    )
+
+    if result["status"] != PLAN_SUCCESS:
+        return None
+
+    return {
+        "goal_cell": result["goal_cell"],
+        "path": result["path"],
+        "cluster": result["cluster"],
+        "frontier_count": result["frontier_count"],
+    }
