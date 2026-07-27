@@ -60,7 +60,9 @@ class PlanningNode:
         if self.replan_interval <= 0.0:
             raise ValueError("replan_interval must be positive")
         if self.inflation_radius < 0.0:
-            raise ValueError("inflation_radius must not be negative")
+            raise ValueError(
+                "inflation_radius must not be negative"
+            )
 
         self.status_pub = rospy.Publisher(
             "/competition/planning/status",
@@ -72,7 +74,7 @@ class PlanningNode:
             "/competition/navigation_goal",
             PoseStamped,
             queue_size=1,
-            latch=True,
+            latch=False,
         )
         self.path_pub = rospy.Publisher(
             "/competition/path",
@@ -99,9 +101,8 @@ class PlanningNode:
             self.plan_callback,
         )
 
-        self.publish_status(
+        self.invalidate_plan(
             ModuleStatus.STARTING,
-            False,
             0.0,
             "waiting for map and localization",
         )
@@ -118,7 +119,13 @@ class PlanningNode:
     def odom_callback(self, msg):
         self.odom_msg = msg
 
-    def publish_status(self, state, valid, confidence, detail):
+    def publish_status(
+        self,
+        state,
+        valid,
+        confidence,
+        detail,
+    ):
         msg = ModuleStatus()
         msg.header.stamp = rospy.Time.now()
         msg.state = state
@@ -127,52 +134,96 @@ class PlanningNode:
         msg.detail = detail
         self.status_pub.publish(msg)
 
+    def invalidate_plan(
+        self,
+        state,
+        confidence,
+        detail,
+    ):
+        """Withdraw the latched path and publish an invalid status."""
+        frame_id = "map"
+
+        if self.map_msg is not None:
+            frame_id = (
+                self.map_msg.header.frame_id
+                or "map"
+            )
+
+        empty_path = Path()
+        empty_path.header.stamp = rospy.Time.now()
+        empty_path.header.frame_id = frame_id
+        self.path_pub.publish(empty_path)
+
+        self.publish_status(
+            state,
+            False,
+            confidence,
+            detail,
+        )
+
     def plan_callback(self, _event):
         map_msg = self.map_msg
         odom_msg = self.odom_msg
 
         if map_msg is None or odom_msg is None:
             missing = []
+
             if map_msg is None:
                 missing.append("map")
+
             if odom_msg is None:
                 missing.append("localization")
 
-            self.publish_status(
+            self.invalidate_plan(
                 ModuleStatus.STARTING,
-                False,
                 0.0,
-                "waiting for " + " and ".join(missing),
+                "waiting for "
+                + " and ".join(missing),
             )
             return
 
         try:
-            self.plan_and_publish(map_msg, odom_msg)
+            self.plan_and_publish(
+                map_msg,
+                odom_msg,
+            )
         except (TypeError, ValueError) as error:
             rospy.logerr_throttle(
                 5.0,
                 "planning failed: %s",
                 str(error),
             )
-            self.publish_status(
+            self.invalidate_plan(
                 ModuleStatus.FAILED,
-                False,
                 0.0,
                 str(error),
             )
 
-    def plan_and_publish(self, map_msg, odom_msg):
+    def plan_and_publish(
+        self,
+        map_msg,
+        odom_msg,
+    ):
         info = map_msg.info
 
         if info.resolution <= 0.0:
-            raise ValueError("map resolution must be positive")
+            raise ValueError(
+                "map resolution must be positive"
+            )
 
         origin = info.origin
-        origin_yaw = quaternion_to_yaw(origin.orientation)
+        origin_yaw = quaternion_to_yaw(
+            origin.orientation
+        )
 
-        robot_position = odom_msg.pose.pose.position
+        robot_position = (
+            odom_msg.pose.pose.position
+        )
         robot_cell = world_to_grid_cell(
-            (robot_position.x, robot_position.y),
+            (
+                robot_position.x,
+                robot_position.y,
+            ),
             resolution=info.resolution,
             origin_x=origin.position.x,
             origin_y=origin.position.y,
@@ -180,7 +231,10 @@ class PlanningNode:
         )
 
         inflation_radius_cells = int(
-            ceil(self.inflation_radius / info.resolution)
+            ceil(
+                self.inflation_radius
+                / info.resolution
+            )
         )
 
         result = plan_to_frontier_with_status(
@@ -188,19 +242,30 @@ class PlanningNode:
             width=info.width,
             height=info.height,
             robot_cell=robot_cell,
-            min_frontier_size=self.frontier_min_size,
-            inflation_radius_cells=inflation_radius_cells,
+            min_frontier_size=(
+                self.frontier_min_size
+            ),
+            inflation_radius_cells=(
+                inflation_radius_cells
+            ),
             size_weight=self.size_weight,
             distance_weight=self.distance_weight,
-            obstacle_threshold=self.obstacle_threshold,
+            obstacle_threshold=(
+                self.obstacle_threshold
+            ),
         )
 
         if result["status"] == PLAN_NO_FRONTIER:
-            detail = "exploration complete: no usable frontier"
-            rospy.loginfo_throttle(5.0, detail)
-            self.publish_status(
+            detail = (
+                "exploration complete: "
+                "no usable frontier"
+            )
+            rospy.loginfo_throttle(
+                5.0,
+                detail,
+            )
+            self.invalidate_plan(
                 ModuleStatus.SUCCEEDED,
-                False,
                 1.0,
                 detail,
             )
@@ -208,12 +273,15 @@ class PlanningNode:
 
         if result["status"] == PLAN_UNREACHABLE:
             detail = (
-                "frontiers detected but none is currently reachable"
+                "frontiers detected but none "
+                "is currently reachable"
             )
-            rospy.logwarn_throttle(5.0, detail)
-            self.publish_status(
+            rospy.logwarn_throttle(
+                5.0,
+                detail,
+            )
+            self.invalidate_plan(
                 ModuleStatus.BLOCKED,
-                False,
                 0.0,
                 detail,
             )
@@ -226,7 +294,10 @@ class PlanningNode:
                 )
             )
 
-        frame_id = map_msg.header.frame_id or "map"
+        frame_id = (
+            map_msg.header.frame_id
+            or "map"
+        )
         stamp = rospy.Time.now()
 
         goal_msg = self.make_pose(
@@ -255,7 +326,8 @@ class PlanningNode:
         self.path_pub.publish(path_msg)
 
         detail = (
-            "planned path with {} poses to frontier {}; "
+            "planned path with {} poses "
+            "to frontier {}; "
             "{} frontier cells detected"
         ).format(
             len(result["path"]),
@@ -270,10 +342,19 @@ class PlanningNode:
             detail,
         )
 
-        rospy.loginfo_throttle(5.0, detail)
+        rospy.loginfo_throttle(
+            5.0,
+            detail,
+        )
 
     @staticmethod
-    def make_pose(cell, info, origin_yaw, frame_id, stamp):
+    def make_pose(
+        cell,
+        info,
+        origin_yaw,
+        frame_id,
+        stamp,
+    ):
         world_x, world_y = grid_cell_to_world(
             cell,
             resolution=info.resolution,
@@ -293,7 +374,10 @@ class PlanningNode:
 
 
 def main():
-    rospy.init_node("planning_node", log_level=rospy.INFO)
+    rospy.init_node(
+        "planning_node",
+        log_level=rospy.INFO,
+    )
     PlanningNode()
     rospy.spin()
 
