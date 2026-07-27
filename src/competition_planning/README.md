@@ -20,6 +20,17 @@
 |---|---|---|---|
 | `/competition/map` | `nav_msgs/OccupancyGrid` | mapping | 占据栅格地图 |
 | `/competition/localization/odom` | `nav_msgs/Odometry` | localization | 机器人当前位置 |
+### 坐标系约束
+
+`/competition/map` 与 `/competition/localization/odom` 的
+`header.frame_id` 必须均为非空值且完全相同。
+
+当前版本不执行 TF 坐标转换。若两个坐标系不一致，规划模块将：
+
+- 发布 `ModuleStatus(state=FAILED, valid=false)`；
+- 发布空的 `/competition/path`，撤销此前锁存的路径；
+- 不发布新的导航目标；
+- 不继续进行路径规划。
 
 ## 输出
 

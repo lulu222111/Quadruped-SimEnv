@@ -182,6 +182,44 @@ class PlanningNode:
             )
             return
 
+        map_frame = map_msg.header.frame_id.strip()
+        odom_frame = odom_msg.header.frame_id.strip()
+
+        if not map_frame or not odom_frame:
+            detail = (
+                "map and localization frame_id "
+                "must both be non-empty"
+            )
+            rospy.logerr_throttle(
+                5.0,
+                detail,
+            )
+            self.invalidate_plan(
+                ModuleStatus.FAILED,
+                0.0,
+                detail,
+            )
+            return
+
+        if odom_frame != map_frame:
+            detail = (
+                "frame mismatch: map uses {!r}, "
+                "localization uses {!r}"
+            ).format(
+                map_frame,
+                odom_frame,
+            )
+            rospy.logerr_throttle(
+                5.0,
+                detail,
+            )
+            self.invalidate_plan(
+                ModuleStatus.FAILED,
+                0.0,
+                detail,
+            )
+            return
+
         try:
             self.plan_and_publish(
                 map_msg,

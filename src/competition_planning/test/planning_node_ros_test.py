@@ -90,10 +90,10 @@ class PlanningNodeRosTest(unittest.TestCase):
             self.last_path = None
 
     @staticmethod
-    def make_map(width, height, data):
+    def make_map(width, height, data, frame_id="map"):
         msg = OccupancyGrid()
         msg.header.stamp = rospy.Time.now()
-        msg.header.frame_id = "map"
+        msg.header.frame_id = frame_id
         msg.info.resolution = 1.0
         msg.info.width = width
         msg.info.height = height
@@ -102,17 +102,19 @@ class PlanningNodeRosTest(unittest.TestCase):
         return msg
 
     @staticmethod
-    def make_odom(x, y):
+    def make_odom(x, y, frame_id="map"):
         msg = Odometry()
         msg.header.stamp = rospy.Time.now()
-        msg.header.frame_id = "map"
+        msg.header.frame_id = frame_id
         msg.child_frame_id = "base_link"
         msg.pose.pose.position.x = x
         msg.pose.pose.position.y = y
         msg.pose.pose.orientation.w = 1.0
         return msg
 
-    def test_invalid_plan_clears_latched_path_and_goal(self):
+    def test_invalid_plan_clears_outputs_and_rejects_frame_mismatch(
+        self,
+    ):
         reachable_map = self.make_map(
             5,
             5,
@@ -143,6 +145,40 @@ class PlanningNodeRosTest(unittest.TestCase):
 
         self.assertTrue(success_status.valid)
         self.assertGreater(len(success_path.poses), 0)
+
+        self.clear_received_outputs()
+
+        self.map_pub.publish(reachable_map)
+        self.odom_pub.publish(
+            self.make_odom(
+                2.5,
+                2.5,
+                frame_id="odom",
+            )
+        )
+
+        mismatch_status, mismatch_path = self.wait_for(
+            lambda status, path: (
+                status is not None
+                and status.state == ModuleStatus.FAILED
+                and not status.valid
+                and "frame mismatch" in status.detail
+                and path is not None
+                and len(path.poses) == 0
+            ),
+            "FAILED status and empty path for frame mismatch",
+        )
+
+        self.assertFalse(mismatch_status.valid)
+        self.assertIn(
+            "map uses 'map'",
+            mismatch_status.detail,
+        )
+        self.assertIn(
+            "localization uses 'odom'",
+            mismatch_status.detail,
+        )
+        self.assertEqual(len(mismatch_path.poses), 0)
 
         self.clear_received_outputs()
 
