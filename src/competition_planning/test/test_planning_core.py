@@ -220,6 +220,37 @@ class PlanToFrontierTest(unittest.TestCase):
             ),
         )
 
+    def test_clears_inflation_from_free_robot_start_cell(self):
+        data = [
+            -1, -1, -1, -1, -1, -1, -1,
+            -1,  0,  0,  0,  0,  0, -1,
+            -1,  0,  0, 100,  0,  0, -1,
+            -1,  0,  0,  0,  0,  0, -1,
+            -1,  0,  0,  0,  0,  0, -1,
+            -1,  0,  0,  0,  0,  0, -1,
+            -1, -1, -1, -1, -1, -1, -1,
+        ]
+        robot_cell = (3, 3)
+
+        result = plan_to_frontier(
+            data,
+            width=7,
+            height=7,
+            robot_cell=robot_cell,
+            min_frontier_size=1,
+            inflation_radius_cells=1,
+        )
+
+        self.assertEqual(
+            data[robot_cell[1] * 7 + robot_cell[0]],
+            0,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result["path"][0],
+            robot_cell,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

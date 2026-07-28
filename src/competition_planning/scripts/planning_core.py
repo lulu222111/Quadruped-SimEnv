@@ -114,6 +114,26 @@ def plan_to_frontier_with_status(
         obstacle_threshold=obstacle_threshold,
     )
 
+    robot_x, robot_y = robot_cell
+
+    if (
+        0 <= robot_x < width
+        and 0 <= robot_y < height
+    ):
+        robot_index = (
+            robot_y * width
+            + robot_x
+        )
+        original_robot_value = data[robot_index]
+
+        if (
+            0 <= original_robot_value
+            < obstacle_threshold
+        ):
+            planning_grid[robot_index] = (
+                original_robot_value
+            )
+
     remaining_clusters = list(clusters)
 
     while remaining_clusters:
