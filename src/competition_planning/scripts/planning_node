@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from math import atan2, ceil, isfinite
+from math import atan2, ceil, cos, isfinite, sin
 
 import rospy
 from competition_interfaces.msg import ModuleStatus
@@ -16,6 +16,7 @@ from planning_core import (
     PLAN_NO_FRONTIER,
     PLAN_SUCCESS,
     PLAN_UNREACHABLE,
+    path_cell_yaws,
     plan_to_frontier_with_status,
 )
 
@@ -512,12 +513,9 @@ class PlanningNode:
         )
         stamp = rospy.Time.now()
 
-        goal_msg = self.make_pose(
-            result["goal_cell"],
-            info,
-            origin_yaw,
-            frame_id,
-            stamp,
+        path_yaws = path_cell_yaws(
+            result["path"],
+            origin_yaw=origin_yaw,
         )
 
         path_msg = Path()
@@ -530,9 +528,27 @@ class PlanningNode:
                 origin_yaw,
                 frame_id,
                 stamp,
+                pose_yaw,
             )
-            for cell in result["path"]
+            for cell, pose_yaw in zip(
+                result["path"],
+                path_yaws,
+            )
         ]
+
+        goal_yaw = (
+            path_yaws[-1]
+            if path_yaws
+            else origin_yaw
+        )
+        goal_msg = self.make_pose(
+            result["goal_cell"],
+            info,
+            origin_yaw,
+            frame_id,
+            stamp,
+            goal_yaw,
+        )
 
         self.goal_pub.publish(goal_msg)
         self.path_pub.publish(path_msg)
@@ -566,6 +582,7 @@ class PlanningNode:
         origin_yaw,
         frame_id,
         stamp,
+        pose_yaw,
     ):
         world_x, world_y = grid_cell_to_world(
             cell,
@@ -581,7 +598,12 @@ class PlanningNode:
         pose.pose.position.x = world_x
         pose.pose.position.y = world_y
         pose.pose.position.z = 0.0
-        pose.pose.orientation.w = 1.0
+        pose.pose.orientation.z = sin(
+            pose_yaw / 2.0
+        )
+        pose.pose.orientation.w = cos(
+            pose_yaw / 2.0
+        )
         return pose
 
 

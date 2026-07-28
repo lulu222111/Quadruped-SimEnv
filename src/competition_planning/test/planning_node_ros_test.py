@@ -9,6 +9,7 @@ import rostest
 from competition_interfaces.msg import ModuleStatus
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from math import atan2, cos, sin
 
 
 class PlanningNodeRosTest(unittest.TestCase):
@@ -214,6 +215,78 @@ class PlanningNodeRosTest(unittest.TestCase):
 
         self.assertFalse(blocked_status.valid)
         self.assertEqual(len(cleared_path.poses), 0)
+
+        for pose_stamped in success_path.poses:
+            orientation = (
+                pose_stamped.pose.orientation
+            )
+            quaternion_norm = (
+                orientation.z * orientation.z
+                + orientation.w * orientation.w
+            )
+
+            self.assertAlmostEqual(
+                quaternion_norm,
+                1.0,
+                places=6,
+            )
+
+        for index in range(
+            len(success_path.poses) - 1
+        ):
+            current = success_path.poses[index]
+            following = success_path.poses[
+                index + 1
+            ]
+
+            expected_yaw = atan2(
+                (
+                    following.pose.position.y
+                    - current.pose.position.y
+                ),
+                (
+                    following.pose.position.x
+                    - current.pose.position.x
+                ),
+            )
+
+            orientation = (
+                current.pose.orientation
+            )
+            actual_yaw = 2.0 * atan2(
+                orientation.z,
+                orientation.w,
+            )
+
+            angle_error = atan2(
+                sin(actual_yaw - expected_yaw),
+                cos(actual_yaw - expected_yaw),
+            )
+
+            self.assertAlmostEqual(
+                angle_error,
+                0.0,
+                places=6,
+            )
+
+        if len(success_path.poses) > 1:
+            previous_orientation = (
+                success_path.poses[-2].pose.orientation
+            )
+            final_orientation = (
+                success_path.poses[-1].pose.orientation
+            )
+
+            self.assertAlmostEqual(
+                final_orientation.z,
+                previous_orientation.z,
+                places=6,
+            )
+            self.assertAlmostEqual(
+                final_orientation.w,
+                previous_orientation.w,
+                places=6,
+            )
 
         late_goal_received = threading.Event()
 

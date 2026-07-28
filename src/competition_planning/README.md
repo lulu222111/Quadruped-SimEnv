@@ -12,7 +12,8 @@
 3. 综合区域大小和距离选择探索目标；
 4. 对障碍物进行安全膨胀；
 5. 使用 A* 规划无碰路径；
-6. 向控制模块发布导航目标和路径。
+6. 向控制模块发布导航目标和路径；
+7. 在输入失效、坐标系不一致或规划失败时撤销旧路径。
 
 ## 输入
 
@@ -20,6 +21,7 @@
 |---|---|---|---|
 | `/competition/map` | `nav_msgs/OccupancyGrid` | mapping | 占据栅格地图 |
 | `/competition/localization/odom` | `nav_msgs/Odometry` | localization | 机器人当前位置 |
+
 ### 坐标系约束
 
 `/competition/map` 与 `/competition/localization/odom` 的
@@ -40,6 +42,14 @@
 | `/competition/path` | `nav_msgs/Path` | control | A* 规划路径 |
 | `/competition/planning/status` | `competition_interfaces/ModuleStatus` | competition_loop | 规划模块状态 |
 
+### 输出安全约定
+
+- `/competition/navigation_goal` 不锁存，避免新启动的控制节点收到旧目标；
+- `/competition/path` 使用锁存，但规划失效时会发布空路径撤销旧路径；
+- 控制模块收到空路径或 `planning/status.valid=false` 时应停止路径跟踪；
+- 有效路径中的每个位姿均根据路径切线设置行进方向四元数；
+- 最后一个路径位姿沿用最后一段路径的方向。
+
 ## ROS 参数
 
 | 参数 | 类型 | 默认值 | 说明 |
@@ -51,7 +61,21 @@
 | `~inflation_radius` | float | `0.25` | 障碍物安全膨胀半径，单位为米 |
 | `~size_weight` | float | `1.0` | Frontier 区域大小评分权重 |
 | `~distance_weight` | float | `1.0` | 机器人到目标距离评分权重 |
-| `~obstacle_threshold` | int | `50` | 判定占用格子的阈值 |
+| `~obstacle_threshold` | int | `50` | 判定占用格子的阈值，合法范围为 `[1, 100]` |
+
+### 参数安全约束
+
+节点启动时会检查：
+
+- `frontier_min_size >= 1`；
+- `replan_interval > 0`；
+- `map_timeout > 0`；
+- `localization_timeout > 0`；
+- `inflation_radius >= 0`；
+- `size_weight >= 0`；
+- `distance_weight >= 0`；
+- `1 <= obstacle_threshold <= 100`；
+- 所有浮点参数必须是有限值，拒绝 `NaN` 和 `Inf`。
 
 ## 当前已实现
 
@@ -59,47 +83,96 @@
 - [x] 采用八邻域进行 Frontier 聚类
 - [x] 使用 `frontier_min_size` 过滤零散噪声
 - [x] 选择距离聚类中心最近的真实 Frontier 格子
-- [x] 综合区域大小和距离选择候选目标
+- [x] 综合区域大小和距离选择 Frontier 簇
+- [x] 同簇代表点不可达时继续尝试同簇其他候选点
+- [x] 整个 Frontier 簇不可达后尝试下一片 Frontier
 - [x] 地图格子坐标与世界坐标双向转换
 - [x] 支持带旋转的地图原点
 - [x] 四邻域 A* 路径规划
 - [x] 障碍物安全膨胀
 - [x] 膨胀覆盖机器人起点时，仅恢复原本空闲的起点格
 - [x] 禁止路径穿过未知区域和障碍物
-- [x] 当前候选点不可达时先尝试同簇其他候选点，再尝试下一片 Frontier
 - [x] 接入地图和定位 ROS 话题
-- [x] 发布导航目标、路径和模块状态
-- [x] 52 项无 ROS 依赖的自动测试通过
+- [x] 强制检查地图与定位坐标系一致
 - [x] 地图或定位输入超时后撤销旧路径并发布 `TIMEOUT`
+- [x] 发布导航目标、路径和模块状态
+- [x] 规划失效时发布空路径撤销旧锁存路径
+- [x] 导航目标不锁存
+- [x] 根据路径切线生成路径位姿方向四元数
+- [x] 区分“探索完成”和“暂时不可达”
+- [x] 启动时完整校验参数并拒绝 `NaN`、`Inf` 和非法范围
+- [x] 54 项无 ROS 依赖的自动测试通过
+- [x] ROS 自动集成测试通过
 
-## 当前状态说明
+## 规划状态
 
-模块已经完成个人分支中的核心算法、ROS 话题接入以及标准个人容器内的独立验证。
+| 场景 | `ModuleStatus.state` | `valid` | 路径输出 |
+|---|---:|---:|---|
+| 等待地图或定位 | `STARTING` | `false` | 空路径 |
+| 正常生成路径 | `RUNNING` | `true` | 有效路径 |
+| 探索完成、没有 Frontier | `SUCCEEDED` | `false` | 空路径 |
+| 存在 Frontier 但均不可达 | `BLOCKED` | `false` | 空路径 |
+| 地图或定位输入过期 | `TIMEOUT` | `false` | 空路径 |
+| 参数、数据或坐标系错误 | `FAILED` | `false` | 空路径 |
 
-已完成的验证：
+## 已完成验证
 
-- Python 语法检查通过；
-- 46 项 `unittest` 自动测试在标准个人 Docker 容器中通过；
-- ROS Noetic 工作区 `catkin_make` 编译通过；
-- `rospack find competition_planning` 能够正确识别规划包；
-- `planning_node` 能够在真实 ROS Master 中启动；
-- 缺少地图和定位输入时，模块保持 `STARTING`、`valid=false`，不发布伪造规划结果；
-- `GUI=false` 无界面 Gazebo、Unitree A1、传感器和控制器启动通过；
-- 使用合规 mock `OccupancyGrid` 和 `Odometry` 完成 ROS 话题闭环验证；
-- mock 验证中检测到 12 个 Frontier 格子，发布目标 `(1.5, 2.5)` 和包含 2 个位姿的路径；
-- `/competition/navigation_goal` 类型为 `geometry_msgs/PoseStamped`；
-- `/competition/path` 类型为 `nav_msgs/Path`；
-- 导航目标和路径的坐标系均为 `map`；
-- Git 差异格式检查通过。
+### 无 ROS 单元测试
 
-尚待团队联调和性能验证：
+已验证：
 
-- 使用 mapping 模块提供的真实 `/competition/map` 联调；
-- 使用 localization 模块提供的真实 `/competition/localization/odom` 联调；
-- 与 control 模块验证目标、路径消费和重规划行为；
-- 在真实 Gazebo 地图中验证路径安全性、不可达目标处理和动态重规划；
-- 完成 20×36 m 场景性能和覆盖率测试；
-- 按需使用 RViz 和 Gazebo GUI 完成可视化验证。
+- Frontier 提取、聚类和过滤；
+- Frontier 代表点及簇评分；
+- 同簇多候选点回退；
+- 地图格子坐标与世界坐标转换；
+- 带旋转地图原点；
+- 四邻域 A*；
+- 障碍物膨胀；
+- 机器人起点被膨胀覆盖时的安全恢复；
+- 探索完成与不可达状态区分；
+- 20×36 m 地图规划性能；
+- 路径方向计算。
+
+当前预期结果：
+
+```text
+Ran 54 tests
+OK
+```
+
+### ROS 自动集成测试
+
+已验证：
+
+- 节点能根据 mock 地图和定位生成有效路径；
+- 有效路径中的四元数与路径前进方向一致；
+- 坐标系不一致时发布 `FAILED` 和空路径；
+- Frontier 不可达时发布 `BLOCKED` 和空路径；
+- 输入超时后发布 `TIMEOUT` 和空路径；
+- 成功规划后再次失效时，旧锁存路径被清空；
+- 新订阅者不会收到过期的锁存导航目标。
+
+当前预期结果：
+
+```text
+RESULT: SUCCESS
+TESTS: 1
+ERRORS: 0
+FAILURES: 0
+```
+
+### Docker 与 ROS 环境
+
+已在个人 Docker 环境中完成：
+
+- ROS Noetic 环境检查；
+- `catkin_make` 编译；
+- `rospack find competition_planning` 检查；
+- 54 项单元测试；
+- ROS 自动集成测试；
+- headless Gazebo 启动检查；
+- mock 地图与定位话题验证；
+- 导航目标、路径和模块状态输出检查。
 
 ## 自动测试
 
@@ -110,66 +183,50 @@ python3 -m unittest discover \
   -s src/competition_planning/test \
   -p 'test_*.py' \
   -v
-
-```
-
-当前预期结果：
-
-```text
-Ran 52 tests
-OK
 ```
 
 ## ROS 编译与运行
 
-需要在团队统一的 ROS Noetic Docker 环境中执行：
+在团队统一的 ROS Noetic Docker 环境中执行：
 
 ```bash
 source /opt/ros/noetic/setup.bash
+cd /workspace/SimEnv
 catkin_make -j
 source devel/setup.bash
 rosrun competition_planning planning_node
 ```
 
-启动节点本身不会启动 Gazebo，但正式联调应由负责人统一安排。
+## ROS 自动集成测试
 
-## 状态行为
+```bash
+source /opt/ros/noetic/setup.bash
+cd /workspace/SimEnv
+catkin_make -j
+source devel/setup.bash
+rostest competition_planning planning_node_ros.test --text
+```
 
-- 地图或定位尚未收到：
-  - `state=STARTING`
-  - `valid=false`
-- 成功生成目标和路径：
-  - `state=RUNNING`
-  - `valid=true`
-- 没有可达 Frontier：
-  - `state=BLOCKED`
-  - `valid=false`
-- 输入数据或参数无效：
-  - `state=FAILED`
-  - `valid=false`
+## 尚待团队联调
 
-## 安全与禁止事项
+- [ ] 使用 mapping 模块真实发布的 `/competition/map` 联调
+- [ ] 使用 localization 模块真实发布的 `/competition/localization/odom` 联调
+- [ ] 与 control 模块确认空路径和 `valid=false` 时立即停止跟踪
+- [ ] 验证 control 模块是否使用路径姿态
+- [ ] 在真实 Gazebo 地图中验证动态重规划
+- [ ] 验证20×36 m 场景中的可达房间覆盖率
+- [ ] 完善目标到达和重复目标抑制
+- [ ] 实现多楼层、电梯和返回起点策略
 
-本模块：
+## 禁止事项
 
-- 不读取 `layout_metadata.json`；
-- 不读取 `danger_truth.json`；
-- 不订阅 `/ground_truth/*`；
-- 不直接发布 `/cmd_vel`；
-- 不把未知区域当作可通行区域；
-- 不伪造地图、定位、目标或路径数据。
+规划模块不得：
 
-## 待完成事项
-
-- [ ] Docker 中完成 ROS 编译验证
-- [ ] 与真实 mapping 输出联调
-- [ ] 与 localization 输出联调
-- [ ] 与 control 路径消费者联调
-- [x] 区分“探索完成”和“暂时不可达”
-- [ ] 完善目标到达与重复目标抑制
-- [ ] 多楼层、电梯和返回起点策略
-- [x] 验证规划时间小于 500 ms
-- [ ] 验证 20×36 m 场景中的可达房间覆盖率
+- 读取 `layout_metadata.json` 获取房间或目标位置；
+- 读取 `danger_truth.json` 获取危险源位置；
+- 订阅 `/ground_truth/*`；
+- 使用裁判真值作为规划输入；
+- 在无效状态下继续保留旧路径。
 
 ## 团队协作接口
 

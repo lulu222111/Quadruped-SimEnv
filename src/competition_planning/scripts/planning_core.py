@@ -2,6 +2,8 @@
 
 """ROS-independent exploration planning pipeline."""
 
+from math import atan2
+
 from frontier import (
     cluster_frontier_cells,
     extract_frontier_cells,
@@ -16,22 +18,60 @@ PLAN_NO_FRONTIER = "no_frontier"
 PLAN_UNREACHABLE = "unreachable"
 
 
+def path_cell_yaws(path, origin_yaw=0.0):
+    """
+    Return one world-frame yaw for every grid path cell.
+
+    Each pose faces the next path cell. The final pose keeps the
+    direction of the final path segment.
+    """
+    if not path:
+        return []
+
+    if len(path) == 1:
+        return [origin_yaw]
+
+    yaws = []
+
+    for index in range(len(path) - 1):
+        current_x, current_y = path[index]
+        next_x, next_y = path[index + 1]
+
+        yaws.append(
+            origin_yaw
+            + atan2(
+                next_y - current_y,
+                next_x - current_x,
+            )
+        )
+
+    yaws.append(yaws[-1])
+    return yaws
+
+
 def order_frontier_candidates(cluster, robot_cell):
     """
     Order candidate cells within one Frontier cluster.
 
-    The existing centroid representative remains the first candidate.
-    Remaining cells are ordered by distance to the cluster centroid,
-    distance to the robot, and finally grid coordinates for deterministic
-    behavior.
+    The centroid representative remains the first candidate. Remaining
+    cells are ordered by centroid distance, robot distance, and grid
+    coordinates.
     """
     if not cluster:
         return []
 
-    representative = select_frontier_representative(cluster)
+    representative = select_frontier_representative(
+        cluster
+    )
 
-    center_x = sum(cell[0] for cell in cluster) / len(cluster)
-    center_y = sum(cell[1] for cell in cluster) / len(cluster)
+    center_x = (
+        sum(cell[0] for cell in cluster)
+        / len(cluster)
+    )
+    center_y = (
+        sum(cell[1] for cell in cluster)
+        / len(cluster)
+    )
 
     def candidate_key(cell):
         centroid_distance_squared = (
@@ -84,7 +124,7 @@ def plan_to_frontier_with_status(
 
         - ``PLAN_SUCCESS``: a reachable frontier and path were found.
         - ``PLAN_NO_FRONTIER``: no usable frontier cluster exists.
-        - ``PLAN_UNREACHABLE``: frontier clusters exist, but none is
+        - ``PLAN_UNREACHABLE``: Frontier clusters exist, but none is
           reachable.
     """
     frontier_cells = extract_frontier_cells(
@@ -168,10 +208,14 @@ def plan_to_frontier_with_status(
                     "goal_cell": goal_cell,
                     "path": path,
                     "cluster": selected_cluster,
-                    "frontier_count": len(frontier_cells),
+                    "frontier_count": len(
+                        frontier_cells
+                    ),
                 }
 
-        remaining_clusters.remove(selected_cluster)
+        remaining_clusters.remove(
+            selected_cluster
+        )
 
     return {
         "status": PLAN_UNREACHABLE,
@@ -196,10 +240,8 @@ def plan_to_frontier(
     """
     Select a reachable frontier and plan a collision-free grid path.
 
-    This compatibility interface keeps the original behavior:
-
-    - returns a planning dictionary when successful;
-    - returns ``None`` when no reachable frontier exists.
+    Returns a planning dictionary when successful and ``None`` when no
+    reachable Frontier exists.
     """
     result = plan_to_frontier_with_status(
         data,
