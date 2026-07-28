@@ -4,6 +4,7 @@ import statistics
 import sys
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -87,6 +88,59 @@ class PlanToFrontierTest(unittest.TestCase):
         for x, y in result["path"]:
             self.assertEqual(data[y * 5 + x], 0)
 
+    def test_tries_another_candidate_in_the_same_cluster(self):
+        cluster = [
+            (2, 1),
+            (1, 1),
+            (3, 1),
+        ]
+        expected_path = [
+            (0, 1),
+            (1, 1),
+        ]
+
+        with patch(
+            "planning_core.extract_frontier_cells",
+            return_value=list(cluster),
+        ):
+            with patch(
+                "planning_core.cluster_frontier_cells",
+                return_value=[cluster],
+            ):
+                with patch(
+                    "planning_core.inflate_obstacles",
+                    return_value=[0] * 12,
+                ):
+                    with patch(
+                        "planning_core.astar_path",
+                        side_effect=[
+                            None,
+                            expected_path,
+                        ],
+                    ) as astar_mock:
+                        result = plan_to_frontier(
+                            [0] * 12,
+                            width=4,
+                            height=3,
+                            robot_cell=(0, 1),
+                            min_frontier_size=1,
+                        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["goal_cell"], (1, 1))
+        self.assertEqual(result["path"], expected_path)
+        self.assertEqual(result["cluster"], cluster)
+
+        self.assertEqual(astar_mock.call_count, 2)
+        self.assertEqual(
+            astar_mock.call_args_list[0].kwargs["goal"],
+            (2, 1),
+        )
+        self.assertEqual(
+            astar_mock.call_args_list[1].kwargs["goal"],
+            (1, 1),
+        )
+
     def test_planning_time_is_below_500_ms_on_20_by_36_m_map(self):
         resolution = 0.1
         width = int(20.0 / resolution)
@@ -95,13 +149,22 @@ class PlanToFrontierTest(unittest.TestCase):
 
         data = [-1] * (width * height)
 
-        for y in range(unknown_border, height - unknown_border):
+        for y in range(
+            unknown_border,
+            height - unknown_border,
+        ):
             row_start = y * width
 
-            for x in range(unknown_border, width - unknown_border):
+            for x in range(
+                unknown_border,
+                width - unknown_border,
+            ):
                 data[row_start + x] = 0
 
-        robot_cell = (width // 2, height // 2)
+        robot_cell = (
+            width // 2,
+            height // 2,
+        )
 
         def run_planner():
             return plan_to_frontier(
@@ -121,14 +184,25 @@ class PlanToFrontierTest(unittest.TestCase):
         for _ in range(5):
             start_time = time.perf_counter()
             result = run_planner()
-            durations.append(time.perf_counter() - start_time)
+            durations.append(
+                time.perf_counter() - start_time
+            )
 
             self.assertIsNotNone(result)
-            self.assertEqual(result["path"][0], robot_cell)
-            self.assertEqual(result["path"][-1], result["goal_cell"])
+            self.assertEqual(
+                result["path"][0],
+                robot_cell,
+            )
+            self.assertEqual(
+                result["path"][-1],
+                result["goal_cell"],
+            )
 
             for x, y in result["path"]:
-                self.assertEqual(data[y * width + x], 0)
+                self.assertEqual(
+                    data[y * width + x],
+                    0,
+                )
 
         median_seconds = statistics.median(durations)
         median_ms = median_seconds * 1000.0
@@ -138,8 +212,11 @@ class PlanToFrontierTest(unittest.TestCase):
             0.5,
             msg=(
                 "Median planning time was "
-                f"{median_ms:.1f} ms; expected less than 500 ms. "
-                f"All runs: {[round(value * 1000.0, 1) for value in durations]} ms"
+                f"{median_ms:.1f} ms; expected less than "
+                "500 ms. "
+                f"All runs: "
+                f"{[round(value * 1000.0, 1) for value in durations]} "
+                "ms"
             ),
         )
 

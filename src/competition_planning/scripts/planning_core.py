@@ -16,6 +16,55 @@ PLAN_NO_FRONTIER = "no_frontier"
 PLAN_UNREACHABLE = "unreachable"
 
 
+def order_frontier_candidates(cluster, robot_cell):
+    """
+    Order candidate cells within one Frontier cluster.
+
+    The existing centroid representative remains the first candidate.
+    Remaining cells are ordered by distance to the cluster centroid,
+    distance to the robot, and finally grid coordinates for deterministic
+    behavior.
+    """
+    if not cluster:
+        return []
+
+    representative = select_frontier_representative(cluster)
+
+    center_x = sum(cell[0] for cell in cluster) / len(cluster)
+    center_y = sum(cell[1] for cell in cluster) / len(cluster)
+
+    def candidate_key(cell):
+        centroid_distance_squared = (
+            (cell[0] - center_x) ** 2
+            + (cell[1] - center_y) ** 2
+        )
+        robot_distance_squared = (
+            (cell[0] - robot_cell[0]) ** 2
+            + (cell[1] - robot_cell[1]) ** 2
+        )
+
+        return (
+            centroid_distance_squared,
+            robot_distance_squared,
+            cell[1],
+            cell[0],
+        )
+
+    remaining_candidates = sorted(
+        (
+            cell
+            for cell in cluster
+            if cell != representative
+        ),
+        key=candidate_key,
+    )
+
+    return [
+        representative,
+        *remaining_candidates,
+    ]
+
+
 def plan_to_frontier_with_status(
     data,
     width,
@@ -35,7 +84,8 @@ def plan_to_frontier_with_status(
 
         - ``PLAN_SUCCESS``: a reachable frontier and path were found.
         - ``PLAN_NO_FRONTIER``: no usable frontier cluster exists.
-        - ``PLAN_UNREACHABLE``: frontier clusters exist, but none is reachable.
+        - ``PLAN_UNREACHABLE``: frontier clusters exist, but none is
+          reachable.
     """
     frontier_cells = extract_frontier_cells(
         data,
@@ -77,24 +127,29 @@ def plan_to_frontier_with_status(
         if selected_cluster is None:
             break
 
-        goal_cell = select_frontier_representative(selected_cluster)
-        path = astar_path(
-            planning_grid,
-            width,
-            height,
-            start=robot_cell,
-            goal=goal_cell,
-            obstacle_threshold=obstacle_threshold,
+        candidates = order_frontier_candidates(
+            selected_cluster,
+            robot_cell,
         )
 
-        if path is not None:
-            return {
-                "status": PLAN_SUCCESS,
-                "goal_cell": goal_cell,
-                "path": path,
-                "cluster": selected_cluster,
-                "frontier_count": len(frontier_cells),
-            }
+        for goal_cell in candidates:
+            path = astar_path(
+                planning_grid,
+                width,
+                height,
+                start=robot_cell,
+                goal=goal_cell,
+                obstacle_threshold=obstacle_threshold,
+            )
+
+            if path is not None:
+                return {
+                    "status": PLAN_SUCCESS,
+                    "goal_cell": goal_cell,
+                    "path": path,
+                    "cluster": selected_cluster,
+                    "frontier_count": len(frontier_cells),
+                }
 
         remaining_clusters.remove(selected_cluster)
 
