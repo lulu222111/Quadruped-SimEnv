@@ -46,6 +46,8 @@
 |---|---|---:|---|
 | `~frontier_min_size` | int | `5` | Frontier 聚类最少格子数 |
 | `~replan_interval` | float | `2.0` | 重规划周期，单位为秒 |
+| `~map_timeout` | float | `5.0` | 地图消息最长允许未更新时间，单位为秒 |
+| `~localization_timeout` | float | `5.0` | 定位消息最长允许未更新时间，单位为秒 |
 | `~inflation_radius` | float | `0.25` | 障碍物安全膨胀半径，单位为米 |
 | `~size_weight` | float | `1.0` | Frontier 区域大小评分权重 |
 | `~distance_weight` | float | `1.0` | 机器人到目标距离评分权重 |
@@ -67,6 +69,7 @@
 - [x] 接入地图和定位 ROS 话题
 - [x] 发布导航目标、路径和模块状态
 - [x] 51 项无 ROS 依赖的自动测试通过
+- [x] 地图或定位输入超时后撤销旧路径并发布 `TIMEOUT`
 
 ## 当前状态说明
 

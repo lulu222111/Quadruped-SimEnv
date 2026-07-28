@@ -37,6 +37,8 @@ class PlanningNode:
     def __init__(self):
         self.map_msg = None
         self.odom_msg = None
+        self.map_received_at = None
+        self.odom_received_at = None
 
         self.frontier_min_size = int(
             rospy.get_param("~frontier_min_size", 5)
@@ -56,12 +58,31 @@ class PlanningNode:
         self.obstacle_threshold = int(
             rospy.get_param("~obstacle_threshold", 50)
         )
+        self.map_timeout = float(
+            rospy.get_param("~map_timeout", 5.0)
+        )
+        self.localization_timeout = float(
+            rospy.get_param(
+                "~localization_timeout",
+                5.0,
+            )
+        )
 
         if self.replan_interval <= 0.0:
-            raise ValueError("replan_interval must be positive")
+            raise ValueError(
+                "replan_interval must be positive"
+            )
         if self.inflation_radius < 0.0:
             raise ValueError(
                 "inflation_radius must not be negative"
+            )
+        if self.map_timeout <= 0.0:
+            raise ValueError(
+                "map_timeout must be positive"
+            )
+        if self.localization_timeout <= 0.0:
+            raise ValueError(
+                "localization_timeout must be positive"
             )
 
         self.status_pub = rospy.Publisher(
@@ -115,9 +136,11 @@ class PlanningNode:
 
     def map_callback(self, msg):
         self.map_msg = msg
+        self.map_received_at = rospy.Time.now()
 
     def odom_callback(self, msg):
         self.odom_msg = msg
+        self.odom_received_at = rospy.Time.now()
 
     def publish_status(
         self,
@@ -145,7 +168,7 @@ class PlanningNode:
 
         if self.map_msg is not None:
             frame_id = (
-                self.map_msg.header.frame_id
+                self.map_msg.header.frame_id.strip()
                 or "map"
             )
 
@@ -164,14 +187,25 @@ class PlanningNode:
     def plan_callback(self, _event):
         map_msg = self.map_msg
         odom_msg = self.odom_msg
+        map_received_at = self.map_received_at
+        odom_received_at = self.odom_received_at
 
-        if map_msg is None or odom_msg is None:
+        map_missing = (
+            map_msg is None
+            or map_received_at is None
+        )
+        localization_missing = (
+            odom_msg is None
+            or odom_received_at is None
+        )
+
+        if map_missing or localization_missing:
             missing = []
 
-            if map_msg is None:
+            if map_missing:
                 missing.append("map")
 
-            if odom_msg is None:
+            if localization_missing:
                 missing.append("localization")
 
             self.invalidate_plan(
@@ -179,6 +213,41 @@ class PlanningNode:
                 0.0,
                 "waiting for "
                 + " and ".join(missing),
+            )
+            return
+
+        now = rospy.Time.now()
+        stale_inputs = []
+
+        map_age = (
+            now - map_received_at
+        ).to_sec()
+        localization_age = (
+            now - odom_received_at
+        ).to_sec()
+
+        if map_age > self.map_timeout:
+            stale_inputs.append("map")
+
+        if (
+            localization_age
+            > self.localization_timeout
+        ):
+            stale_inputs.append("localization")
+
+        if stale_inputs:
+            detail = (
+                "stale input timeout: "
+                + " and ".join(stale_inputs)
+            )
+            rospy.logwarn_throttle(
+                5.0,
+                detail,
+            )
+            self.invalidate_plan(
+                ModuleStatus.TIMEOUT,
+                0.0,
+                detail,
             )
             return
 
@@ -333,7 +402,7 @@ class PlanningNode:
             )
 
         frame_id = (
-            map_msg.header.frame_id
+            map_msg.header.frame_id.strip()
             or "map"
         )
         stamp = rospy.Time.now()

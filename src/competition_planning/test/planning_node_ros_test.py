@@ -217,6 +217,58 @@ class PlanningNodeRosTest(unittest.TestCase):
 
         late_goal_received = threading.Event()
 
+        self.clear_received_outputs()
+
+        self.map_pub.publish(reachable_map)
+        self.odom_pub.publish(
+            self.make_odom(2.5, 2.5)
+        )
+
+        recovered_status, recovered_path = self.wait_for(
+            lambda status, path: (
+                status is not None
+                and status.state == ModuleStatus.RUNNING
+                and status.valid
+                and path is not None
+                and len(path.poses) > 0
+            ),
+            "a recovered valid path before timeout",
+        )
+
+        self.assertTrue(recovered_status.valid)
+        self.assertGreater(
+            len(recovered_path.poses),
+            0,
+        )
+
+        self.clear_received_outputs()
+
+        timeout_status, timeout_path = self.wait_for(
+            lambda status, path: (
+                status is not None
+                and status.state == ModuleStatus.TIMEOUT
+                and not status.valid
+                and "stale input timeout" in status.detail
+                and path is not None
+                and len(path.poses) == 0
+            ),
+            "TIMEOUT status and empty path for stale inputs",
+        )
+
+        self.assertFalse(timeout_status.valid)
+        self.assertIn(
+            "map",
+            timeout_status.detail,
+        )
+        self.assertIn(
+            "localization",
+            timeout_status.detail,
+        )
+        self.assertEqual(
+            len(timeout_path.poses),
+            0,
+        )
+
         late_goal_sub = rospy.Subscriber(
             "/competition/navigation_goal",
             PoseStamped,

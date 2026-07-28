@@ -1,19 +1,19 @@
-<?xml version="1.0"?>
 <launch>
   <node
     pkg="competition_planning"
     type="planning_node"
     name="planning_node"
-    output="screen">
-
-    <param
-      name="replan_interval"
-      value="0.1" />
+    output="screen"
+  >
+    <param name="replan_interval" value="0.1" />
+    <param name="map_timeout" value="0.6" />
+    <param name="localization_timeout" value="0.6" />
   </node>
 
   <test
     test-name="planning_node_ros_test"
     pkg="competition_planning"
     type="planning_node_ros_test.py"
-    time-limit="30.0" />
+    time-limit="30.0"
+  />
 </launch>
