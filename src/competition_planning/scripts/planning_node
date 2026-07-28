@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from math import atan2, ceil
+from math import atan2, ceil, isfinite
 
 import rospy
 from competition_interfaces.msg import ModuleStatus
@@ -40,34 +40,103 @@ class PlanningNode:
         self.map_received_at = None
         self.odom_received_at = None
 
-        self.frontier_min_size = int(
-            rospy.get_param("~frontier_min_size", 5)
-        )
-        self.replan_interval = float(
-            rospy.get_param("~replan_interval", 2.0)
-        )
-        self.inflation_radius = float(
-            rospy.get_param("~inflation_radius", 0.25)
-        )
-        self.size_weight = float(
-            rospy.get_param("~size_weight", 1.0)
-        )
-        self.distance_weight = float(
-            rospy.get_param("~distance_weight", 1.0)
-        )
-        self.obstacle_threshold = int(
-            rospy.get_param("~obstacle_threshold", 50)
-        )
-        self.map_timeout = float(
-            rospy.get_param("~map_timeout", 5.0)
-        )
-        self.localization_timeout = float(
-            rospy.get_param(
-                "~localization_timeout",
-                5.0,
+        try:
+            self.frontier_min_size = int(
+                rospy.get_param(
+                    "~frontier_min_size",
+                    5,
+                )
             )
+            self.replan_interval = float(
+                rospy.get_param(
+                    "~replan_interval",
+                    2.0,
+                )
+            )
+            self.inflation_radius = float(
+                rospy.get_param(
+                    "~inflation_radius",
+                    0.25,
+                )
+            )
+            self.size_weight = float(
+                rospy.get_param(
+                    "~size_weight",
+                    1.0,
+                )
+            )
+            self.distance_weight = float(
+                rospy.get_param(
+                    "~distance_weight",
+                    1.0,
+                )
+            )
+            self.obstacle_threshold = int(
+                rospy.get_param(
+                    "~obstacle_threshold",
+                    50,
+                )
+            )
+            self.map_timeout = float(
+                rospy.get_param(
+                    "~map_timeout",
+                    5.0,
+                )
+            )
+            self.localization_timeout = float(
+                rospy.get_param(
+                    "~localization_timeout",
+                    5.0,
+                )
+            )
+        except (
+            TypeError,
+            ValueError,
+            OverflowError,
+        ) as error:
+            raise ValueError(
+                "invalid planning parameter: {}".format(
+                    error
+                )
+            ) from error
+
+        finite_parameters = (
+            (
+                "replan_interval",
+                self.replan_interval,
+            ),
+            (
+                "inflation_radius",
+                self.inflation_radius,
+            ),
+            (
+                "size_weight",
+                self.size_weight,
+            ),
+            (
+                "distance_weight",
+                self.distance_weight,
+            ),
+            (
+                "map_timeout",
+                self.map_timeout,
+            ),
+            (
+                "localization_timeout",
+                self.localization_timeout,
+            ),
         )
 
+        for name, value in finite_parameters:
+            if not isfinite(value):
+                raise ValueError(
+                    "{} must be finite".format(name)
+                )
+
+        if self.frontier_min_size < 1:
+            raise ValueError(
+                "frontier_min_size must be at least 1"
+            )
         if self.replan_interval <= 0.0:
             raise ValueError(
                 "replan_interval must be positive"
@@ -75,6 +144,18 @@ class PlanningNode:
         if self.inflation_radius < 0.0:
             raise ValueError(
                 "inflation_radius must not be negative"
+            )
+        if self.size_weight < 0.0:
+            raise ValueError(
+                "size_weight must not be negative"
+            )
+        if self.distance_weight < 0.0:
+            raise ValueError(
+                "distance_weight must not be negative"
+            )
+        if not 1 <= self.obstacle_threshold <= 100:
+            raise ValueError(
+                "obstacle_threshold must be in [1, 100]"
             )
         if self.map_timeout <= 0.0:
             raise ValueError(
@@ -294,7 +375,11 @@ class PlanningNode:
                 map_msg,
                 odom_msg,
             )
-        except (TypeError, ValueError) as error:
+        except (
+            TypeError,
+            ValueError,
+            OverflowError,
+        ) as error:
             rospy.logerr_throttle(
                 5.0,
                 "planning failed: %s",
@@ -313,9 +398,12 @@ class PlanningNode:
     ):
         info = map_msg.info
 
-        if info.resolution <= 0.0:
+        if (
+            not isfinite(info.resolution)
+            or info.resolution <= 0.0
+        ):
             raise ValueError(
-                "map resolution must be positive"
+                "map resolution must be finite and positive"
             )
 
         origin = info.origin
@@ -326,6 +414,23 @@ class PlanningNode:
         robot_position = (
             odom_msg.pose.pose.position
         )
+
+        finite_pose_values = (
+            origin.position.x,
+            origin.position.y,
+            origin_yaw,
+            robot_position.x,
+            robot_position.y,
+        )
+
+        if not all(
+            isfinite(value)
+            for value in finite_pose_values
+        ):
+            raise ValueError(
+                "map origin and robot position must be finite"
+            )
+
         robot_cell = world_to_grid_cell(
             (
                 robot_position.x,
