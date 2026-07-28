@@ -1,6 +1,5 @@
 # HazardCandidate — a single detected hazard-source candidate.
 # Published by the perception module on /competition/hazard_candidates.
-
 std_msgs/Header header
 
 # Position in the frame specified by header.frame_id.
