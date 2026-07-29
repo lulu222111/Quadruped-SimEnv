@@ -2,6 +2,7 @@
 
 """ROS-independent exploration planning pipeline."""
 
+from collections import deque
 from math import atan2
 
 from frontier import (
@@ -10,7 +11,7 @@ from frontier import (
     select_best_frontier_cluster,
     select_frontier_representative,
 )
-from path_planner import astar_path, inflate_obstacles
+from path_planner import inflate_obstacles
 
 
 PLAN_SUCCESS = "success"
@@ -105,6 +106,66 @@ def order_frontier_candidates(cluster, robot_cell):
     ]
 
 
+def _bfs_reachability(
+    grid,
+    width,
+    height,
+    start,
+    obstacle_threshold=50,
+):
+    """
+    Single-source BFS over a 4-connected occupancy grid.
+
+    Returns a ``parent`` dict that maps each reachable cell to the
+    neighbour from which it was first discovered.  The start cell maps
+    to ``None``.  Cells absent from the dict are unreachable.
+
+    Paths reconstructed by following parent pointers are shortest paths
+    under unit edge weights.
+    """
+    parent = {}
+
+    sx, sy = start
+    if not (0 <= sx < width and 0 <= sy < height):
+        return parent
+
+    start_value = grid[sy * width + sx]
+    if not (0 <= start_value < obstacle_threshold):
+        return parent
+
+    parent[start] = None
+    queue = deque([start])
+
+    neighbour_offsets = (
+        (0, -1),
+        (-1, 0),
+        (1, 0),
+        (0, 1),
+    )
+
+    while queue:
+        cx, cy = queue.popleft()
+
+        for dx, dy in neighbour_offsets:
+            nx, ny = cx + dx, cy + dy
+
+            if not (0 <= nx < width and 0 <= ny < height):
+                continue
+
+            neighbour = (nx, ny)
+            if neighbour in parent:
+                continue
+
+            value = grid[ny * width + nx]
+            if not (0 <= value < obstacle_threshold):
+                continue
+
+            parent[neighbour] = (cx, cy)
+            queue.append(neighbour)
+
+    return parent
+
+
 def plan_to_frontier_with_status(
     data,
     width,
@@ -176,6 +237,14 @@ def plan_to_frontier_with_status(
 
     remaining_clusters = list(clusters)
 
+    parent = _bfs_reachability(
+        planning_grid,
+        width,
+        height,
+        start=robot_cell,
+        obstacle_threshold=obstacle_threshold,
+    )
+
     while remaining_clusters:
         selected_cluster = select_best_frontier_cluster(
             remaining_clusters,
@@ -193,16 +262,14 @@ def plan_to_frontier_with_status(
         )
 
         for goal_cell in candidates:
-            path = astar_path(
-                planning_grid,
-                width,
-                height,
-                start=robot_cell,
-                goal=goal_cell,
-                obstacle_threshold=obstacle_threshold,
-            )
+            if goal_cell in parent:
+                path = []
+                cell = goal_cell
+                while cell is not None:
+                    path.append(cell)
+                    cell = parent[cell]
+                path.reverse()
 
-            if path is not None:
                 return {
                     "status": PLAN_SUCCESS,
                     "goal_cell": goal_cell,
