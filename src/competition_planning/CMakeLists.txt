@@ -16,6 +16,14 @@ catkin_package(
   competition_interfaces
 )
 
+if(CATKIN_ENABLE_TESTING)
+  find_package(rostest REQUIRED)
+
+  add_rostest(
+    test/planning_node_ros.test
+  )
+endif()
+
 install(DIRECTORY scripts
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
   PATTERN "__pycache__" EXCLUDE
