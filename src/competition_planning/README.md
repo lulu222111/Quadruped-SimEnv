@@ -39,7 +39,7 @@
 | 输出话题 | 类型 | 使用模块 | 说明 |
 |---|---|---|---|
 | `/competition/navigation_goal` | `geometry_msgs/PoseStamped` | control | 当前 Frontier 导航目标 |
-| `/competition/path` | `nav_msgs/Path` | control | A* 规划路径 |
+| `/competition/path` | `nav_msgs/Path` | control | 四邻域最短路径 |
 | `/competition/planning/status` | `competition_interfaces/ModuleStatus` | competition_loop | 规划模块状态 |
 
 ### 输出安全约定
@@ -88,7 +88,7 @@
 - [x] 整个 Frontier 簇不可达后尝试下一片 Frontier
 - [x] 地图格子坐标与世界坐标双向转换
 - [x] 支持带旋转的地图原点
-- [x] 四邻域 A* 路径规划
+- [x] 单源四邻域BFS最短路径规划
 - [x] 单源 BFS 可达性搜索树在所有 Frontier 候选间复用
 - [x] 障碍物安全膨胀
 - [x] 膨胀覆盖机器人起点时，仅恢复原本空闲的起点格
@@ -127,7 +127,7 @@
 - 同簇多候选点回退；
 - 地图格子坐标与世界坐标转换；
 - 带旋转地图原点；
-- 四邻域 A*；
+- 四邻域BFS最短路径；
 - 障碍物膨胀；
 - 机器人起点被膨胀覆盖时的安全恢复；
 - 探索完成与不可达状态区分；
@@ -136,17 +136,6 @@
 - 单源 BFS 可达性搜索在所有 Frontier 候选间复用；
 - 同簇代表点不可达时回退至同簇其他候选（含真实网格验证）；
 - 重建路径完全由合法空闲格组成；
-- 起点等于目标、起点越界、起点被障碍占用的边界情况。<｜end▁of▁thinking｜>
-
-<｜｜DSML｜｜parameter name="new_string" string="true">- 四邻域 A*；
-- 障碍物膨胀；
-- 机器人起点被膨胀覆盖时的安全恢复；
-- 探索完成与不可达状态区分；
-- 20×36 m 和 400×400 地图规划性能；
-- 路径方向计算；
-- 单源 BFS 可达性搜索在全部 Frontier 候选间复用；
-- 同簇代表点不可达时回退至同簇其他候选（含真实网格验证）；
-- 重建路径全部由合法空闲格组成；
 - 起点等于目标、起点越界、起点被障碍占用的边界情况。
 
 当前预期结果：
