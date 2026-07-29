@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mock_planning_node — publish synthetic navigation goals for integration testing.
 
-ALL data is hard-coded. Requires test_mode=true.
+ALL data is hard-coded. Runs ONLY in test mode (competition_mode=false).
 """
 
 from __future__ import annotations
@@ -28,9 +28,13 @@ MOCK_WAYPOINTS = [
 def main():
     rospy.init_node("mock_planning", log_level=rospy.INFO)
 
-    test_mode = rospy.get_param("/competition_loop/competition_mode", True)
-    if not test_mode:
-        rospy.logerr("mock_planning: test_mode=false, refusing to run!")
+    # Guard: competition_mode=true means official competition — refuse to run
+    competition_mode = rospy.get_param("/competition_loop/competition_mode", True)
+    if competition_mode:
+        rospy.logerr(
+            "mock_planning: competition_mode=true — "
+            "mock nodes MUST NOT run in official competition. Refusing to start."
+        )
         sys.exit(1)
 
     rospy.loginfo("mock_planning: publishing synthetic goals (TEST MODE ONLY).")
