@@ -1,50 +1,64 @@
 #!/usr/bin/env python3
-"""cmd_vel_guard_node — exclusive /cmd_vel publisher with safety gating.
+"""Exclusive /cmd_vel publisher and authoritative control-status aggregator.
 
-This is the ONLY node in the competition system permitted to publish to
-the robot's /cmd_vel topic. All other control code MUST publish to
-/competition/raw_cmd_vel instead.
+Subscribes:
+  /competition/raw_cmd_vel
+  /competition/control/path_follower_status
+  /competition/control_enabled
+  /competition/emergency_stop
 
-Safety features:
-  - Defaults to control_enabled=false, emergency_stop=true (safe state)
-  - /cmd_vel timeout: if no new raw_cmd_vel within cmd_vel_timeout, publishes zero velocity
-  - Parameterised velocity limits on linear.x, linear.y, angular.z
-  - On shutdown, publishes multiple zero-velocity messages
-  - Does NOT forward unused Twist degrees of freedom (angular.x, angular.y, linear.z)
+Publishes:
+  /cmd_vel
+  /competition/control/status
+
+Safety conditions always override the path follower's reported state.
 """
 
 from __future__ import annotations
 
-import rospy
+import math
+
 import geometry_msgs.msg
+import rospy
 import std_msgs.msg
+
+from competition_interfaces.msg import ModuleStatus
 
 
 class CmdVelGuard:
-    """Safety gate between raw velocity commands and the robot's /cmd_vel."""
+    """Gate raw velocity and aggregate the authoritative control status."""
 
     def __init__(self):
         rospy.init_node("cmd_vel_guard", log_level=rospy.INFO)
 
-        # --- Parameters (conservative defaults) ---
-        self._timeout = rospy.get_param("~cmd_vel_timeout", 0.5)  # seconds
-        self._max_linear_x = rospy.get_param("~max_linear_x", 0.5)
-        self._max_linear_y = rospy.get_param("~max_linear_y", 0.3)
-        self._max_angular_z = rospy.get_param("~max_angular_z", 1.0)
+        self._timeout = self._positive_param("~cmd_vel_timeout", 0.5)
+        self._path_status_timeout = self._positive_param(
+            "~path_follower_status_timeout", 1.0
+        )
+        self._max_linear_x = self._positive_param("~max_linear_x", 0.5)
+        self._max_linear_y = self._positive_param("~max_linear_y", 0.3)
+        self._max_angular_z = self._positive_param("~max_angular_z", 1.0)
 
-        # --- State ---
-        self._last_raw_cmd_time: rospy.Time | None = None
+        self._last_raw_cmd_time = None
+        self._last_path_status_time = None
+        self._path_status = None
         self._control_enabled = False
         self._emergency_stop = True
+        self._raw_cmd_finite = True
         self._raw_linear_x = 0.0
         self._raw_linear_y = 0.0
         self._raw_angular_z = 0.0
 
-        # --- Subscribers ---
         self._raw_sub = rospy.Subscriber(
             "/competition/raw_cmd_vel",
             geometry_msgs.msg.Twist,
             self._raw_cmd_callback,
+            queue_size=10,
+        )
+        self._path_status_sub = rospy.Subscriber(
+            "/competition/control/path_follower_status",
+            ModuleStatus,
+            self._path_status_callback,
             queue_size=10,
         )
         self._enabled_sub = rospy.Subscriber(
@@ -60,121 +74,201 @@ class CmdVelGuard:
             queue_size=1,
         )
 
-        # --- Exclusive /cmd_vel publisher ---
+        # These are the only publishers for the final velocity and public status.
         self._cmd_vel_pub = rospy.Publisher(
             "/cmd_vel", geometry_msgs.msg.Twist, queue_size=1
         )
-
-        # --- Status publisher ---
-        from competition_interfaces.msg import ModuleStatus
         self._status_pub = rospy.Publisher(
             "/competition/control/status", ModuleStatus, queue_size=10, latch=True
         )
 
-        # --- Main control loop timer (50 Hz) ---
         self._timer = rospy.Timer(rospy.Duration(0.02), self._control_loop)
-
         rospy.on_shutdown(self._on_shutdown)
 
         rospy.loginfo(
-            "cmd_vel_guard started: timeout=%.2fs, limits=(%.2f, %.2f, %.2f). "
-            "Default: control_enabled=false, emergency_stop=true.",
+            "cmd_vel_guard started: cmd timeout=%.2fs, path-status timeout=%.2fs, "
+            "limits=(%.2f, %.2f, %.2f). Safe defaults are active.",
             self._timeout,
+            self._path_status_timeout,
             self._max_linear_x,
             self._max_linear_y,
             self._max_angular_z,
         )
 
-    # ------------------------------------------------------------------
-    # Callbacks
-    # ------------------------------------------------------------------
-
-    def _raw_cmd_callback(self, msg: geometry_msgs.msg.Twist):
+    def _raw_cmd_callback(self, msg):
         self._last_raw_cmd_time = rospy.Time.now()
-        self._raw_linear_x = msg.linear.x
-        self._raw_linear_y = msg.linear.y
-        self._raw_angular_z = msg.angular.z
-
-    def _enabled_callback(self, msg: std_msgs.msg.Bool):
-        self._control_enabled = msg.data
-
-    def _estop_callback(self, msg: std_msgs.msg.Bool):
-        self._emergency_stop = msg.data
-
-    # ------------------------------------------------------------------
-    # Main control loop
-    # ------------------------------------------------------------------
-
-    def _control_loop(self, event):
-        cmd = geometry_msgs.msg.Twist()
-        status_detail = ""
-
-        # Determine the output velocity
-        if self._emergency_stop:
-            # Estop active → zero velocity
-            cmd.linear.x = 0.0
-            cmd.linear.y = 0.0
-            cmd.angular.z = 0.0
-            status_detail = "emergency_stop active"
-
-        elif not self._control_enabled:
-            # Control not enabled → zero velocity
-            cmd.linear.x = 0.0
-            cmd.linear.y = 0.0
-            cmd.angular.z = 0.0
-            status_detail = "control_disabled"
-
-        elif self._is_timed_out():
-            # No recent raw command → timeout → zero velocity
-            cmd.linear.x = 0.0
-            cmd.linear.y = 0.0
-            cmd.angular.z = 0.0
-            status_detail = f"cmd_vel_timeout ({self._timeout:.2f}s)"
-
+        values = (msg.linear.x, msg.linear.y, msg.angular.z)
+        self._raw_cmd_finite = all(math.isfinite(value) for value in values)
+        if self._raw_cmd_finite:
+            (
+                self._raw_linear_x,
+                self._raw_linear_y,
+                self._raw_angular_z,
+            ) = values
         else:
-            # Normal operation → apply limits and forward
+            # Never retain a previous non-zero command after invalid input.
+            self._raw_linear_x = 0.0
+            self._raw_linear_y = 0.0
+            self._raw_angular_z = 0.0
+
+    def _path_status_callback(self, msg):
+        self._path_status = msg
+        self._last_path_status_time = rospy.Time.now()
+
+    def _enabled_callback(self, msg):
+        self._control_enabled = bool(msg.data)
+
+    def _estop_callback(self, msg):
+        self._emergency_stop = bool(msg.data)
+
+    def _control_loop(self, _event):
+        now = rospy.Time.now()
+        cmd = geometry_msgs.msg.Twist()
+
+        state, valid, confidence, detail, allow_motion = self._select_status(now)
+        if allow_motion:
             cmd.linear.x = self._clamp(self._raw_linear_x, self._max_linear_x)
             cmd.linear.y = self._clamp(self._raw_linear_y, self._max_linear_y)
-            cmd.angular.z = self._clamp(self._raw_angular_z, self._max_angular_z)
-            status_detail = "forwarding"
+            cmd.angular.z = self._clamp(
+                self._raw_angular_z, self._max_angular_z
+            )
 
-        # Never forward unused DOF: angular.x, angular.y, linear.z remain 0
+        # Unused Twist degrees of freedom remain zero.
         self._cmd_vel_pub.publish(cmd)
+        self._publish_status(state, valid, confidence, detail, now)
 
-        # Publish status
-        self._publish_status(status_detail)
+    def _select_status(self, now):
+        """Return status fields and whether raw velocity may be forwarded."""
 
-    def _is_timed_out(self) -> bool:
-        if self._last_raw_cmd_time is None:
-            return True
-        elapsed = (rospy.Time.now() - self._last_raw_cmd_time).to_sec()
-        return elapsed > self._timeout
-
-    def _publish_status(self, detail: str):
-        from competition_interfaces.msg import ModuleStatus
-        msg = ModuleStatus()
-        msg.header.stamp = rospy.Time.now()
-
+        # Safety-gateway conditions have priority over all follower states.
         if self._emergency_stop:
-            msg.state = ModuleStatus.BLOCKED
-            msg.valid = False
-        elif not self._control_enabled:
-            msg.state = ModuleStatus.READY
-            msg.valid = False
-        elif self._is_timed_out():
-            msg.state = ModuleStatus.BLOCKED
-            msg.valid = True
-        else:
-            msg.state = ModuleStatus.RUNNING
-            msg.valid = True
+            return (
+                ModuleStatus.BLOCKED,
+                False,
+                0.0,
+                "emergency_stop active",
+                False,
+            )
 
-        msg.confidence = 1.0 if msg.valid else 0.0
+        if not self._control_enabled:
+            return (
+                ModuleStatus.READY,
+                False,
+                0.0,
+                "control_disabled",
+                False,
+            )
+
+        if not self._raw_cmd_finite:
+            return (
+                ModuleStatus.FAILED,
+                False,
+                0.0,
+                "non-finite raw_cmd_vel rejected",
+                False,
+            )
+
+        raw_age = self._age(self._last_raw_cmd_time, now)
+        if raw_age is None:
+            return (
+                ModuleStatus.TIMEOUT,
+                False,
+                0.0,
+                "waiting for /competition/raw_cmd_vel",
+                False,
+            )
+        if raw_age < 0.0:
+            return (
+                ModuleStatus.TIMEOUT,
+                False,
+                0.0,
+                "ROS time moved backwards after raw_cmd_vel",
+                False,
+            )
+        if raw_age > self._timeout:
+            return (
+                ModuleStatus.TIMEOUT,
+                False,
+                0.0,
+                "raw_cmd_vel timeout ({:.2f}s)".format(self._timeout),
+                False,
+            )
+
+        if self._path_status is None or self._last_path_status_time is None:
+            return (
+                ModuleStatus.STARTING,
+                False,
+                0.0,
+                "waiting for /competition/control/path_follower_status",
+                False,
+            )
+
+        status_age = self._age(self._last_path_status_time, now)
+        if status_age < 0.0:
+            return (
+                ModuleStatus.TIMEOUT,
+                False,
+                0.0,
+                "ROS time moved backwards after path_follower_status",
+                False,
+            )
+        if status_age > self._path_status_timeout:
+            return (
+                ModuleStatus.TIMEOUT,
+                False,
+                0.0,
+                "path_follower_status timeout ({:.2f}s)".format(
+                    self._path_status_timeout
+                ),
+                False,
+            )
+
+        follower = self._path_status
+        follower_failed = follower.state in (
+            ModuleStatus.FAILED,
+            ModuleStatus.TIMEOUT,
+            ModuleStatus.BLOCKED,
+        )
+        if follower_failed or not follower.valid:
+            state = (
+                follower.state
+                if follower.state != ModuleStatus.UNKNOWN
+                else ModuleStatus.FAILED
+            )
+            return state, False, 0.0, follower.detail, False
+
+        if follower.state == ModuleStatus.RUNNING:
+            return (
+                ModuleStatus.RUNNING,
+                True,
+                follower.confidence,
+                follower.detail,
+                True,
+            )
+
+        # SUCCEEDED and all non-running states are deliberately zero-velocity.
+        return (
+            follower.state,
+            bool(follower.valid),
+            follower.confidence,
+            follower.detail,
+            False,
+        )
+
+    @staticmethod
+    def _age(stamp, now):
+        if stamp is None:
+            return None
+        return (now - stamp).to_sec()
+
+    def _publish_status(self, state, valid, confidence, detail, stamp):
+        msg = ModuleStatus()
+        msg.header.stamp = stamp
+        msg.state = state
+        msg.valid = valid
+        msg.confidence = confidence
         msg.detail = detail
         self._status_pub.publish(msg)
-
-    # ------------------------------------------------------------------
-    # Shutdown
-    # ------------------------------------------------------------------
 
     def _on_shutdown(self):
         rospy.loginfo("cmd_vel_guard shutting down; publishing zero velocity.")
@@ -183,13 +277,16 @@ class CmdVelGuard:
             self._cmd_vel_pub.publish(zero)
             rospy.sleep(0.05)
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _clamp(value, limit):
+        return max(-limit, min(value, limit))
 
     @staticmethod
-    def _clamp(value: float, limit: float) -> float:
-        return max(-limit, min(value, limit))
+    def _positive_param(name, default):
+        value = float(rospy.get_param(name, default))
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("{} must be finite and greater than zero".format(name))
+        return value
 
     def run(self):
         rospy.spin()
