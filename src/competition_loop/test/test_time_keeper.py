@@ -310,6 +310,36 @@ class TestTimeKeeperRegression(unittest.TestCase):
         _MockTime.set_now(30.0)  # now behind start
         self.assertEqual(tk.elapsed_seconds, 0.0)  # not negative
 
+    def test_sequential_100_101_01_02_03(self):
+        """Sequence 100→101→0.1→0.2→0.3: only one regression detected.
+
+        After regression at 0.1, the baseline is updated to 0.1.
+        Subsequent 0.2 and 0.3 are NOT regressions (they are > 0.1).
+        """
+        tk = TimeKeeper(max_time=600.0)
+
+        # Advance normally
+        _MockTime.set_now(100.0)
+        self.assertFalse(tk.check_time_regression(), "100: no regression")
+
+        _MockTime.set_now(101.0)
+        self.assertFalse(tk.check_time_regression(), "101: no regression")
+
+        # Time resets to 0.1 — regression detected
+        _MockTime.set_now(0.1)
+        self.assertTrue(tk.check_time_regression(), "0.1: regression from 101")
+        self.assertTrue(tk.regression_detected)
+
+        # Next tick at 0.2 — baseline is now 0.1, so 0.2 > 0.1 → no regression
+        _MockTime.set_now(0.2)
+        self.assertFalse(tk.check_time_regression(), "0.2: no regression (baseline was 0.1)")
+        self.assertFalse(tk.regression_detected)
+
+        # Next tick at 0.3 — baseline is now 0.2, so 0.3 > 0.2 → no regression
+        _MockTime.set_now(0.3)
+        self.assertFalse(tk.check_time_regression(), "0.3: no regression (baseline was 0.2)")
+        self.assertFalse(tk.regression_detected)
+
 
 if __name__ == "__main__":
     unittest.main()

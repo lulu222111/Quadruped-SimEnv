@@ -74,10 +74,18 @@ class TimeKeeper:
     def check_time_regression(self) -> bool:
         """Check if ROS time moved backwards since last call.
 
-        Updates internal tracking. Returns True if regression detected.
-        The caller should enter a safe state.
+        ALWAYS updates _last_time to the current time, even when regression
+        is detected.  This ensures the next call compares against the most
+        recent time, not a stale historical baseline.
+
+        Sequence 100→101→0.1→0.2:
+          tick 100: no regression, _last = 100
+          tick 101: no regression, _last = 101
+          tick 0.1: regression detected, _last = 0.1  (UPDATED)
+          tick 0.2: no regression (0.2 > 0.1), _last = 0.2
         """
         now = rospy.Time.now()
+        regression = False
         if self._last_time is not None and now < self._last_time:
             rospy.logerr(
                 "TimeKeeper: ROS time regression detected: "
@@ -86,11 +94,13 @@ class TimeKeeper:
                 now.to_sec(),
                 (now - self._last_time).to_sec(),
             )
+            regression = True
             self._regression_detected = True
-            return True
+        else:
+            self._regression_detected = False
+        # ALWAYS update baseline — even on regression
         self._last_time = now
-        self._regression_detected = False
-        return False
+        return regression
 
     def start(self) -> None:
         if self._running:

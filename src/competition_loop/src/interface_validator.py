@@ -10,9 +10,10 @@ Validation uses explicit state flags rather than relying on an empty error list.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Any, List, Optional, Set
 
 import rospy
 
@@ -23,6 +24,9 @@ class InterfaceValidator:
     Explicit state flags track which checks have been completed and whether
     they passed.  is_ready() requires ALL mandatory checks to be completed
     AND passed — an empty error list alone is never sufficient.
+
+    Warnings (e.g. forbidden file presence) are tracked separately from
+    errors and do NOT affect is_ready().
     """
 
     # The single file the competition algorithm is allowed to read.
@@ -42,12 +46,17 @@ class InterfaceValidator:
         self._competition_mode = competition_mode
         self._scene_info: Optional[dict] = None
         self._validation_errors: List[str] = []
+        self._validation_warnings: List[str] = []
 
         # --- Explicit validation state flags ---
         self._scene_info_loaded: bool = False
         self._forbidden_topic_check_completed: bool = False
         self._forbidden_topic_check_passed: bool = False
         self._forbidden_file_check_completed: bool = False
+
+        # Retry tracking for Master query failures
+        self._next_topic_retry_time: Optional[rospy.Time] = None
+        self._topic_retry_interval = rospy.Duration.from_sec(2.0)  # 2 s between retries
 
     # ------------------------------------------------------------------
     # Explicit state accessors
@@ -82,6 +91,9 @@ class InterfaceValidator:
 
         Returns the parsed JSON dict, or None on failure.
         Stores the result for later checks.
+
+        The root of the JSON document MUST be a dict (object).  Lists,
+        strings, numbers, and null are rejected.
         """
         root = Path(workspace_root) if workspace_root else Path.cwd()
         path = root / self.ALLOWED_SCENE_FILE
@@ -101,6 +113,16 @@ class InterfaceValidator:
             self._scene_info_loaded = False
             return None
 
+        if not isinstance(data, dict):
+            msg = (
+                f"Root of {path} is not a JSON object (got {type(data).__name__}). "
+                f"Expected a dict with 'schema' and 'referee_only' keys."
+            )
+            rospy.logerr(msg)
+            self._validation_errors.append(msg)
+            self._scene_info_loaded = False
+            return None
+
         self._scene_info = data
         self._scene_info_loaded = True
         rospy.loginfo("Loaded team_scene_info.json (schema: %s)", data.get("schema", "unknown"))
@@ -110,15 +132,25 @@ class InterfaceValidator:
     # Forbidden topic check (competition mode only)
     # ------------------------------------------------------------------
 
-    def check_forbidden_topics(self, timeout: float = 3.0) -> bool:
+    def check_forbidden_topics(self) -> bool:
         """Verify that no forbidden topics are currently being published.
 
         Returns True if the environment is clean, False otherwise.
         Does NOT subscribe to the forbidden topics — only inspects the
-        ROS master topic list.
+        ROS master topic list via get_published_topics().
 
         In test mode the check is explicitly recorded as completed and
         passed without querying the master.
+
+        ROS Master query failures are treated as transient: the check
+        remains incomplete so it will be retried on the next call.
+        Only a confirmed detection of forbidden topics sets the check
+        to completed + failed permanently.
+
+        NOTE: rospy.get_published_topics(namespace='/') takes a string
+        namespace, NOT a float timeout.  The real signature is:
+            def get_published_topics(namespace='/'):
+        It returns [[topic_name, topic_type], ...].
         """
         if not self._competition_mode:
             rospy.loginfo("Test mode: skipping forbidden-topic check (recorded as passed).")
@@ -139,23 +171,35 @@ class InterfaceValidator:
             self._forbidden_topic_check_passed = True
             return True
 
-        rospy.loginfo("Checking for forbidden topics (timeout=%.1f s)...", timeout)
+        # Respect retry interval if a previous Master query failed
+        if self._next_topic_retry_time is not None:
+            if rospy.Time.now() < self._next_topic_retry_time:
+                # Not yet time to retry — keep check incomplete so the
+                # caller will ask again later
+                return False
+            self._next_topic_retry_time = None
 
-        # rospy.get_published_topics() returns [(topic_name, topic_type), ...]
-        # We must extract only the topic names for correct membership tests.
+        rospy.loginfo("Checking for forbidden topics via ROS Master...")
+
+        # rospy.get_published_topics(namespace='/') is the correct API.
+        # It takes a string namespace (default '/'), NOT a float timeout.
+        # Returns [[topic_name, topic_type], ...].
         try:
-            published: List[tuple] = rospy.get_published_topics(timeout)
+            published: List[list] = rospy.get_published_topics()
         except rospy.ROSException as exc:
             msg = f"Failed to query published topics from ROS Master: {exc}"
-            rospy.logerr(msg)
+            rospy.logwarn_throttle(10.0, msg)
+            # Do NOT set completed=True — this is a transient error,
+            # let the caller retry on the next tick.
+            # Schedule next retry after the interval.
+            self._next_topic_retry_time = rospy.Time.now() + self._topic_retry_interval
             # Do not append duplicate errors
             if msg not in self._validation_errors:
                 self._validation_errors.append(msg)
-            self._forbidden_topic_check_completed = True
-            self._forbidden_topic_check_passed = False
             return False
 
-        published_names: Set[str] = {topic_name for topic_name, _topic_type in published}
+        # Extract topic names from [[topic_name, topic_type], ...]
+        published_names: Set[str] = {item[0] for item in published}
 
         ok = True
         for topic in forbidden:
@@ -171,6 +215,7 @@ class InterfaceValidator:
                     self._validation_errors.append(msg)
                 ok = False
 
+        # On confirmed detection or confirmed clean, mark completed
         self._forbidden_topic_check_completed = True
         self._forbidden_topic_check_passed = ok
 
@@ -190,13 +235,12 @@ class InterfaceValidator:
 
         Principles:
           - Algorithm code MUST NOT read these files.
-          - In competition mode, file presence triggers a warning.
+          - In competition mode, file presence triggers a WARNING (not error).
           - In test mode, file presence is logged at info level.
           - NEVER read file contents.
           - NEVER delete files automatically.
           - NEVER run evaluation scripts.
-          - File existence alone does NOT block startup unless project
-            rules explicitly require it.
+          - File existence alone does NOT affect is_ready().
         """
         root = Path(workspace_root) if workspace_root else Path.cwd()
         ok = True
@@ -210,9 +254,10 @@ class InterfaceValidator:
                     rospy.logwarn(msg)
                 else:
                     rospy.loginfo("Test mode: %s (allowed for debugging)", msg)
-                # Do not append duplicate warnings
-                if msg not in self._validation_errors:
-                    self._validation_errors.append(msg)
+                # Store as warning, NOT error — file presence alone does not
+                # prove the algorithm read it.
+                if msg not in self._validation_warnings:
+                    self._validation_warnings.append(msg)
 
         self._forbidden_file_check_completed = True
         return ok
@@ -242,6 +287,10 @@ class InterfaceValidator:
     def errors(self) -> List[str]:
         return list(self._validation_errors)
 
+    @property
+    def warnings(self) -> List[str]:
+        return list(self._validation_warnings)
+
     def report(self) -> str:
         lines = []
         if self._scene_info_loaded:
@@ -261,5 +310,10 @@ class InterfaceValidator:
                 lines.append(f"  - {e}")
         else:
             lines.append("Errors: none")
+
+        if self._validation_warnings:
+            lines.append("Warnings:")
+            for w in self._validation_warnings:
+                lines.append(f"  - {w}")
 
         return "\n".join(lines)
