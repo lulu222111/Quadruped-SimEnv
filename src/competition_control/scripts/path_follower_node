@@ -1,52 +1,323 @@
 #!/usr/bin/env python3
-"""path_follower_node — execute a planned path by publishing to /competition/raw_cmd_vel.
+"""Minimal, safety-checked path follower for the competition control loop.
 
-SKELETON ONLY — algorithm not implemented.
+Subscribes:
+  /competition/path
+  /competition/localization/odom
 
-This node publishes to /competition/raw_cmd_vel ONLY, never directly to /cmd_vel.
-The cmd_vel_guard_node is the sole publisher of /cmd_vel.
+Publishes:
+  /competition/raw_cmd_vel
+  /competition/control/path_follower_status
+
+This node never publishes /cmd_vel or /competition/control/status.
 """
 
 from __future__ import annotations
 
-import rospy
+import math
+
 import geometry_msgs.msg
+import nav_msgs.msg
+import rospy
+
 from competition_interfaces.msg import ModuleStatus
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def normalize_angle(angle):
+    if not math.isfinite(angle):
+        raise ValueError("angle is not finite")
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def yaw_from_quaternion(q):
+    values = (q.x, q.y, q.z, q.w)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("odom quaternion contains NaN or Inf")
+    norm = math.sqrt(sum(value * value for value in values))
+    if norm < 1.0e-9:
+        raise ValueError("odom quaternion has zero norm")
+    x, y, z, w = (value / norm for value in values)
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+    if not math.isfinite(yaw):
+        raise ValueError("computed odom yaw is not finite")
+    return yaw
+
+
+class PathFollower:
+    def __init__(self):
+        self.path = []
+        self.path_frame = ""
+        self.path_time = None
+        self.path_error = None
+        self.odom = None
+        self.odom_time = None
+        self.odom_error = None
+        self.target_index = 0
+
+        self.max_linear = self._positive_param("~max_linear", 0.25)
+        self.max_angular = self._positive_param("~max_angular", 0.8)
+        self.goal_tolerance = self._positive_param("~goal_tolerance", 0.2)
+        self.path_timeout = rospy.Duration(
+            self._positive_param("~path_timeout", 5.0)
+        )
+        self.odom_timeout = rospy.Duration(
+            self._positive_param("~odom_timeout", 1.0)
+        )
+
+        self.raw_vel_pub = rospy.Publisher(
+            "/competition/raw_cmd_vel", geometry_msgs.msg.Twist, queue_size=1
+        )
+        self.status_pub = rospy.Publisher(
+            "/competition/control/path_follower_status",
+            ModuleStatus,
+            queue_size=10,
+            latch=True,
+        )
+
+        rospy.Subscriber(
+            "/competition/path", nav_msgs.msg.Path, self.on_path, queue_size=1
+        )
+        rospy.Subscriber(
+            "/competition/localization/odom",
+            nav_msgs.msg.Odometry,
+            self.on_odom,
+            queue_size=1,
+        )
+
+    def on_path(self, msg):
+        """Safely replace the current path, including explicit cancellation."""
+        now = rospy.Time.now()
+        self.path = []
+        self.path_frame = msg.header.frame_id
+        self.path_time = now
+        self.path_error = self._validate_path(msg)
+        self.target_index = 0
+
+        if self.path_error is None:
+            self.path = list(msg.poses)
+            self.target_index = self._initial_target_index()
+
+        if not msg.poses:
+            # Empty path means cancellation. Do not retain or execute an old path.
+            self.raw_vel_pub.publish(geometry_msgs.msg.Twist())
+
+        rospy.loginfo("path received: %d poses", len(msg.poses))
+
+    def on_odom(self, msg):
+        self.odom = msg
+        self.odom_time = rospy.Time.now()
+        self.odom_error = self._validate_odom(msg)
+        rospy.loginfo_throttle(2.0, "odom received")
+
+    def publish_status(self, state, valid, confidence, detail):
+        msg = ModuleStatus()
+        msg.header.stamp = rospy.Time.now()
+        msg.state = state
+        msg.valid = valid
+        msg.confidence = confidence
+        msg.detail = detail
+        self.status_pub.publish(msg)
+
+    def publish_stop(self, state, detail, valid=False, confidence=0.0):
+        self.raw_vel_pub.publish(geometry_msgs.msg.Twist())
+        self.publish_status(state, valid, confidence, detail)
+
+    def step(self):
+        now = rospy.Time.now()
+
+        if self.path_error is not None:
+            self.publish_stop(ModuleStatus.FAILED, self.path_error)
+            return
+
+        if not self.path:
+            self.publish_stop(
+                ModuleStatus.STARTING, "waiting for /competition/path"
+            )
+            return
+
+        path_age = self._age(self.path_time, now)
+        if path_age < 0.0:
+            self.publish_stop(
+                ModuleStatus.TIMEOUT,
+                "ROS time moved backwards after path reception",
+            )
+            return
+        if path_age > self.path_timeout.to_sec():
+            self.publish_stop(ModuleStatus.TIMEOUT, "path timeout, stop")
+            return
+
+        if self.odom is None:
+            self.publish_stop(
+                ModuleStatus.STARTING,
+                "waiting for /competition/localization/odom",
+            )
+            return
+
+        if self.odom_error is not None:
+            self.publish_stop(ModuleStatus.FAILED, self.odom_error)
+            return
+
+        odom_age = self._age(self.odom_time, now)
+        if odom_age < 0.0:
+            self.publish_stop(
+                ModuleStatus.TIMEOUT,
+                "ROS time moved backwards after odom reception",
+            )
+            return
+        if odom_age > self.odom_timeout.to_sec():
+            self.publish_stop(ModuleStatus.TIMEOUT, "odom timeout, stop")
+            return
+
+        odom_frame = self.odom.header.frame_id
+        if self.path_frame != odom_frame:
+            self.publish_stop(
+                ModuleStatus.FAILED,
+                "frame mismatch: path={} odom={}".format(
+                    self.path_frame, odom_frame
+                ),
+            )
+            return
+
+        try:
+            self._follow_current_target()
+        except ValueError as exc:
+            self.publish_stop(ModuleStatus.FAILED, str(exc))
+
+    def _follow_current_target(self):
+        odom_pose = self.odom.pose.pose
+        robot_x = odom_pose.position.x
+        robot_y = odom_pose.position.y
+        if not all(math.isfinite(value) for value in (robot_x, robot_y)):
+            raise ValueError("odom position contains NaN or Inf")
+        robot_yaw = yaw_from_quaternion(odom_pose.orientation)
+
+        while self.target_index < len(self.path):
+            distance = self._distance_to_target(
+                self.path[self.target_index].pose, robot_x, robot_y
+            )
+            if distance >= self.goal_tolerance:
+                break
+            self.target_index += 1
+
+        if self.target_index >= len(self.path):
+            self.publish_stop(
+                ModuleStatus.SUCCEEDED,
+                "path finished",
+                valid=True,
+                confidence=1.0,
+            )
+            return
+
+        target_pose = self.path[self.target_index].pose
+        dx = target_pose.position.x - robot_x
+        dy = target_pose.position.y - robot_y
+        distance = math.hypot(dx, dy)
+        target_yaw = math.atan2(dy, dx)
+        yaw_error = normalize_angle(target_yaw - robot_yaw)
+        if not all(
+            math.isfinite(value)
+            for value in (distance, target_yaw, yaw_error)
+        ):
+            raise ValueError("path-following calculation produced NaN or Inf")
+
+        cmd = geometry_msgs.msg.Twist()
+        cmd.angular.z = clamp(
+            1.5 * yaw_error, -self.max_angular, self.max_angular
+        )
+        if abs(yaw_error) < 0.8:
+            cmd.linear.x = clamp(0.6 * distance, 0.0, self.max_linear)
+
+        self.raw_vel_pub.publish(cmd)
+        self.publish_status(
+            ModuleStatus.RUNNING,
+            True,
+            0.6,
+            "following waypoint {}/{}".format(
+                self.target_index + 1, len(self.path)
+            ),
+        )
+
+    def _validate_path(self, msg):
+        if not msg.poses:
+            return None
+        if not msg.header.frame_id:
+            return "path frame_id is empty"
+        for index, pose_stamped in enumerate(msg.poses):
+            if not pose_stamped.header.frame_id:
+                return "path pose {} frame_id is empty".format(index)
+            if pose_stamped.header.frame_id != msg.header.frame_id:
+                return "frame mismatch: path={} pose[{}]={}".format(
+                    msg.header.frame_id, index, pose_stamped.header.frame_id
+                )
+            position = pose_stamped.pose.position
+            if not all(
+                math.isfinite(value) for value in (position.x, position.y)
+            ):
+                return "path pose {} contains NaN or Inf".format(index)
+        return None
+
+    @staticmethod
+    def _validate_odom(msg):
+        if not msg.header.frame_id:
+            return "odom frame_id is empty"
+        position = msg.pose.pose.position
+        if not all(math.isfinite(value) for value in (position.x, position.y)):
+            return "odom position contains NaN or Inf"
+        try:
+            yaw_from_quaternion(msg.pose.pose.orientation)
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    def _initial_target_index(self):
+        """Avoid replaying nearby path-start points after frequent replanning."""
+        if self.odom is None or self.odom_error is not None:
+            return 0
+        robot = self.odom.pose.pose.position
+        if not all(math.isfinite(value) for value in (robot.x, robot.y)):
+            return 0
+        for index, pose_stamped in enumerate(self.path):
+            distance = self._distance_to_target(
+                pose_stamped.pose, robot.x, robot.y
+            )
+            if distance >= self.goal_tolerance:
+                return index
+        return len(self.path)
+
+    @staticmethod
+    def _distance_to_target(target_pose, robot_x, robot_y):
+        dx = target_pose.position.x - robot_x
+        dy = target_pose.position.y - robot_y
+        distance = math.hypot(dx, dy)
+        if not math.isfinite(distance):
+            raise ValueError("target distance is not finite")
+        return distance
+
+    @staticmethod
+    def _age(stamp, now):
+        return (now - stamp).to_sec()
+
+    @staticmethod
+    def _positive_param(name, default):
+        value = float(rospy.get_param(name, default))
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("{} must be finite and greater than zero".format(name))
+        return value
 
 
 def main():
     rospy.init_node("path_follower", log_level=rospy.INFO)
+    follower = PathFollower()
 
-    # Publisher for raw velocity (NOT /cmd_vel!)
-    raw_vel_pub = rospy.Publisher(
-        "/competition/raw_cmd_vel", geometry_msgs.msg.Twist, queue_size=1
-    )
-    status_pub = rospy.Publisher(
-        "/competition/control/status", ModuleStatus, queue_size=10, latch=True
-    )
-
-    rospy.loginfo(
-        "path_follower_node: skeleton only / algorithm not implemented. "
-        "Publishing zero velocity to /competition/raw_cmd_vel."
-    )
-
-    rate = rospy.Rate(10)  # 10 Hz
+    rate = rospy.Rate(10)
     while not rospy.is_shutdown():
-        # Always publish zero velocity (safe default)
-        cmd = geometry_msgs.msg.Twist()
-        cmd.linear.x = 0.0
-        cmd.linear.y = 0.0
-        cmd.angular.z = 0.0
-        raw_vel_pub.publish(cmd)
-
-        msg = ModuleStatus()
-        msg.header.stamp = rospy.Time.now()
-        msg.state = ModuleStatus.STARTING
-        msg.valid = False
-        msg.confidence = 0.0
-        msg.detail = "skeleton only / algorithm not implemented"
-        status_pub.publish(msg)
-
+        follower.step()
         rate.sleep()
 
 
