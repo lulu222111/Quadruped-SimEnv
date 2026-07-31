@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """competition_loop_node — competition state machine entry point.
 
-Skeleton only — no real exploration logic. This node manages the FSM,
-timer, interface validation, and result writing. All algorithm modules
-communicate through standard competition topics.
+Manages the FSM, timer, interface validation, result writing, and safety
+signals.  All algorithm modules communicate through standard competition
+topics.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 import rospy
 import std_msgs.msg
@@ -29,28 +31,216 @@ from time_keeper import TimeKeeper
 from result_writer import ResultWriter
 
 
+def _is_valid_finite_positive_number(value: object) -> bool:
+    """Return True if value is a finite positive number (int/float, NOT bool)."""
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    if not math.isfinite(value):
+        return False
+    return value > 0
+
+
+def _is_valid_finite_non_negative_number(value: object) -> bool:
+    """Return True if value is a finite non-negative number (int/float, NOT bool)."""
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    if not math.isfinite(value):
+        return False
+    return value >= 0
+
+
+def _safe_repr(value: object) -> str:
+    """Safely convert any value to a log-safe string representation."""
+    try:
+        if isinstance(value, bool):
+            return str(value)
+        if isinstance(value, (int, float)):
+            if math.isfinite(value):
+                return repr(value)
+            return repr(value)
+        return repr(value)
+    except Exception:
+        return "<unprintable>"
+
+
 class CompetitionLoopNode:
     """Main competition orchestration node."""
 
     def __init__(self):
         rospy.init_node("competition_loop", log_level=rospy.INFO)
 
-        # --- Parameters ---
+        # --- Parameters (raw) ---
         self._max_time = rospy.get_param("~max_time", 600.0)
         self._start_delay = rospy.get_param("~start_delay", 5.0)
         self._auto_start = rospy.get_param("~auto_start", True)
         self._competition_mode = rospy.get_param("~competition_mode", True)
-        result_path = rospy.get_param("~result_path", None)
+        self._result_path_raw = rospy.get_param("~result_path", None)
+        self._workspace_root = rospy.get_param("~workspace_root", "/workspace/SimEnv")
 
-        rospy.loginfo("competition_loop starting (mode=%s)", "competition" if self._competition_mode else "test")
+        # --- ALWAYS initialise ALL members before any early return ---
+        # This guarantees run() will never encounter AttributeError.
 
-        # --- Core components ---
+        # FSM
         self._fsm = CompetitionStateMachine()
-        self._timer = TimeKeeper(max_time=self._max_time)
-        self._validator = InterfaceValidator(competition_mode=self._competition_mode)
-        self._result_writer = ResultWriter(output_path=result_path)
 
-        # --- Publishers ---
+        # Parameter validation
+        param_ok = self._validate_parameters()
+
+        # Core components (created regardless of param validity)
+        self._timer = TimeKeeper(
+            max_time=self._max_time if _is_valid_finite_positive_number(self._max_time) else 600.0
+        )
+        self._validator = InterfaceValidator(
+            competition_mode=bool(self._competition_mode)
+            if isinstance(self._competition_mode, bool)
+            else True
+        )
+
+        # Resolve result path
+        self._result_path = self._resolve_result_path()
+
+        self._result_writer = ResultWriter(output_path=str(self._result_path))
+
+        # Clock and delay tracking — initialised BEFORE Timer
+        self._clock_ready: bool = False
+        self._last_ros_time: Optional[rospy.Time] = None
+        self._ready_since: Optional[rospy.Time] = None
+        self._start_delay_done: bool = False
+
+        # Publishers — always set up for safety signals
+        self._setup_publishers()
+
+        # Publish initial safety signals
+        self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+
+        # Handle parameter failure: enter ERROR, set up Timer, and return
+        if not param_ok:
+            rospy.logerr(
+                "competition_loop: invalid parameters — entering ERROR state. "
+                "max_time=%s start_delay=%s competition_mode=%s auto_start=%s workspace_root=%s",
+                _safe_repr(self._max_time),
+                _safe_repr(self._start_delay),
+                _safe_repr(self._competition_mode),
+                _safe_repr(self._auto_start),
+                _safe_repr(self._workspace_root),
+            )
+            self._fsm.force_error("Invalid parameters — check max_time, start_delay.")
+            self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+            # Create Timer LAST so it cannot fire before all members exist
+            self._tick_timer = rospy.Timer(rospy.Duration(0.1), self._tick_callback)
+            self._publish_state()
+            rospy.loginfo("competition_loop initialised in ERROR state (invalid parameters).")
+            return
+
+        # --- Normal initialisation ---
+        rospy.loginfo("competition_loop starting (mode=%s)",
+                      "competition" if self._competition_mode else "test")
+        rospy.loginfo(
+            "  max_time=%s  start_delay=%s  auto_start=%s  workspace_root=%s  result_path=%s",
+            _safe_repr(self._max_time),
+            _safe_repr(self._start_delay),
+            _safe_repr(self._auto_start),
+            _safe_repr(self._workspace_root),
+            str(self._result_path),
+        )
+
+        # Load scene info (the only allowed file)
+        self._validator.load_scene_info(self._workspace_root)
+
+        # Services — created AFTER members, BEFORE Timer
+        self._start_srv = rospy.Service(
+            "/competition/start", std_srvs.srv.Trigger, self._handle_start
+        )
+        self._finish_srv = rospy.Service(
+            "/competition/finish", std_srvs.srv.Trigger, self._handle_finish
+        )
+
+        # Timer — created LAST so it cannot fire before all members exist
+        self._tick_timer = rospy.Timer(rospy.Duration(0.1), self._tick_callback)
+
+        rospy.loginfo("competition_loop initialised; state=WAITING")
+
+    # ------------------------------------------------------------------
+    # Parameter validation
+    # ------------------------------------------------------------------
+
+    def _validate_parameters(self) -> bool:
+        """Validate all critical parameters. Returns False on any violation.
+
+        Rejects: bool, string, NaN, Inf, -Inf, max_time<=0, start_delay<0.
+        Note: Python bool is a subclass of int, so isinstance checks must
+        explicitly exclude bool.
+        """
+        ok = True
+
+        if not (isinstance(self._max_time, (int, float))
+                and not isinstance(self._max_time, bool)
+                and math.isfinite(self._max_time)
+                and self._max_time > 0):
+            rospy.logerr("Invalid ~max_time=%s: must be a finite positive number (not bool/str/NaN/Inf)",
+                         _safe_repr(self._max_time))
+            ok = False
+
+        if not (isinstance(self._start_delay, (int, float))
+                and not isinstance(self._start_delay, bool)
+                and math.isfinite(self._start_delay)
+                and self._start_delay >= 0):
+            rospy.logerr("Invalid ~start_delay=%s: must be a finite non-negative number (not bool/str/NaN/Inf)",
+                         _safe_repr(self._start_delay))
+            ok = False
+
+        if not isinstance(self._competition_mode, bool):
+            rospy.logerr("Invalid ~competition_mode=%s: must be a boolean",
+                         _safe_repr(self._competition_mode))
+            ok = False
+
+        if not isinstance(self._auto_start, bool):
+            rospy.logerr("Invalid ~auto_start=%s: must be a boolean",
+                         _safe_repr(self._auto_start))
+            ok = False
+
+        if not isinstance(self._workspace_root, str) or not self._workspace_root.strip():
+            rospy.logerr("Invalid ~workspace_root=%s: must be a non-empty string",
+                         _safe_repr(self._workspace_root))
+            ok = False
+
+        return ok
+
+    # ------------------------------------------------------------------
+    # Result path resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_result_path(self) -> Path:
+        """Resolve result_path relative to workspace_root.
+
+        If result_path is an absolute path, use it as-is.
+        Otherwise resolve it against workspace_root.
+        Default: /workspace/SimEnv/results/detected_danger.json
+        """
+        if self._result_path_raw:
+            p = Path(self._result_path_raw)
+            if p.is_absolute():
+                return p
+            # Relative path — resolve against workspace_root
+            ws = Path(str(self._workspace_root)) if self._workspace_root else Path.cwd()
+            resolved = ws / p
+        else:
+            ws = Path(str(self._workspace_root)) if self._workspace_root else Path.cwd()
+            resolved = ws / "results" / "detected_danger.json"
+
+        rospy.loginfo("Result path resolved: raw=%s → %s",
+                      repr(self._result_path_raw), str(resolved))
+        return resolved
+
+    # ------------------------------------------------------------------
+    # Publisher setup
+    # ------------------------------------------------------------------
+
+    def _setup_publishers(self):
         self._state_pub = rospy.Publisher(
             "/competition/state", CompetitionStateMsg, queue_size=10, latch=True
         )
@@ -61,29 +251,67 @@ class CompetitionLoopNode:
             "/competition/emergency_stop", std_msgs.msg.Bool, queue_size=1, latch=True
         )
 
-        # --- Services ---
-        self._start_srv = rospy.Service("/competition/start", std_srvs.srv.Trigger, self._handle_start)
-        self._finish_srv = rospy.Service("/competition/finish", std_srvs.srv.Trigger, self._handle_finish)
+    # ------------------------------------------------------------------
+    # Clock helpers
+    # ------------------------------------------------------------------
 
-        # --- Timer: periodic state broadcast ---
-        self._tick_timer = rospy.Timer(rospy.Duration(1.0), self._tick_callback)
+    def _check_clock_ready(self) -> bool:
+        """Return True when ROS time is valid (sim time received or wall clock).
 
-        # --- Start-up sequence ---
-        self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+        When /use_sim_time is true and /clock hasn't been received yet,
+        rospy.Time.now() returns 0.
 
-        # Load scene info (the only allowed file)
-        ws_root = os.environ.get("SIMENV_WORKSPACE", str(Path.cwd()))
-        if not self._validator.load_scene_info(ws_root):
-            rospy.logerr("Failed to load team_scene_info.json. Staying in WAITING.")
-            return
+        IMPORTANT: This method IS NOT cached — it checks the live ROS time
+        every call.  If the clock was valid but becomes zero again (e.g.
+        simulator reset), _clock_ready is reset to False and downstream
+        gate variables are also reset.
+        """
+        now = rospy.Time.now()
+        if now.is_zero():
+            if self._clock_ready:
+                rospy.logwarn("ROS clock became zero — resetting ready/delay state.")
+            self._clock_ready = False
+            self._ready_since = None
+            self._start_delay_done = False
+            return False
+        self._clock_ready = True
+        return True
 
-        rospy.loginfo("competition_loop ready; state=WAITING")
+    def _detect_time_regression(self) -> bool:
+        """Return True if ROS time moved backwards since last tick.
+
+        ALWAYS updates self._last_ros_time to the current time, even when
+        regression is detected.  This ensures subsequent ticks compare
+        against the most recent time, not a stale historical baseline.
+
+        Sequence 100→101→0.1→0.2:
+          tick 100: no regression, _last = 100
+          tick 101: no regression, _last = 101
+          tick 0.1: regression detected, _last = 0.1  (UPDATED)
+          tick 0.2: no regression (0.2 > 0.1), _last = 0.2
+        """
+        now = rospy.Time.now()
+        regression = False
+        if self._last_ros_time is not None and now < self._last_ros_time:
+            rospy.logerr(
+                "ROS time regression: %.3f -> %.3f (delta=%.3f s)",
+                self._last_ros_time.to_sec(),
+                now.to_sec(),
+                (now - self._last_ros_time).to_sec(),
+            )
+            regression = True
+        # ALWAYS update baseline — even on regression
+        self._last_ros_time = now
+        return regression
 
     # ------------------------------------------------------------------
     # Tick — periodic FSM maintenance
     # ------------------------------------------------------------------
 
     def _tick_callback(self, event):
+        # Always publish the current state every tick (latched + periodic)
+        self._publish_state()
+
         phase = self._fsm.phase
 
         if phase == CompetitionPhase.WAITING:
@@ -92,47 +320,78 @@ class CompetitionLoopNode:
         elif phase == CompetitionPhase.RUNNING:
             self._tick_running()
 
-        # Terminal states: just keep publishing safe signals
         elif phase == CompetitionPhase.FINISHED:
             self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+
         elif phase == CompetitionPhase.ERROR:
             self._publish_safety_signals(control_enabled=False, emergency_stop=True)
 
     def _tick_waiting(self):
-        """In WAITING: validate environment, then auto-start or wait for service."""
-        # 1. Forbidden topic check (once)
+        """In WAITING: validate environment, honour start_delay, then auto-start."""
+
+        # 1. Wait for /clock (or wall-clock time) to be valid
+        if not self._check_clock_ready():
+            self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+            return
+
+        # 2. Detect time regression — reset start_delay if it occurs
+        if self._detect_time_regression():
+            self._ready_since = None
+            self._start_delay_done = False
+            self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+            return
+
+        # 3. Run forbidden topic check (retries on transient Master errors)
+        if not self._validator.forbidden_topic_check_completed:
+            self._validator.check_forbidden_topics()
+
+        # 4. Run forbidden file check (once; idempotent)
+        if not self._validator.forbidden_file_check_completed:
+            self._validator.check_forbidden_files(self._workspace_root)
+
+        # 5. Check readiness — all mandatory checks completed AND passed
         if not self._validator.is_ready():
-            if not self._validator.check_forbidden_topics(timeout=2.0):
-                self._fsm.force_error(self._validator.report())
-                return
+            self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+            return
 
-        # 2. Forbidden file presence check
-        self._validator.check_forbidden_files()
+        # 6. Record the moment we first became ready
+        if self._ready_since is None:
+            self._ready_since = rospy.Time.now()
+            rospy.loginfo("All checks passed; start_delay=%.1f s begins now.", self._start_delay)
 
-        # 3. Auto-start
+        # 7. Wait for start_delay to elapse
+        elapsed_since_ready = (rospy.Time.now() - self._ready_since).to_sec()
+        if elapsed_since_ready < self._start_delay:
+            self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+            return
+
+        # 8. Start delay completed
+        self._start_delay_done = True
+
+        # 9. Auto-start or wait for manual start
         if self._auto_start:
-            elapsed = (rospy.Time.now() - rospy.get_rostime()).to_sec()
-            # We don't have a real "start time" yet; use a simple delay
-            rospy.sleep(0.1)  # don't spin
-            # Check if we've been in WAITING long enough (simple approach:
-            # auto-start on the first tick after validation passes)
-            if self._validator.is_ready():
-                self._start_competition()
-                return
-
-        # Still waiting
-        self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+            self._start_competition()
+        else:
+            self._publish_safety_signals(control_enabled=False, emergency_stop=True)
 
     def _tick_running(self):
-        """In RUNNING: check timer expiry."""
+        """In RUNNING: check timer expiry, detect time regression."""
+
+        # 1. Detect time regression — force ERROR
+        if self._detect_time_regression():
+            rospy.logerr("Time regression in RUNNING — forcing ERROR.")
+            self._fsm.force_error("Time regression detected during RUNNING")
+            self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+            return
+
+        # 2. Check timer expiry
         if self._timer.is_expired:
             rospy.loginfo("max_time reached; transitioning to FINISHED.")
             self._end_competition("max_time reached")
             return
 
-        # Publish current state and keep control enabled
+        # 3. Normal operation
         self._publish_safety_signals(control_enabled=True, emergency_stop=False)
-        self._timer.remaining  # no-op just for clarity; timer auto-tracks elapsed
 
     # ------------------------------------------------------------------
     # Start / Finish
@@ -144,7 +403,9 @@ class CompetitionLoopNode:
             return
         self._timer.start()
         self._publish_safety_signals(control_enabled=True, emergency_stop=False)
-        rospy.loginfo("Competition RUNNING. max_time=%.0f s", self._max_time)
+        # Publish state immediately on transition (in addition to periodic tick)
+        self._publish_state()
+        rospy.loginfo("Competition RUNNING. max_time=%s s", _safe_repr(self._max_time))
 
     def _end_competition(self, reason: str = ""):
         """Transition from RUNNING to FINISHED."""
@@ -152,12 +413,18 @@ class CompetitionLoopNode:
         self._result_writer.set_exploration_time(self._timer.elapsed_seconds)
         self._fsm.transition_to(CompetitionPhase.FINISHED, reason)
         self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+        # Publish state immediately on transition
+        self._publish_state()
 
         # Write results
         try:
             self._result_writer.write()
         except Exception as exc:
             rospy.logerr("Failed to write results: %s", exc)
+            self._fsm.force_error(f"Result write failed: {exc}")
+            self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+            self._publish_state()
+            return
 
         rospy.loginfo("Competition FINISHED. elapsed=%.2f s", self._timer.elapsed_seconds)
 
@@ -166,18 +433,53 @@ class CompetitionLoopNode:
     # ------------------------------------------------------------------
 
     def _handle_start(self, req):
-        if self._fsm.phase == CompetitionPhase.WAITING:
-            if self._validator.is_ready():
-                self._start_competition()
-                return std_srvs.srv.TriggerResponse(success=True, message="Competition started")
-            else:
-                return std_srvs.srv.TriggerResponse(
-                    success=False, message=f"Validation failed: {self._validator.report()}"
-                )
-        return std_srvs.srv.TriggerResponse(
-            success=False,
-            message=f"Cannot start from phase {CompetitionPhase.label(self._fsm.phase)}",
-        )
+        """Handle /competition/start service.
+
+        Manual start cannot bypass safety checks. All of the following
+        must be satisfied:
+        """
+        # 1. Must be in WAITING
+        if self._fsm.phase != CompetitionPhase.WAITING:
+            return std_srvs.srv.TriggerResponse(
+                success=False,
+                message=f"Cannot start from phase {CompetitionPhase.label(self._fsm.phase)}",
+            )
+
+        # 2. Scene info must be loaded
+        if not self._validator.scene_info_loaded:
+            return std_srvs.srv.TriggerResponse(
+                success=False,
+                message="Scene info not loaded — cannot start",
+            )
+
+        # 3. Forbidden topic check must be completed and passed
+        if not self._validator.forbidden_topic_check_completed:
+            return std_srvs.srv.TriggerResponse(
+                success=False,
+                message="Forbidden topic check not yet completed — cannot start",
+            )
+        if not self._validator.forbidden_topic_check_passed:
+            return std_srvs.srv.TriggerResponse(
+                success=False,
+                message="Forbidden topic check FAILED — cannot start",
+            )
+
+        # 4. ROS time must be valid (check LIVE, not cached)
+        if rospy.Time.now().is_zero():
+            return std_srvs.srv.TriggerResponse(
+                success=False,
+                message="/clock not ready (sim time is zero) — cannot start",
+            )
+
+        # 5. start_delay must be completed
+        if not self._start_delay_done:
+            return std_srvs.srv.TriggerResponse(
+                success=False,
+                message=f"start_delay ({self._start_delay}) not yet completed — cannot start",
+            )
+
+        self._start_competition()
+        return std_srvs.srv.TriggerResponse(success=True, message="Competition started")
 
     def _handle_finish(self, req):
         if self._fsm.is_running:
@@ -209,8 +511,7 @@ class CompetitionLoopNode:
 
     def run(self):
         rospy.loginfo(
-            "competition_loop running: skeleton only / algorithm not implemented. "
-            "State=%s control_enabled=false emergency_stop=true",
+            "competition_loop running: state=%s control_enabled=false emergency_stop=true",
             CompetitionPhase.label(self._fsm.phase),
         )
         self._publish_state()

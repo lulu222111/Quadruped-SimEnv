@@ -9,7 +9,8 @@ ALL data is hard-coded. This node MUST NOT:
   - read layout_metadata.json
   - call Gazebo get_model_state
 
-It requires test_mode=true. In competition mode (test_mode=false), it exits immediately.
+It runs ONLY in test mode (competition_mode=false).
+In competition mode (competition_mode=true), it refuses to run and exits.
 """
 
 from __future__ import annotations
@@ -35,10 +36,13 @@ MOCK_TRAJECTORY = [
 def main():
     rospy.init_node("mock_localization", log_level=rospy.INFO)
 
-    # Guard: refuse to run in competition mode
-    test_mode = rospy.get_param("/competition_loop/competition_mode", True)
-    if not test_mode:
-        rospy.logerr("mock_localization: test_mode=false, refusing to run in competition mode!")
+    # Guard: competition_mode=true means official competition — refuse to run
+    competition_mode = rospy.get_param("/competition_loop/competition_mode", True)
+    if competition_mode:
+        rospy.logerr(
+            "mock_localization: competition_mode=true — "
+            "mock nodes MUST NOT run in official competition. Refusing to start."
+        )
         sys.exit(1)
 
     rospy.loginfo("mock_localization: publishing synthetic odometry (TEST MODE ONLY).")

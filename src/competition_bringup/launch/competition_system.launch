@@ -34,6 +34,8 @@
     <param name="start_delay" value="5.0" />
     <param name="auto_start" value="$(arg auto_start)" />
     <param name="competition_mode" value="$(arg competition_mode)" />
+    <param name="workspace_root" value="/workspace/SimEnv" />
+    <param name="result_path" value="results/detected_danger.json" />
   </node>
 
   <!-- === cmd_vel Guard (safety gateway — ALWAYS start) === -->
@@ -68,7 +70,7 @@
     <node pkg="competition_planning" type="planning_node" name="planning"
           output="screen" respawn="true" />
 
-    <!-- Path follower (skeleton) -->
+    <!-- Path follower -->
     <node pkg="competition_control" type="path_follower_node" name="path_follower"
           output="screen" respawn="true" />
   </group>
