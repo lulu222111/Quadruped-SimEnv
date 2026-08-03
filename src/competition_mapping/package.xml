@@ -2,20 +2,21 @@
 <package format="2">
   <name>competition_mapping</name>
   <version>0.1.0</version>
-  <description>Point-cloud processing, OccupancyGrid mapping, and map maintenance.</description>
+  <description>Safe fixed-size 2D occupancy-grid mapping for the competition loop.</description>
 
-  <maintainer email="mayue@example.com">mayue</maintainer>
-  <license>Apache-2.0</license>
+  <maintainer email="maintainer@example.com">competition_mapping maintainer</maintainer>
+  <license>BSD-3-Clause</license>
 
   <buildtool_depend>catkin</buildtool_depend>
 
-  <build_depend>rospy</build_depend>
-  <build_depend>nav_msgs</build_depend>
-  <build_depend>sensor_msgs</build_depend>
-  <build_depend>competition_interfaces</build_depend>
+  <depend>competition_interfaces</depend>
+  <depend>nav_msgs</depend>
+  <depend>rospy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2_ros</depend>
 
-  <exec_depend>rospy</exec_depend>
-  <exec_depend>nav_msgs</exec_depend>
-  <exec_depend>sensor_msgs</exec_depend>
-  <exec_depend>competition_interfaces</exec_depend>
+  <test_depend>rostest</test_depend>
+
+  <export/>
 </package>

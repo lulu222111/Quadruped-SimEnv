@@ -1,0 +1,24 @@
+<launch>
+  <node pkg="competition_mapping" type="mapping_node" name="mapping_node" output="screen">
+    <param name="pointcloud_topic" value="/test/points"/>
+    <param name="map_frame" value="odom"/>
+    <param name="resolution" value="1.0"/>
+    <param name="map_width" value="20"/>
+    <param name="map_height" value="20"/>
+    <param name="origin_x" value="-10.0"/>
+    <param name="origin_y" value="-10.0"/>
+    <param name="sensor_min_range" value="0.0"/>
+    <param name="sensor_max_range" value="10.0"/>
+    <param name="min_height" value="-1.0"/>
+    <param name="max_height" value="2.0"/>
+    <param name="update_rate" value="10.0"/>
+    <param name="odom_timeout" value="1.0"/>
+    <param name="localization_status_timeout" value="1.0"/>
+    <param name="pointcloud_timeout" value="1.0"/>
+  </node>
+
+  <test test-name="mapping_integration"
+        pkg="competition_mapping"
+        type="test_mapping_integration.py"
+        time-limit="30"/>
+</launch>

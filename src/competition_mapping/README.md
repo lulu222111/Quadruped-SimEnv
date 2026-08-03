@@ -1,94 +1,184 @@
 # competition_mapping
 
-**负责人**: 马跃（地图构建与维护）
+This package builds a fixed-size 2D `nav_msgs/OccupancyGrid` from legitimate
+localization odometry and LiDAR `PointCloud2` data.
 
-## 模块目标
+## Interface contract
 
-将 Livox 点云和合法位姿估计融合为 `nav_msgs/OccupancyGrid`，供规划模块使用。
+- Input: `/competition/localization/status` (`competition_interfaces/ModuleStatus`)
+- Input: `/competition/localization/odom` (`nav_msgs/Odometry`)
+- Input: `/livox/Pointcloud2` (`sensor_msgs/PointCloud2`)
+- Output: `/competition/map` (`nav_msgs/OccupancyGrid`)
+- Output: `/competition/mapping/status` (`competition_interfaces/ModuleStatus`)
 
-## 输入
+The node never reads Gazebo ground truth, world/layout/truth files, or publishes
+`/cmd_vel`. Point clouds are fused only while localization status and odometry
+are valid and fresh.
 
-| 输入 | 类型 | 频率 | 说明 |
-|------|------|------|------|
-| `/competition/localization/odom` | `nav_msgs/Odometry` | — | 合法定位 |
-| `/scan` | `sensor_msgs/PointCloud` | 10 Hz | Livox 原始点云 |
-| `/livox/Pointcloud2` | `sensor_msgs/PointCloud2` | ~10 Hz | 转换后点云 |
-| TF `odom -> base` | transform | — | 坐标变换 |
+## Files
 
-## 输出
+- `src/competition_mapping/occupancy_grid_core.py`: ROS-independent grid logic.
+- `scripts/mapping_node`: subscriptions, TF conversion, health checks, map/status publication.
+- `config/mapping.yaml`: all map, filter, timeout, and pose-jump parameters.
+- `launch/mapping.launch`: production launch; it starts no mock nodes.
+- `test/test_occupancy_grid_core.py`: deterministic pure-Python unit tests.
+- `test/mapping_integration.test`: ROS integration and localization-failure test.
 
-| 输出 | 类型 | 消费者 | 说明 |
-|------|------|--------|------|
-| `/competition/map` | `nav_msgs/OccupancyGrid` | planning | 占据栅格地图 |
-| `/competition/mapping/status` | `ModuleStatus` | competition_loop | 地图模块状态 |
+## Replace the existing package
 
-## 地图值语义
+From the SimEnv repository on the host, first back up or commit your current
+work. Then replace the contents of `src/competition_mapping/` with the contents
+of this directory. Preserve the real maintainer name/email in `package.xml` if
+your repository already has them.
 
-| 值 | 含义 |
-|----|------|
-| -1 | Unknown（未探索） |
-| 0 | Free（空闲可通行） |
-| 100 | Occupied（被占据） |
-
-## 参数
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `~resolution` | float | 0.1 | 栅格分辨率（m/cell） |
-| `~map_width` | int | 400 | 地图宽度（cells） |
-| `~map_height` | int | 400 | 地图高度（cells） |
-| `~update_rate` | float | 2.0 | 地图发布频率（Hz） |
-| `~sensor_max_range` | float | 20.0 | 传感器最大有效距离（m） |
-
-## 当前状态
-
-**v0.1.0 — 骨架**
-
-- [x] 占位节点只发布 `ModuleStatus(state=STARTING, valid=false)`
-- [x] 不发布伪造 OccupancyGrid
-- [ ] 点云滤波和下采样
-- [ ] 点云到 OccupancyGrid 的投影
-- [ ] 概率占据更新（log-odds）
-- [ ] 基于合法定位的全局地图维护
-- [ ] 地板去除（ground removal）
-
-**默认安全行为**：
-- 不发布地图（`valid=false`）
-
-## 待实现 TODO
-
-1. 点云预处理：体素滤波、离群点去除
-2. 地面分割：分离地板点云
-3. 概率占据：基于 ray-casting 的 log-odds 更新
-4. 多层地图：支持多楼层（可能需 3D 地图或按楼层切换）
-5. 动态更新：关门/开门后更新地图
-
-## 禁止事项
-
-- 不得使用 `/ground_truth/*` 作为位姿输入
-- 不得读取 `layout_metadata.json` 获取建筑布局
-- 不得读取 `scene_manifest.json` 获取地图先验
-- 不得调用 Gazebo service 获取建筑几何
-
-## 最小运行命令
+Make scripts executable:
 
 ```bash
+chmod +x \
+  src/competition_mapping/scripts/mapping_node \
+  src/competition_mapping/test/test_mapping_integration.py \
+  src/competition_mapping/test/test_occupancy_grid_core.py
+```
+
+## Test 1: no-ROS unit test
+
+Run on the host or in the container:
+
+```bash
+cd "$HOME/SimEnv"
+PYTHONPATH=src/competition_mapping/src \
+python3 -m unittest -v \
+  src/competition_mapping/test/test_occupancy_grid_core.py
+```
+
+Expected result: `Ran 12 tests` and `OK`.
+
+## Test 2: build and compile checks
+
+Run inside the `simenv-my` container (or use your actual personal service name):
+
+```bash
+cd /workspace/SimEnv
+source /opt/ros/noetic/setup.bash
+
+python3 -m py_compile \
+  src/competition_mapping/src/competition_mapping/*.py \
+  src/competition_mapping/scripts/mapping_node \
+  src/competition_mapping/test/*.py
+
+catkin_make --pkg competition_mapping
 source devel/setup.bash
+rospack find competition_mapping
 rosrun competition_mapping mapping_node
 ```
 
-## 验收标准
+The final `rosrun` command starts the node, so a ROS master must already be
+running. Stop it with `Ctrl+C` after confirming the executable is found and the
+node reports that it is waiting for inputs.
 
-- [x] 启动后只发布 `valid=false` 的状态
-- [x] 不订阅禁止话题
-- [x] 不读取禁止文件
-- [ ] 正确订阅 `/competition/localization/odom` 和点云
-- [ ] OccupancyGrid 正确填充未知/空闲/占据
-- [ ] 地图更新率 ≥ 2 Hz
-- [ ] 静态环境下重复建图一致性良好
-- [ ] 地图可在 RViz 中正常显示
+## Test 3: automated ROS integration test
 
-## 需要向上下游成员交付的内容
+With no other mapping node or mock publisher running:
 
-- 闫雨萱（planning）：`/competition/map` + 地图元数据
-- 纪雯瀚（localization）：依赖合法位姿和 TF
+```bash
+cd /workspace/SimEnv
+source /opt/ros/noetic/setup.bash
+source devel/setup.bash
+
+rostest competition_mapping mapping_integration.test
+```
+
+The test publishes synthetic legal localization, odometry, and base-frame point
+clouds. It verifies map metadata, `-1/0/100` encoding, `status.valid=true`, then
+injects `localization.valid=false` and verifies that the map no longer changes.
+
+## Test 4: manual synthetic inspection
+
+Terminal 1:
+
+```bash
+source /opt/ros/noetic/setup.bash
+source /workspace/SimEnv/devel/setup.bash
+roslaunch competition_mapping mapping.launch \
+  pointcloud_topic:=/test/points
+```
+
+The automated `rostest` is the preferred synthetic test. For a manual test,
+run the publishers from `test/test_mapping_integration.py` via rostest, or use
+your team's `competition_testing` mock only in `test_mode=true`.
+
+Inspect interfaces in another terminal:
+
+```bash
+source /opt/ros/noetic/setup.bash
+source /workspace/SimEnv/devel/setup.bash
+rostopic info /competition/map
+rostopic hz /competition/map
+rostopic echo -n 1 /competition/map/info
+rostopic echo -n 1 /competition/mapping/status
+```
+
+Expected map values are `unknown=-1`, `free=0`, and `occupied=100`; the default
+metadata is 0.1 m resolution, 400 x 400 cells, origin (-20, -20), frame `odom`.
+
+## Test 5: real simulation
+
+Reserve the shared simulator first. Start SimEnv only once, with truth disabled:
+
+```bash
+cd /workspace/SimEnv
+ENABLE_GROUND_TRUTH=0 ENABLE_REFEREE_ODOM=0 \
+UNITREE_AUTO_CMD_VEL=1 CONTROLLER_FOREGROUND=0 \
+SEED=77 GUI=true ./auto.sh
+```
+
+In another container terminal:
+
+```bash
+source /opt/ros/noetic/setup.bash
+source /workspace/SimEnv/devel/setup.bash
+
+rostopic type /livox/Pointcloud2
+rostopic hz /livox/Pointcloud2
+rostopic echo -n 1 /livox/Pointcloud2/header
+rostopic echo -n 1 /competition/localization/odom/header
+rostopic echo -n 1 /competition/localization/odom/child_frame_id
+rosrun tf tf_echo base_link <POINTCLOUD_FRAME>
+
+roslaunch competition_mapping mapping.launch
+```
+
+Replace `base_link` with the actual odometry `child_frame_id`, and
+`<POINTCLOUD_FRAME>` with the point-cloud header frame. If `tf_echo` cannot find
+that transform, the mapper will correctly report `BLOCKED`; the sensor-to-base
+static TF must be fixed in bringup rather than bypassed in mapping.
+
+In RViz:
+
+1. Set Fixed Frame to `odom`.
+2. Add `Map`, topic `/competition/map`.
+3. Add `PointCloud2`, topic `/livox/Pointcloud2`.
+4. Confirm walls are continuous, robot surroundings are free, unknown space
+   remains unknown, and the whole map does not rotate or drift with the robot.
+
+## Failure injection
+
+Do this only in an isolated test session where a mock localization status
+publisher is allowed. Record one map, publish invalid status, keep sending the
+cloud, and compare the map again. The provided rostest automates this check.
+
+For pose-jump protection, publish an odometry jump larger than `max_pose_jump`
+or `max_yaw_jump`. Mapping status becomes `BLOCKED`. After
+`pose_recovery_samples` mutually consistent poses, the default behavior resets
+the old map and resumes, preventing two coordinate frames from being fused.
+
+## Compliance check
+
+```bash
+rg -n \
+  '/Odometry_gazebo|/ground_truth/|get_model_state|danger_truth.json|layout_metadata.json|competition_scene.world|scene_manifest.json|/cmd_vel' \
+  src/competition_mapping
+```
+
+Only explanatory README text should match; executable Python and launch/config
+files must contain no forbidden interface or truth-file access.
