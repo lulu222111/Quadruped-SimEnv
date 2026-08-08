@@ -19,21 +19,17 @@ cmd_vel_guard:
 
 # --- Mapping ---
 mapping:
-  resolution: 0.1          # Grid resolution (m/cell)
-  map_width: 400           # Map width in cells
-  map_height: 400          # Map height in cells
-  update_rate: 2.0         # Map publish rate (Hz)
-  sensor_max_range: 20.0   # Max sensor range (m)
-  map_frame: "world"       # Reference frame of the occupancy grid map
-  robot_base_frame: "base" # Robot base frame for TF lookups
+  resolution: 0.1            # Grid resolution (m/cell)
+  map_width: 400             # Map width in cells
+  map_height: 400            # Map height in cells
+  update_rate: 2.0           # Map publish rate (Hz)
+  sensor_max_range: 20.0     # Max sensor range (m)
 
 # --- Planning ---
 planning:
-  frontier_min_size: 5     # Minimum frontier cluster size (cells)
-  replan_interval: 2.0     # Replanning interval (seconds)
-  goal_tolerance: 0.5      # Goal arrival tolerance (m)
-  map_frame: "world"       # Reference frame of /competition/map and goals
-  robot_base_frame: "base" # Robot base frame for pose lookups
+  frontier_min_size: 5       # Minimum frontier cluster size (cells)
+  replan_interval: 2.0       # Replanning interval (seconds)
+  goal_tolerance: 0.5        # Goal arrival tolerance (m)
 
 # --- Localization ---
 localization:
@@ -47,10 +43,6 @@ localization:
   #   laser_livox->livox_imu_link (-0.011 -0.02329 0.04412, rpy 0 0 0)
   base_to_imu_translation: [0.223404, -0.023290, 0.118985]
   base_to_imu_rotation_rpy: [0.0, 0.785, 0.0]
-
-# --- Control ---
-# Note: path_follower_node and cmd_vel_guard use params from private namespaces.
-# See competition_control for details.
 
 # --- Perception ---
 perception:

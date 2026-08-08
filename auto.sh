@@ -34,9 +34,9 @@ ENABLE_LIVOX_IMU="$(as_ros_bool "${ENABLE_LIVOX_IMU:-$ENABLE_LIVOX}")"
 ENABLE_REALSENSE_INPUT="${ENABLE_REALSENSE:-${ENABLE_DEPTH_CAMERA:-$ENABLE_SENSOR_DATA}}"
 ENABLE_REALSENSE="$(as_ros_bool "$ENABLE_REALSENSE_INPUT")"
 ENABLE_FRONT_CAMERA="$(as_ros_bool "${ENABLE_FRONT_CAMERA:-0}")"
-# NOTE: The `odom` frame is removed from the system (team contract). The legacy
-# referee odom (/Odometry_gazebo + odom -> base TF) is no longer published, so
-# ENABLE_REFEREE_ODOM is always treated as false.
+# Legacy referee odometry (/Odometry_gazebo, state_from_gazebo node).
+# OFF by default in competition mode — the localization module is the ONLY
+# dynamic world -> base publisher.  Set ENABLE_REFEREE_ODOM=1 for debug only.
 ENABLE_REFEREE_ODOM="$(as_ros_bool "${ENABLE_REFEREE_ODOM:-0}")"
 ENABLE_GROUND_TRUTH="$(as_ros_bool "${ENABLE_GROUND_TRUTH:-1}")"
 ENABLE_FOOT_CONTACT_SENSOR="$(as_ros_bool "${ENABLE_FOOT_CONTACT_SENSOR:-0}")"
@@ -223,6 +223,7 @@ roslaunch unitree_guide multi_floor_gazeboSim.launch \
   enable_livox_imu:="$ENABLE_LIVOX_IMU" \
   enable_realsense:="$ENABLE_REALSENSE" \
   enable_front_camera:="$ENABLE_FRONT_CAMERA" \
+  enable_referee_odom:="$ENABLE_REFEREE_ODOM" \
   enable_ground_truth:="$ENABLE_GROUND_TRUTH" \
   enable_foot_contact_sensor:="$ENABLE_FOOT_CONTACT_SENSOR" \
   enable_foot_force_visual:="$ENABLE_FOOT_FORCE_VISUAL" \
