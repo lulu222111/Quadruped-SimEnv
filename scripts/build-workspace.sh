@@ -55,6 +55,13 @@ if [ ! -f "$LIVOX_PATCH" ]; then
     exit 1
 fi
 
+FASTLIO_PATCH="$REPO_ROOT/scripts/patches/fast_lio_message_dependency.patch"
+if [ ! -f "$FASTLIO_PATCH" ]; then
+    echo "ERROR: fast_lio 补丁文件缺失: $FASTLIO_PATCH" >&2
+    echo "此补丁是离线构建的必要文件，请确认仓库完整。" >&2
+    exit 1
+fi
+
 echo "所有子模块和依赖已就绪。"
 
 set +e
@@ -113,9 +120,34 @@ if [ ! -f /workspace/SimEnv/src/fast_lio/include/ikd-Tree/ikd_Tree.cpp ]; then
     exit 1
 fi
 
+# --- SimEnv: apply FAST-LIO message dependency patch ---
+# fastlio_mapping depends on Pose6D.h generated from Pose6D.msg, but the
+# CMakeLists.txt lacks an explicit add_dependencies().  In a parallel build
+# laserMapping.cpp can be compiled before the message header is generated,
+# causing: fatal error: fast_lio/Pose6D.h: No such file or directory.
+# This patch adds the missing dependency without modifying the submodule.
+FASTLIO_PATCH="/workspace/SimEnv/scripts/patches/fast_lio_message_dependency.patch"
+
+if [ ! -f "$FASTLIO_PATCH" ]; then
+    echo "FATAL: fast_lio patch file missing inside container: $FASTLIO_PATCH" >&2
+    exit 1
+fi
+
+if git -C /workspace/SimEnv/src/fast_lio apply --reverse --check "$FASTLIO_PATCH" >/dev/null 2>&1; then
+    echo "fast_lio: message-dependency patch already applied (idempotent skip)"
+elif git -C /workspace/SimEnv/src/fast_lio apply "$FASTLIO_PATCH" 2>&1; then
+    echo "fast_lio: message-dependency patch applied"
+else
+    echo "FATAL: failed to apply fast_lio message-dependency patch." >&2
+    echo "The patch is required for parallel builds. Check if the submodule" >&2
+    echo "commit matches the patch baseline." >&2
+    exit 1
+fi
+
 catkin_make \
     -j"$CATKIN_JOBS" \
     -l"$CATKIN_JOBS" \
+    -DCATKIN_WHITELIST_PACKAGES="" \
     -DCMAKE_BUILD_TYPE=Release \
     -DTORCH_CUDA_ARCH_LIST=12.0 \
     -DLOCAL_SENSING_CUDA_ARCH=120 \
