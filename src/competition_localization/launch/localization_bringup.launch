@@ -36,13 +36,30 @@
 
   <!-- === FAST-LIO (SimEnv-tuned) === -->
 
-  <!-- Load the base config from the submodule.
-       NB: mid360_sim.yaml has been corrected — extrinsic_T = [0.011, 0.02329, -0.04412]
-       (Lidar_T_wrt_IMU, derived from URDF chain; see config comments for derivation).
-       pcd_save_en is false for production. -->
+  <!-- Load the base config from the submodule (e6aeba1, unmodified).
+       The submodule's mid360_sim.yaml has extrinsic_T = [-0.011, -0.02329, 0.04412]
+       which is the raw URDF joint laser_livox->livox_imu origin.  This is the IMU
+       origin expressed in the LiDAR frame (T_lidar_imu).  FAST-LIO expects
+       Lidar_T_wrt_IMU (LiDAR origin in IMU frame) — see laserMapping.cpp:820
+       and IMU_Processing.hpp:343: p_imu = offset_R_L_I * p_lidar + offset_T_L_I.
+       Because the laser_livox -> livox_imu_link relative rotation is identity,
+       the translation must be NEGATED: T_imu_lidar = -T_lidar_imu.  We override
+       both extrinsic_T and extrinsic_R here so the fix lives in the parent repo
+       and does not require modifying the submodule. -->
   <rosparam command="load" file="$(find fast_lio)/config/mid360_sim.yaml" />
 
-  <!-- Production overrides (explicit belt-and-suspenders) -->
+  <!-- Production: correct FAST-LIO extrinsic_T for our URDF chain.
+       URDF: laser_livox_joint (base->laser_livox)  t=[0.2, 0, 0.08], Ry(45°)
+             livox_imu_joint  (laser_livox->livox_imu) t=[-0.011, -0.02329, 0.04412], R=I
+       FAST-LIO expects Lidar_T_wrt_IMU:
+         extrinsic_T = -[-0.011, -0.02329, 0.04412] = [0.011, 0.02329, -0.04412] -->
+  <rosparam param="mapping/extrinsic_T" subst_value="True">[0.011, 0.02329, -0.04412]</rosparam>
+  <rosparam param="mapping/extrinsic_R" subst_value="True">[1, 0, 0,
+                                                             0, 1, 0,
+                                                             0, 0, 1]</rosparam>
+  <param name="mapping/extrinsic_est_en" type="bool" value="false" />
+
+  <!-- Production overrides (belt-and-suspenders) -->
   <param name="feature_extract_enable" type="bool" value="0"/>
   <param name="point_filter_num" type="int" value="3"/>
   <param name="max_iteration" type="int" value="3" />

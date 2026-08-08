@@ -337,6 +337,7 @@ def _adapter_with_start(start: dict) -> object:
     adapter.input_frame_id = "camera_init"
     adapter.input_child_frame_id = "body"
     adapter.input_timeout = 0.5
+    adapter._max_future_stamp_skew = 1.0
     adapter.competition_mode = False
     adapter._state = _ModuleStatus.STARTING
     adapter._valid = False
@@ -574,6 +575,32 @@ class TestLocalizationNode(unittest.TestCase):
         self.assertEqual(adapter._state, _ModuleStatus.FAILED)
         self.assertFalse(adapter._valid)
 
+    def test_future_timestamp_rejected(self):
+        """A timestamp beyond max_future_stamp_skew ahead of now() is rejected."""
+        adapter = _adapter_with_start({"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0})
+        adapter._max_future_stamp_skew = 1.0
+        _MockTime._now = 10.0
+        odom = _make_odom(1.0, 0.0, 0.0, stamp=_MockTimeInstance(12.5))
+        mod.LocalizationAdapter._odom_callback(adapter, odom)
+        self.assertEqual(adapter._state, _ModuleStatus.FAILED)
+        self.assertFalse(adapter._valid)
+        self.assertIn("future", adapter._detail)
+
+    def test_future_timestamp_within_tolerance_accepted(self):
+        """A small future skew within max_future_stamp_skew is accepted."""
+        adapter = _adapter_with_start({"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0})
+        adapter.start_alignment_delay = 0.0
+        adapter._max_future_stamp_skew = 1.0
+        adapter._T_base_to_imu = mod._identity_transform()
+        _MockTime._now = 10.0
+        odom = _make_odom(1.0, 0.0, 0.0, stamp=_MockTimeInstance(10.5))
+        pub = _RecordingPublisher()
+        adapter._odom_pub = pub
+        mod.LocalizationAdapter._odom_callback(adapter, odom)
+        # Should be accepted — 10.5 is within 10.0 + 1.0
+        self.assertEqual(adapter._state, _ModuleStatus.RUNNING)
+        self.assertTrue(adapter._valid)
+
     def test_output_uses_input_original_timestamp(self):
         """The output odometry must carry the INPUT original timestamp, not the
         reception wall-clock time."""
@@ -617,7 +644,7 @@ class TestLocalizationNode(unittest.TestCase):
 
         expected_q = mod._quat_from_euler_rpy(0.0, 0.0, start["yaw"])
         for i in range(50):
-            _MockTime._now = i * 0.05
+            _MockTime._now = 10.0 + i * 0.05
             odom = _make_odom(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
                               stamp=_MockTimeInstance(10.0 + i * 0.05))
             mod.LocalizationAdapter._odom_callback(adapter, odom)
@@ -689,7 +716,7 @@ class TestLocalizationNode(unittest.TestCase):
         n = 50
         base_stamp = 100.0
         for i in range(n):
-            _MockTime._now = i * 0.01
+            _MockTime._now = base_stamp + i * 0.01
             mod.LocalizationAdapter._odom_callback(
                 adapter,
                 _make_odom(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
