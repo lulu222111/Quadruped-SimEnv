@@ -1,0 +1,84 @@
+<launch>
+  <!--
+    localization_bringup.launch — canonical production localization bringup.
+
+    Starts:
+      1. FAST-LIO `laserMapping` (estimates camera_init -> body; body = IMU frame)
+      2. competition_localization `localization_node` (adapts to world -> base,
+         publishes /competition/localization/odom + the single dynamic
+         world -> base TF)
+
+    Topic remaps:
+      FAST-LIO's mid360_sim.yaml already uses SimEnv topics; the remaps here
+      are a belt-and-suspenders guarantee.
+
+    Usage (standalone):
+      roslaunch competition_localization localization_bringup.launch rviz:=false
+
+    Production integration (from competition_system.launch):
+      <include file="$(find competition_localization)/launch/localization_bringup.launch">
+        <arg name="rviz" value="false"/>
+      </include>
+
+    Lifecycle: respawn is DISABLED for production.
+      FAST-LIO restart resets camera_init, which breaks the world alignment
+      without a re-alignment protocol.  Fail-fast is safer than silent drift.
+      The localization_node fails immediately on critical config errors
+      (missing extrinsic, bad scene file) in competition mode rather than
+      crash-looping forever.
+  -->
+
+  <arg name="rviz" default="false" />
+  <arg name="lid_topic" default="/livox/Pointcloud2" />
+  <arg name="imu_topic" default="/livox/imu" />
+  <arg name="odom_input_topic" default="/Odometry" />
+  <arg name="team_scene_info_path" default="generated_building/team_scene_info.json" />
+
+  <!-- === FAST-LIO (SimEnv-tuned) === -->
+
+  <!-- Load the base config from the submodule.
+       NB: mid360_sim.yaml has been corrected — extrinsic_T = [0.011, 0.02329, -0.04412]
+       (Lidar_T_wrt_IMU, derived from URDF chain; see config comments for derivation).
+       pcd_save_en is false for production. -->
+  <rosparam command="load" file="$(find fast_lio)/config/mid360_sim.yaml" />
+
+  <!-- Production overrides (explicit belt-and-suspenders) -->
+  <param name="feature_extract_enable" type="bool" value="0"/>
+  <param name="point_filter_num" type="int" value="3"/>
+  <param name="max_iteration" type="int" value="3" />
+  <param name="filter_size_surf" type="double" value="0.5" />
+  <param name="filter_size_map" type="double" value="0.5" />
+  <param name="cube_side_length" type="double" value="1000" />
+  <param name="runtime_pos_log_enable" type="bool" value="0" />
+  <param name="pcd_save/pcd_save_en" type="bool" value="false" />
+
+  <!-- Production: NO respawn.  See lifecycle note above. -->
+  <node pkg="fast_lio" type="fastlio_mapping" name="laserMapping" output="screen"
+        respawn="false">
+    <remap from="/livox/lidar" to="$(arg lid_topic)" />
+    <remap from="/livox/imu" to="$(arg imu_topic)" />
+  </node>
+
+  <!-- === Localization adapter (world -> base) === -->
+
+  <!-- Production: NO respawn. -->
+  <node pkg="competition_localization" type="localization_node" name="localization"
+        output="screen" respawn="false">
+    <param name="odom_input_topic" value="$(arg odom_input_topic)" />
+    <param name="team_scene_info_path" value="$(arg team_scene_info_path)" />
+    <param name="publish_tf" value="true" />
+    <!-- Fixed extrinsic base -> livox_imu_link (a1_description URDF chain).
+         Computed: T_base_lidar = [0.2, 0, 0.08], Ry(45°)
+                   T_lidar_imu  = [-0.011, -0.02329, 0.04412]
+         Composed:  T_base_imu   = [0.223404, -0.023290, 0.118985], Ry(45°) -->
+    <rosparam param="base_to_imu_translation">[0.223404, -0.023290, 0.118985]</rosparam>
+    <rosparam param="base_to_imu_rotation_rpy">[0.0, 0.785, 0.0]</rosparam>
+  </node>
+
+  <!-- === RViz (off by default) === -->
+  <group if="$(arg rviz)">
+    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz"
+          args="-d $(find fast_lio)/rviz_cfg/loam_livox.rviz" />
+  </group>
+
+</launch>

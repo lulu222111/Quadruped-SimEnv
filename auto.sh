@@ -34,13 +34,18 @@ ENABLE_LIVOX_IMU="$(as_ros_bool "${ENABLE_LIVOX_IMU:-$ENABLE_LIVOX}")"
 ENABLE_REALSENSE_INPUT="${ENABLE_REALSENSE:-${ENABLE_DEPTH_CAMERA:-$ENABLE_SENSOR_DATA}}"
 ENABLE_REALSENSE="$(as_ros_bool "$ENABLE_REALSENSE_INPUT")"
 ENABLE_FRONT_CAMERA="$(as_ros_bool "${ENABLE_FRONT_CAMERA:-0}")"
-ENABLE_REFEREE_ODOM="$(as_ros_bool "${ENABLE_REFEREE_ODOM:-1}")"
+# NOTE: The `odom` frame is removed from the system (team contract). The legacy
+# referee odom (/Odometry_gazebo + odom -> base TF) is no longer published, so
+# ENABLE_REFEREE_ODOM is always treated as false.
+ENABLE_REFEREE_ODOM="$(as_ros_bool "${ENABLE_REFEREE_ODOM:-0}")"
 ENABLE_GROUND_TRUTH="$(as_ros_bool "${ENABLE_GROUND_TRUTH:-1}")"
 ENABLE_FOOT_CONTACT_SENSOR="$(as_ros_bool "${ENABLE_FOOT_CONTACT_SENSOR:-0}")"
 ENABLE_FOOT_FORCE_VISUAL="$(as_ros_bool "${ENABLE_FOOT_FORCE_VISUAL:-0}")"
 ENABLE_JOY_NODE="$(as_ros_bool "${ENABLE_JOY_NODE:-0}")"
 ENABLE_POINTCLOUD_CONVERTER="$(as_ros_bool "${ENABLE_POINTCLOUD_CONVERTER:-$ENABLE_LIVOX}")"
-POINTCLOUD_USE_GROUND_TRUTH_ODOM="$(as_ros_bool "${POINTCLOUD_USE_GROUND_TRUTH_ODOM:-1}")"
+# Ground-truth odom must stay OFF in competition mode. When OFF, pointcloud2livox
+# publishes /livox/Pointcloud2 directly in the laser_livox frame.
+POINTCLOUD_USE_WORLD_ODOM="$(as_ros_bool "${POINTCLOUD_USE_WORLD_ODOM:-0}")"
 WRITE_GENERATED_TRUTH_COPY="$(as_ros_bool "${WRITE_GENERATED_TRUTH_COPY:-1}")"
 UNITREE_CTRL_DT="${UNITREE_CTRL_DT:-0.004}"
 UNITREE_LOG_WAIT_WARNINGS="$(as_ros_bool "${UNITREE_LOG_WAIT_WARNINGS:-0}")"
@@ -218,13 +223,12 @@ roslaunch unitree_guide multi_floor_gazeboSim.launch \
   enable_livox_imu:="$ENABLE_LIVOX_IMU" \
   enable_realsense:="$ENABLE_REALSENSE" \
   enable_front_camera:="$ENABLE_FRONT_CAMERA" \
-  enable_referee_odom:="$ENABLE_REFEREE_ODOM" \
   enable_ground_truth:="$ENABLE_GROUND_TRUTH" \
   enable_foot_contact_sensor:="$ENABLE_FOOT_CONTACT_SENSOR" \
   enable_foot_force_visual:="$ENABLE_FOOT_FORCE_VISUAL" \
   enable_joy_node:="$ENABLE_JOY_NODE" \
   enable_pointcloud_converter:="$ENABLE_POINTCLOUD_CONVERTER" \
-  pointcloud_use_ground_truth_odom:="$POINTCLOUD_USE_GROUND_TRUTH_ODOM" \
+  pointcloud_use_world_odom:="$POINTCLOUD_USE_WORLD_ODOM" \
   > "$WORKSPACE_DIR/logs/competition_gazebo.log" 2>&1 &
 LAUNCH_PID=$!
 echo "$LAUNCH_PID" > "$WORKSPACE_DIR/logs/competition_gazebo.pid"

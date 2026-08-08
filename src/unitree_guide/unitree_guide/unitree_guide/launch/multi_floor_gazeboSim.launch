@@ -15,13 +15,12 @@
     <arg name="enable_livox_imu" default="$(arg enable_livox)"/>
     <arg name="enable_realsense" default="$(arg enable_sensor_data)"/>
     <arg name="enable_front_camera" default="false"/>
-    <arg name="enable_referee_odom" default="true"/>
     <arg name="enable_ground_truth" default="true"/>
     <arg name="enable_foot_contact_sensor" default="false"/>
     <arg name="enable_foot_force_visual" default="false"/>
     <arg name="enable_joy_node" default="false"/>
     <arg name="enable_pointcloud_converter" default="true"/>
-    <arg name="pointcloud_use_ground_truth_odom" default="true"/>
+    <arg name="pointcloud_use_world_odom" default="false"/>
     <arg name="controller_spawner_timeout" default="$(optenv CONTROLLER_SPAWNER_TIMEOUT 120)"/>
 
     <arg name="world_file" default="$(optenv BUILDING_WORLD_FILE)"/>
@@ -59,9 +58,11 @@
                     -J RR_hip_joint -0.50 -J RR_thigh_joint 1.36 -J RR_calf_joint -2.65
                     -J RL_hip_joint 0.50 -J RL_thigh_joint 1.36 -J RL_calf_joint -2.65"/>
 
-    <node if="$(arg enable_referee_odom)" pkg="unitree_guide" type="state_from_gazebo" name="state_from_gazebo" args="0 0 0 0 0 0" output="screen">
-        <param name="robot_name" value="$(arg rname)" />
-    </node>
+    <!-- NOTE: The `odom` frame is removed from the system (team contract).
+         The legacy referee-odom node (state_from_gazebo, publishing
+         map -> odom / odom -> base TF and /Odometry_gazebo) is intentionally
+         no longer started. world -> base is provided exclusively by the
+         competition localization module. -->
 
     <rosparam file="$(arg dollar)$(arg robot_path)/config/robot_control.yaml" command="load"/>
 
@@ -92,7 +93,7 @@
             <param name="laser_blind" value="0.5" />
             <param name="min_angle" value="-7"/>
             <param name="max_angle" value="55"/>
-            <param name="use_ground_truth_odom" value="$(arg pointcloud_use_ground_truth_odom)"/>
+            <param name="use_world_odom" value="$(arg pointcloud_use_world_odom)"/>
         </node>
     </group>
 </launch>

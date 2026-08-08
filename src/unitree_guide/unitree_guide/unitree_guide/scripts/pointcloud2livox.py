@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-@brief: 将 /scan (sensor_msgs/PointCloud) 变换到 odom 坐标系后发布为 PointCloud2
+@brief: 将 /scan (sensor_msgs/PointCloud) 变换到 world 坐标系后发布为 PointCloud2
 @Editor: CJH + 修改完善版
-@Date: 2025-10-22 → 2025-11-22
+@Date: 2025-10-22 → 2025-11-22 (odom frame removed per team contract)
 """
 
 import tf
@@ -19,12 +19,15 @@ import sensor_msgs.point_cloud2 as pc2
 from nav_msgs.msg import Odometry
 
 
-ODOM_FRAME = "odom"
+WORLD_FRAME = "world"
 LOCAL_SENSOR_FRAME = "laser_livox"
-ODOM_TOPIC = "/Odometry_gazebo"
+# NOTE: The `odom` frame is removed from the system (team contract).
+# The world pose now comes from the legitimate localization module, never
+# from the ground-truth /Odometry_gazebo channel.
+LOCALIZATION_ODOM_TOPIC = "/competition/localization/odom"
 m_buf = Lock()
 latest_odom = None
-use_ground_truth_odom = True
+use_world_odom = False
 
 
 def _get_struct_fmt(pointcloud2):
@@ -110,10 +113,11 @@ def quat_to_rot_matrix(q):
         [2*(x*z - y*w),       2*(y*z + x*w),     1 - 2*(x*x + y*y)]
     ])
 
-def transform_points_to_odom(points_sensor, odom_msg):
+def transform_points_to_world(points_sensor, odom_msg):
     global tf_listener
     """
-    将 sensor_frame 中的点云变换到 odom 坐标系
+    将 sensor_frame 中的点云变换到 world 坐标系
+    （使用定位模块输出的 world -> base 位姿）
     """
     if odom_msg is None:
         return points_sensor
@@ -127,8 +131,8 @@ def transform_points_to_odom(points_sensor, odom_msg):
         if points_np.size == 0:
             return []
         points_base = (rot_base_matrix @ points_np.T).T + trans_base
-        
-        # 提取 odom → sensor_frame 的变换
+
+        # 提取 world -> base 的变换（定位模块 odom）
         trans = np.array([
             odom_msg.pose.pose.position.x,
             odom_msg.pose.pose.position.y,
@@ -137,12 +141,12 @@ def transform_points_to_odom(points_sensor, odom_msg):
 
         rot = quat_to_rot_matrix(odom_msg.pose.pose.orientation)
 
-        # 先旋转，再平移： P_odom = R * P_sensor + t
+        # 先旋转，再平移： P_world = R * P_base + t
         transformed = (rot @ points_base.T).T + trans
         return transformed.tolist()
 
     except Exception as e:
-        rospy.logwarn("Exception in transform_points_to_odom: %s", str(e))
+        rospy.logwarn("Exception in transform_points_to_world: %s", str(e))
         # 如果TF变换失败，使用原来的方法
         trans = np.array([
             odom_msg.pose.pose.position.x,
@@ -175,7 +179,7 @@ def filter_points_by_angle(points, min_angle_deg, max_angle_deg):
 
 
 def mmw_handler(mmw_cloud_msg):
-    global latest_odom, pub_laser_cloud,pub_laser_livox, laser_blind,min_angle,max_angle,use_ground_truth_odom
+    global latest_odom, pub_laser_cloud,pub_laser_livox, laser_blind,min_angle,max_angle,use_world_odom
 
     with m_buf:
         odom_now = latest_odom
@@ -202,7 +206,7 @@ def mmw_handler(mmw_cloud_msg):
         publish_custom_livox(stamp, [])
         header = rospy.Header()
         header.stamp = stamp
-        header.frame_id = ODOM_FRAME if use_ground_truth_odom else LOCAL_SENSOR_FRAME
+        header.frame_id = WORLD_FRAME if use_world_odom else LOCAL_SENSOR_FRAME
         pub_laser_cloud.publish(pc2.create_cloud_xyz32(header, []))
         return
     points_np = points_np.reshape((-1, 3))
@@ -213,10 +217,11 @@ def mmw_handler(mmw_cloud_msg):
     with m_buf:
         publish_custom_livox(stamp, filtered_points)
 
-    # Step 4: 可选地使用 Gazebo 真值里程计变换到 odom。正式比赛应关闭该选项。
-    if use_ground_truth_odom:
-        transformed_points = transform_points_to_odom(filtered_points, odom_now)
-        pointcloud2_frame = ODOM_FRAME
+    # Step 4: 可选地使用定位模块 odom 变换到 world。正式比赛建议关闭该选项
+    # （由 FAST-LIO 自己估计，无需预变换）。
+    if use_world_odom:
+        transformed_points = transform_points_to_world(filtered_points, odom_now)
+        pointcloud2_frame = WORLD_FRAME
     else:
         transformed_points = filtered_points
         pointcloud2_frame = LOCAL_SENSOR_FRAME
@@ -234,10 +239,10 @@ def mmw_handler(mmw_cloud_msg):
 
 
 def main():
-    global pub_laser_cloud,pub_laser_livox,laser_blind,min_angle,max_angle,tf_listener,use_ground_truth_odom
+    global pub_laser_cloud,pub_laser_livox,laser_blind,min_angle,max_angle,tf_listener,use_world_odom
 
 
-    rospy.init_node('pre_mmw_to_odom', anonymous=True)
+    rospy.init_node('pre_mmw_to_world', anonymous=True)
     #监听雷达与底盘的安装角度，便于矫正雷达位置
 
     tf_listener = tf.TransformListener()
@@ -250,13 +255,13 @@ def main():
     max_angle = rospy.get_param('~max_angle',60)   # 默认上限45度
     rospy.loginfo(f"Angle filter : {min_angle} ~ {max_angle} deg")
 
-    use_ground_truth_odom = rospy.get_param('~use_ground_truth_odom', True)
-    rospy.loginfo(f"Use ground-truth odom for /livox/Pointcloud2: {use_ground_truth_odom}")
+    use_world_odom = rospy.get_param('~use_world_odom', False)
+    rospy.loginfo(f"Use localization odom for /livox/Pointcloud2 in world frame: {use_world_odom}")
 
-    # 订阅原始点云；真值里程计仅在显式开启时订阅。
+    # 订阅原始点云；world 位姿（来自定位模块）仅在显式开启时订阅。
     rospy.Subscriber('/scan', PointCloud, mmw_handler, queue_size=10)
-    if use_ground_truth_odom:
-        rospy.Subscriber(ODOM_TOPIC, Odometry, odom_callback, queue_size=10)
+    if use_world_odom:
+        rospy.Subscriber(LOCALIZATION_ODOM_TOPIC, Odometry, odom_callback, queue_size=10)
 
     pub_laser_livox = rospy.Publisher('/livox/lidar2', CustomMsg, queue_size=10)
 
@@ -264,8 +269,8 @@ def main():
 
     rospy.loginfo("=== Pointcloud2livox STARTED ===")
     rospy.loginfo(f"Local sensor frame: {LOCAL_SENSOR_FRAME}")
-    if use_ground_truth_odom:
-        rospy.loginfo(f"Odom topic : {ODOM_TOPIC}")
+    if use_world_odom:
+        rospy.loginfo(f"World odom topic : {LOCALIZATION_ODOM_TOPIC}")
 
     rospy.spin()
 
