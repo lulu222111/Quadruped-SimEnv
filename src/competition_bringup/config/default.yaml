@@ -35,7 +35,7 @@ planning:
   distance_weight: 1.0
   obstacle_threshold: 50
   map_timeout: 5.0
-  localization_timeout: 2.0
+  localization_timeout: 5.0
   mapping_status_timeout: 3.0
   localization_status_timeout: 3.0
   future_stamp_tolerance: 0.5

@@ -260,6 +260,31 @@ class PlanningNodeContractRosTest(unittest.TestCase):
         self.assertFalse(frame_status.valid)
         self.assertEqual(len(frame_path.poses), 0)
 
+        # A freshly received message with an old header timestamp must
+        # still be rejected by message-level freshness protection.
+        self.clear_received_outputs()
+        self.publish_valid_statuses()
+        stale_map = self.make_map()
+        stale_map.header.stamp = (
+            rospy.Time.now() - rospy.Duration(3.0)
+        )
+        self.map_pub.publish(stale_map)
+        self.odom_pub.publish(self.make_odom())
+        stale_status, stale_path = self.wait_for(
+            lambda status, path: (
+                status is not None
+                and status.state == ModuleStatus.FAILED
+                and not status.valid
+                and "map timestamp is" in status.detail
+                and "old; limit" in status.detail
+                and path is not None
+                and len(path.poses) == 0
+            ),
+            "old map header timestamp rejection",
+        )
+        self.assertFalse(stale_status.valid)
+        self.assertEqual(len(stale_path.poses), 0)
+
         # Recover once more, then stop status heartbeats. Status timeout
         # must happen before the longer Map/Odometry timeout.
         self.clear_received_outputs()

@@ -155,7 +155,7 @@ class PlanningNode:
                 rospy.get_param("~map_timeout", 5.0)
             )
             self.localization_timeout = float(
-                rospy.get_param("~localization_timeout", 2.0)
+                rospy.get_param("~localization_timeout", 5.0)
             )
             self.mapping_status_timeout = float(
                 rospy.get_param("~mapping_status_timeout", 3.0)
@@ -394,7 +394,13 @@ class PlanningNode:
             return None
         return (now - received_at).to_sec()
 
-    def _validate_message_stamp(self, name, stamp, now):
+    def _validate_message_stamp(
+        self,
+        name,
+        stamp,
+        now,
+        max_age,
+    ):
         if stamp.is_zero():
             raise ValueError("{} timestamp must be non-zero".format(name))
         future_offset = (stamp - now).to_sec()
@@ -403,6 +409,15 @@ class PlanningNode:
                 "{} timestamp is {:.3f}s in the future".format(
                     name,
                     future_offset,
+                )
+            )
+        age = (now - stamp).to_sec()
+        if age > max_age:
+            raise ValueError(
+                "{} timestamp is {:.3f}s old; limit is {:.3f}s".format(
+                    name,
+                    age,
+                    max_age,
                 )
             )
 
@@ -547,21 +562,25 @@ class PlanningNode:
                 "mapping status",
                 mapping_status.header.stamp,
                 now,
+                self.mapping_status_timeout,
             )
             self._validate_message_stamp(
                 "localization status",
                 localization_status.header.stamp,
                 now,
+                self.localization_status_timeout,
             )
             self._validate_message_stamp(
                 "map",
                 map_msg.header.stamp,
                 now,
+                self.map_timeout,
             )
             self._validate_message_stamp(
                 "localization",
                 odom_msg.header.stamp,
                 now,
+                self.localization_timeout,
             )
 
             map_frame = map_msg.header.frame_id.strip()
