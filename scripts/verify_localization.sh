@@ -89,6 +89,51 @@ if ! wait_for_master; then
 fi
 echo "=== ROS master is up ==="
 
+echo "=== Extrinsic consistency check (official doc / canonical launch) ==="
+# Official competition doc / URDF chain (a1_description/xacro/robot.xacro):
+#   laser_livox    in base:        (0.2, 0, 0.08), Ry(45°)
+#   livox_imu_link in laser_livox: (-0.011, -0.02329, 0.04412), R=I
+# Derived:
+#   FAST-LIO Lidar_T_wrt_IMU = -t_lidar_imu = (0.011, 0.02329, -0.04412)
+#   base->imu compose        = (0.223404, -0.023290, 0.118985), Ry(45°)
+LAUNCH="$(find "$PWD/src" -path '*competition_localization/launch/localization_bringup.launch' 2>/dev/null | head -1)"
+if [[ -z "$LAUNCH" ]]; then
+    echo "FAIL: localization_bringup.launch not found" >&2
+    exit 1
+fi
+if grep -q 'mapping/extrinsic_T.*0\.011.*0\.02329.*-0\.04412' "$LAUNCH"; then
+    echo "OK: launch override FAST-LIO extrinsic_T = (0.011, 0.02329, -0.04412)"
+else
+    echo "FAIL: localization_bringup.launch lacks correct extrinsic_T override (expected 0.011, 0.02329, -0.04412)" >&2
+    exit 1
+fi
+if grep -q 'base_to_imu_translation.*0\.223404.*-0\.023290.*0\.118985' "$LAUNCH"; then
+    echo "OK: launch override base_to_imu_translation = (0.223404, -0.023290, 0.118985)"
+else
+    echo "FAIL: localization_bringup.launch lacks correct base_to_imu_translation override" >&2
+    exit 1
+fi
+if rosparam get /mapping/extrinsic_T >/dev/null 2>&1; then
+    CUR="$(rosparam get /mapping/extrinsic_T)"
+    if ! python3 - "$CUR" <<'PY'
+import math, sys
+expected = (0.011, 0.02329, -0.04412)
+try:
+    cur = tuple(float(x) for x in sys.argv[1].strip('[]').split(','))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if len(cur) == 3 and all(math.isclose(a, b, abs_tol=1e-6) for a, b in zip(cur, expected)) else 1)
+PY
+    then
+        echo "FAIL: runtime /mapping/extrinsic_T = $CUR (expected [0.011, 0.02329, -0.04412])" >&2
+        exit 1
+    else
+        echo "OK: runtime /mapping/extrinsic_T matches"
+    fi
+else
+    echo "SKIP: runtime /mapping/extrinsic_T not set (standalone mode, no FAST-LIO)"
+fi
+
 echo "=== Setting workspace root for localization_node ==="
 rosparam set /competition_loop/workspace_root "$(pwd)"
 # Standalone dev verification runs in DEBUG mode (lenient on scene-file /
@@ -164,5 +209,21 @@ else
     echo "FAIL: watchdog did not produce TIMEOUT / valid=false after input stop"
     exit 1
 fi
+
+echo "=== [Item 10] Forbidden topic scan (ground-truth / referee isolation) ==="
+# Competition contract: the production chain must not publish ground-truth,
+# referee-odom or raw cmd_vel topics in the verified environment.
+CURRENT_TOPICS="$(timeout 5 rostopic list 2>/dev/null || echo '')"
+FORBIDDEN_HIT=""
+for pattern in "/Odometry_gazebo" "/ground_truth" "/cmd_vel"; do
+    if echo "$CURRENT_TOPICS" | grep -qF "$pattern"; then
+        FORBIDDEN_HIT="$FORBIDDEN_HIT $pattern"
+    fi
+done
+if [[ -n "$FORBIDDEN_HIT" ]]; then
+    echo "FAIL: forbidden topics detected:$FORBIDDEN_HIT" >&2
+    exit 1
+fi
+echo "OK: no forbidden topics (/Odometry_gazebo, /ground_truth, /cmd_vel)"
 
 echo "=== All checks passed ==="

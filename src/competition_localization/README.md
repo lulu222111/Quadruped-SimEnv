@@ -94,6 +94,13 @@ T_imu_lidar = -T_lidar_imu = [0.011, 0.02329, -0.04412] (旋转为 I)
 
 **最终 extrinsic_T: `[0.011, 0.02329, -0.04412]`**
 
+> **官方比赛文档依据**：
+> - `laser_livox`（父 `base`）：`xyz=(0.2, 0.0, 0.08)`，`rpy=(0.0, 0.785, 0.0)`（绕 Y 轴 45°）；
+> - `livox_imu_link`（父 `laser_livox`）：`(-0.011, -0.02329, 0.04412)`，`(0.0, 0.0, 0.0)`。
+> 与 URDF `robot.xacro` 一致，构成 `base_to_imu = [0.223404, -0.023290, 0.118985], Ry(45°)` 与 `extrinsic_T = [0.011, 0.02329, -0.04412]` 的权威基准。
+
+> ⚠️ **已知 sign error 警示**：`fast_lio` 子模块 `config/mid360_sim.yaml` 默认 `extrinsic_T = [-0.011, -0.02329, 0.04412]`（把 IMU-in-LiDAR 当成 LiDAR-in-IMU，方向反了）。**生产必须经 `localization_bringup.launch` 覆盖为 `[0.011, 0.02329, -0.04412]`**；不要直接运行 FAST-LIO 自带 `mapping_mid360_sim.launch`。
+
 ---
 
 ## 启动 (生产链路)
