@@ -133,16 +133,42 @@ control_enabled     emergency_stop
   “新 Odom + 失效前旧 Path”继续运动的情况。
 * Localization status 超时后，旧 Odom 和旧 Path 都失效并停车。
 
-#### 超时和 ROS 时间回退
+#### 并发、时间戳和 ROS 时间回退
 
-PathFollower 分别检查：
+PathFollower 使用 `threading.RLock` 保护 callback 与控制循环共享状态，
+并维护本地 generation / state version。
 
-* Path 接收超时；
-* Odom 接收超时；
-* Planning status 接收超时；
-* Localization status 接收超时。
+控制周期会对 Path、Odom 和上游状态读取稳定快照；
+在发布非零 `/competition/raw_cmd_vel` 前再次确认 generation 和
+state version 未发生变化。因此一旦 Planning / Localization invalid、
+timeout 或 ROS 时间回退已经发生，失效前启动的旧控制计算不能随后重新
+发布非零速度。
 
-发生 ROS 时间回退时，旧 generation 输入全部失效并停车。
+PathFollower 将两个时间概念分开处理：
+
+* `received_at`：本节点收到消息的 ROS 时间，用于本地 watchdog；
+* `header.stamp`：消息自身时间戳，用于判断数据来源和 freshness。
+
+以下四类正式输入都检查 `header.stamp`：
+
+* `/competition/path`
+* `/competition/planning/status`
+* `/competition/localization/odom`
+* `/competition/localization/status`
+
+拒绝：
+
+* 零时间戳；
+* 超过对应 timeout 的 stale 时间戳；
+* 超过 `max_future_stamp_skew` 的 future 时间戳；
+* 属于已失效旧 generation 的延迟数据。
+
+Path、Odom、Planning status 和 Localization status 仍分别执行
+接收 watchdog timeout。
+
+检测到 ROS 时间回退时，当前 generation 立即失效，
+旧 Planning status、Localization status、Odom 和 Path 全部清除并停车；
+只有回退后当前 generation 的新输入重新齐全后才允许恢复运动。
 
 ### `cmd_vel_guard_node`
 
@@ -182,6 +208,7 @@ PathFollower 分别检查：
 | `~odom_timeout`                |  `1.0` | Odom 接收超时（s）                |
 | `~planning_status_timeout`     |  `1.0` | Planning status 接收超时（s）     |
 | `~localization_status_timeout` |  `1.0` | Localization status 接收超时（s） |
+| `~max_future_stamp_skew`        |  `0.2` | 允许消息时间戳领先当前 ROS time 的最大偏差（s） |
 
 ### `cmd_vel_guard_node`
 
@@ -239,7 +266,10 @@ python3 src/competition_control/test/test_path_follower.py
 * invalid 状态下候选新数据的缓存与恢复；
 * Path timeout；
 * Odom timeout；
-* ROS 时间回退；
+* callback / `step()` 并发安全和旧控制周期结果丢弃；
+* 四类正式输入的 zero / stale / future `header.stamp`；
+* invalid / rollback 后旧 generation 延迟数据拒绝；
+* ROS 时间回退与新 generation 恢复；
 * 空 Path 撤销；
 * Path `world` frame 校验；
 * Path 中每个 PoseStamped 的 `world` frame 校验；
@@ -255,7 +285,7 @@ python3 src/competition_control/test/test_path_follower.py
 当前回归结果：
 
 ```text
-test_path_follower.py: 26 tests passed
+test_path_follower.py: 49 tests passed
 test_cmd_vel_guard.py: 14 tests passed
 ```
 
@@ -303,7 +333,20 @@ rostopic info /cmd_vel
 * 非法 Odom `child_frame_id`；
 * `control_enabled=false` 时最终速度为零；
 * `emergency_stop=true` 时最终速度为零；
-* 急停优先级高于控制禁用。
+* 急停优先级高于控制禁用；
+* 正常运行中 Localization `valid=false` 后，不再出现旧 generation 非零速度；
+* 正常运行中 Planning `valid=false` 后，不再出现旧 Path 非零速度；
+* zero、stale、future `header.stamp` 被拒绝并保持零速度；
+* ROS `/clock` 从新时间回退到旧时间后，旧 generation 全部失效；
+* rollback 后旧 generation 延迟 Path 被拒绝；
+* rollback 后只有新的 Planning status、Localization status、Odom 和 Path
+  齐全后才恢复运动；
+* ROS 时间回退后 PathFollower 和 Guard 均保持存活。
+
+Localization production 链当前实测 Odom 和 status 均约为 `10 Hz`。
+Control 仍独立保留 `odom_timeout=1.0` 和
+`localization_status_timeout=1.0` 作为第二层 fail-safe，
+不复制 Localization 内部 watchdog 参数。
 
 禁止正式算法订阅 `/Odometry_gazebo`、`/ground_truth/*`
 或读取其他真值接口绕过 Localization。

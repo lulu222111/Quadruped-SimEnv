@@ -17,6 +17,7 @@ Safety conditions always override the path follower's reported state.
 from __future__ import annotations
 
 import math
+import time
 
 import geometry_msgs.msg
 import rospy
@@ -82,7 +83,7 @@ class CmdVelGuard:
             "/competition/control/status", ModuleStatus, queue_size=10, latch=True
         )
 
-        self._timer = rospy.Timer(rospy.Duration(0.02), self._control_loop)
+        self._timer = rospy.Timer(rospy.Duration(0.02), self._control_loop, reset=True)
         rospy.on_shutdown(self._on_shutdown)
 
         rospy.loginfo(
@@ -275,7 +276,7 @@ class CmdVelGuard:
         zero = geometry_msgs.msg.Twist()
         for _ in range(5):
             self._cmd_vel_pub.publish(zero)
-            rospy.sleep(0.05)
+            time.sleep(0.05)
 
     @staticmethod
     def _clamp(value, limit):
