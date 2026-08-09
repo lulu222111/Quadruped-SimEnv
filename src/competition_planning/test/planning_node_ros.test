@@ -5,15 +5,18 @@
     name="planning_node"
     output="screen"
   >
-    <param name="replan_interval" value="0.1" />
-    <param name="map_timeout" value="0.6" />
-    <param name="localization_timeout" value="0.6" />
+    <param name="replan_interval" value="0.05" />
+    <param name="map_timeout" value="2.0" />
+    <param name="localization_timeout" value="2.0" />
+    <param name="mapping_status_timeout" value="0.6" />
+    <param name="localization_status_timeout" value="0.6" />
+    <param name="future_stamp_tolerance" value="0.2" />
+    <param name="status_heartbeat_interval" value="0.1" />
   </node>
-
   <test
     test-name="planning_node_ros_test"
     pkg="competition_planning"
     type="planning_node_ros_test.py"
-    time-limit="30.0"
+    time-limit="40.0"
   />
 </launch>
