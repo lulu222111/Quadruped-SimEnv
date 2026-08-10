@@ -18,6 +18,7 @@ from __future__ import annotations
 import sys
 
 import rospy
+import tf2_ros
 import nav_msgs.msg
 import geometry_msgs.msg
 from competition_interfaces.msg import ModuleStatus
@@ -54,6 +55,10 @@ def main():
         "/competition/localization/status", ModuleStatus, queue_size=10, latch=True
     )
 
+    # Publish the single dynamic TF world -> base (same convention as the real
+    # localization node: the `odom` frame is removed from the system).
+    tf_broadcaster = tf2_ros.TransformBroadcaster()
+
     # Publish valid status
     status = ModuleStatus()
     status.header.stamp = rospy.Time.now()
@@ -67,9 +72,10 @@ def main():
     idx = 0
     while not rospy.is_shutdown():
         x, y, z, qx, qy, qz, qw = MOCK_TRAJECTORY[idx % len(MOCK_TRAJECTORY)]
+        stamp = rospy.Time.now()
 
         odom = nav_msgs.msg.Odometry()
-        odom.header.stamp = rospy.Time.now()
+        odom.header.stamp = stamp
         odom.header.frame_id = "world"
         odom.child_frame_id = "base"
         odom.pose.pose.position.x = x
@@ -88,6 +94,20 @@ def main():
         odom.pose.covariance[14] = 0.01
 
         odom_pub.publish(odom)
+
+        # world -> base TF, values/timestamp identical to the odometry message
+        tf_msg = geometry_msgs.msg.TransformStamped()
+        tf_msg.header.stamp = stamp
+        tf_msg.header.frame_id = "world"
+        tf_msg.child_frame_id = "base"
+        tf_msg.transform.translation.x = x
+        tf_msg.transform.translation.y = y
+        tf_msg.transform.translation.z = z
+        tf_msg.transform.rotation.x = qx
+        tf_msg.transform.rotation.y = qy
+        tf_msg.transform.rotation.z = qz
+        tf_msg.transform.rotation.w = qw
+        tf_broadcaster.sendTransform(tf_msg)
 
         idx += 1
         rate.sleep()
