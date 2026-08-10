@@ -194,6 +194,23 @@ Path、Odom、Planning status 和 Localization status 仍分别执行
 只有 PathFollower 报告 `RUNNING, valid=true`，
 且 Guard 的所有安全检查都通过时，才允许输出非零 `/cmd_vel`。
 
+Guard 使用 `threading.RLock` 串行化安全 callback 与控制循环的最终
+`/cmd_vel` / `/competition/control/status` 提交。急停、控制禁用、
+PathFollower invalid 等 callback 一旦完成状态更新，之前已经启动的旧控制循环
+不能随后再发布非零 `/cmd_vel`。
+
+Guard 也独立维护 ROS time generation。检测到 ROS 时间回退时，会立即：
+
+* 清除缓存的 `/competition/raw_cmd_vel` 及其接收时间；
+* 清除缓存的 `/competition/control/path_follower_status` 及其接收时间；
+* 发布零 `/cmd_vel`；
+* 发布 `control/status` 为 `valid=false`。
+
+回退后必须重新收到当前 generation 的 fresh raw velocity 和 fresh
+PathFollower status 才允许恢复运动。由于 `geometry_msgs/Twist` 没有 Header，
+raw velocity 继续使用本地接收 watchdog；PathFollower status 则检查
+`header.stamp`，拒绝 zero / stale / future / old-generation 时间戳。
+
 ## 参数
 
 ### `path_follower_node`
@@ -216,6 +233,7 @@ Path、Odom、Planning status 和 Localization status 仍分别执行
 | ------------------------------- | ----: | -------------------------------- |
 | `~cmd_vel_timeout`              | `0.5` | `/competition/raw_cmd_vel` 超时（s） |
 | `~path_follower_status_timeout` | `1.0` | 内部路径跟踪状态超时（s）                    |
+| `~max_future_stamp_skew`        | `0.2` | 允许 PathFollower status 时间戳领先当前 ROS time 的最大偏差（s） |
 | `~max_linear_x`                 | `0.5` | `linear.x` 限幅（m/s）               |
 | `~max_linear_y`                 | `0.3` | `linear.y` 限幅（m/s）               |
 | `~max_angular_z`                | `1.0` | `angular.z` 限幅（rad/s）            |
@@ -280,13 +298,17 @@ python3 src/competition_control/test/test_path_follower.py
 * 非法 raw velocity；
 * raw velocity timeout；
 * follower status timeout；
+* Guard callback / control-loop 原子性：急停、控制禁用、follower invalid；
+* follower status 的 zero / stale / future / old-generation `header.stamp`；
+* Guard ROS time rollback 后缓存清理、立即零速与 fresh-data recovery；
+* 连续多次 rollback 时新 epoch cutoff 正确重置；
 * 速度限幅与安全状态优先级。
 
 当前回归结果：
 
 ```text
 test_path_follower.py: 49 tests passed
-test_cmd_vel_guard.py: 14 tests passed
+test_cmd_vel_guard.py: 25 tests passed
 ```
 
 ## ROS 联调验收
