@@ -5,15 +5,19 @@ pointcloud_topic: /livox/Pointcloud2
 map_topic: /competition/map
 mapping_status_topic: /competition/mapping/status
 
-# Fixed map: 40 m x 40 m, centered around the initial odom origin
-map_frame: odom
+# Frozen frame contract and 40 m x 40 m map
+map_frame: world
+expected_base_frame: base
+expected_cloud_frame: laser_livox
 resolution: 0.10
 map_width: 400
 map_height: 400
+origin_mode: initial_pose
+# Used only when origin_mode=fixed
 origin_x: -20.0
 origin_y: -20.0
 
-# Points are filtered after TF conversion into odom child/base frame
+# Points are filtered after timestamped TF conversion into base
 sensor_min_range: 0.30
 sensor_max_range: 20.0
 min_height: -0.50
@@ -23,12 +27,16 @@ max_points_per_cloud: 50000
 tf_timeout: 0.10
 
 # Health/status behavior
-update_rate: 2.0
+map_publish_rate: 2.0
+status_heartbeat_rate: 10.0
+integration_rate: 5.0
 odom_timeout: 1.0
 localization_status_timeout: 1.0
 pointcloud_timeout: 1.0
+max_input_age: 2.0
+future_stamp_tolerance: 0.20
+time_rollback_tolerance: 0.001
 quaternion_norm_tolerance: 0.10
-require_odom_in_map_frame: true
 
 # Safety against localization discontinuities
 max_pose_jump: 2.0

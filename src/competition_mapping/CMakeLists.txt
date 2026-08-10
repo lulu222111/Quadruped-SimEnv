@@ -3,6 +3,7 @@ project(competition_mapping)
 
 find_package(catkin REQUIRED COMPONENTS
   competition_interfaces
+  geometry_msgs
   nav_msgs
   rospy
   sensor_msgs
@@ -15,6 +16,7 @@ catkin_python_setup()
 catkin_package(
   CATKIN_DEPENDS
     competition_interfaces
+    geometry_msgs
     nav_msgs
     rospy
     sensor_msgs

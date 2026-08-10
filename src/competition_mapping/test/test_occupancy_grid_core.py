@@ -75,8 +75,19 @@ class OccupancyGridCoreTest(unittest.TestCase):
         ]
         stats = grid.integrate_scan(0.0, 0.0, 0.0, points)
         self.assertEqual(6, stats["input_points"])
+        self.assertEqual(6, stats["total_points"])
         self.assertEqual(1, stats["valid_points"])
         self.assertEqual(5, stats["rejected_points"])
+        self.assertEqual(1, stats["non_finite_rejected"])
+        self.assertEqual(2, stats["range_rejected"])
+        self.assertEqual(2, stats["height_rejected"])
+
+    def test_occupied_endpoint_wins_over_crossing_free_ray_in_same_scan(self):
+        grid = self.make_grid()
+        # The second ray crosses the endpoint of the first ray at (7, 5).
+        grid.integrate_scan(0.0, 0.0, 0.0, [(2.0, 0.0, 0.0), (4.0, 0.0, 0.0)])
+        self.assertEqual(100, grid.get_cell(7, 5))
+        self.assertEqual(100, grid.get_cell(9, 5))
 
     def test_empty_scan_does_not_change_map(self):
         grid = self.make_grid()

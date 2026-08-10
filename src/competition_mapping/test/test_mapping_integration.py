@@ -6,7 +6,9 @@ import unittest
 import rospy
 import rostest
 import sensor_msgs.point_cloud2 as pc2
+import tf2_ros
 from competition_interfaces.msg import ModuleStatus
+from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
@@ -18,6 +20,7 @@ class MappingIntegrationTest(unittest.TestCase):
         self._map = None
         self._status = None
         self._status_valid = True
+        self._publish_cloud = True
         self._stop = False
         self._status_pub = rospy.Publisher(
             "/competition/localization/status", ModuleStatus, queue_size=1, latch=True
@@ -30,6 +33,9 @@ class MappingIntegrationTest(unittest.TestCase):
         self._mapping_status_sub = rospy.Subscriber(
             "/competition/mapping/status", ModuleStatus, self._status_cb
         )
+        self._tf = tf2_ros.TransformBroadcaster()
+        self._static_tf = tf2_ros.StaticTransformBroadcaster()
+        self._publish_static_tf()
         self._thread = threading.Thread(target=self._publish_inputs)
         self._thread.daemon = True
         self._thread.start()
@@ -46,6 +52,14 @@ class MappingIntegrationTest(unittest.TestCase):
         with self._lock:
             self._status = msg
 
+    def _publish_static_tf(self):
+        transform = TransformStamped()
+        transform.header.stamp = rospy.Time.now()
+        transform.header.frame_id = "base"
+        transform.child_frame_id = "laser_livox"
+        transform.transform.rotation.w = 1.0
+        self._static_tf.sendTransform(transform)
+
     def _publish_inputs(self):
         rate = rospy.Rate(10)
         fields = [
@@ -55,6 +69,7 @@ class MappingIntegrationTest(unittest.TestCase):
         ]
         while not rospy.is_shutdown() and not self._stop:
             stamp = rospy.Time.now()
+
             status = ModuleStatus()
             status.header.stamp = stamp
             status.state = ModuleStatus.RUNNING if self._status_valid else ModuleStatus.BLOCKED
@@ -65,14 +80,25 @@ class MappingIntegrationTest(unittest.TestCase):
 
             odom = Odometry()
             odom.header.stamp = stamp
-            odom.header.frame_id = "odom"
-            odom.child_frame_id = "base_link"
+            odom.header.frame_id = "world"
+            odom.child_frame_id = "base"
             odom.pose.pose.orientation.w = 1.0
             self._odom_pub.publish(odom)
 
-            header = Header(stamp=stamp, frame_id="base_link")
-            cloud = pc2.create_cloud(header, fields, [(3.0, 0.0, 0.5)])
-            self._cloud_pub.publish(cloud)
+            # Deliberately differs from Odometry x=0. The expected occupied cell
+            # proves Mapping uses the point-cloud timestamp TF pose (x=1).
+            dynamic_tf = TransformStamped()
+            dynamic_tf.header.stamp = stamp
+            dynamic_tf.header.frame_id = "world"
+            dynamic_tf.child_frame_id = "base"
+            dynamic_tf.transform.translation.x = 1.0
+            dynamic_tf.transform.rotation.w = 1.0
+            self._tf.sendTransform(dynamic_tf)
+
+            if self._publish_cloud:
+                header = Header(stamp=stamp, frame_id="laser_livox")
+                cloud = pc2.create_cloud(header, fields, [(3.0, 0.0, 0.5)])
+                self._cloud_pub.publish(cloud)
             rate.sleep()
 
     def _wait_for(self, predicate, timeout=8.0):
@@ -84,24 +110,38 @@ class MappingIntegrationTest(unittest.TestCase):
             time.sleep(0.05)
         self.fail("condition not reached within {:.1f}s".format(timeout))
 
-    def test_map_metadata_encoding_and_localization_failure_guard(self):
+    def test_timestamped_tf_metadata_and_epoch_recovery(self):
         self._wait_for(lambda m, s: m is not None and s is not None and s.valid)
         with self._lock:
             first_map = self._map
             first_data = list(first_map.data)
-        self.assertEqual("odom", first_map.header.frame_id)
+        self.assertEqual("world", first_map.header.frame_id)
         self.assertEqual(1.0, first_map.info.resolution)
         self.assertEqual(20, first_map.info.width)
         self.assertEqual(20, first_map.info.height)
+        self.assertEqual(-10.0, first_map.info.origin.position.x)
         self.assertIn(100, first_data)
         self.assertIn(0, first_data)
         self.assertIn(-1, first_data)
+        self.assertEqual(100, first_data[10 * 20 + 14])
+        self.assertNotEqual(100, first_data[10 * 20 + 13])
 
         self._status_valid = False
-        self._wait_for(lambda _m, s: s is not None and not s.valid and s.state == ModuleStatus.BLOCKED)
-        time.sleep(0.5)
+        self._wait_for(lambda _m, s: s is not None and not s.valid)
+        time.sleep(0.4)
         with self._lock:
             self.assertEqual(first_data, list(self._map.data))
+
+        # A valid localization alone cannot revalidate the old latched map.
+        self._publish_cloud = False
+        self._status_valid = True
+        time.sleep(0.5)
+        with self._lock:
+            self.assertIsNotNone(self._status)
+            self.assertFalse(self._status.valid)
+
+        self._publish_cloud = True
+        self._wait_for(lambda _m, s: s is not None and s.valid)
 
 
 if __name__ == "__main__":

@@ -1,37 +1,93 @@
 # competition_mapping
 
-This package builds a fixed-size 2D `nav_msgs/OccupancyGrid` from legitimate
-localization odometry and LiDAR `PointCloud2` data.
+负责人：马跃。
 
-## Interface contract
+本包使用合法 Localization 和 Livox 点云生成固定尺寸的二维
+`nav_msgs/OccupancyGrid`。当前实现是最小可用的确定性二值栅格建图，不读取
+Gazebo truth、world/layout 文件，不订阅真值接口，也不发布 `/cmd_vel`。
 
-- Input: `/competition/localization/status` (`competition_interfaces/ModuleStatus`)
-- Input: `/competition/localization/odom` (`nav_msgs/Odometry`)
-- Input: `/livox/Pointcloud2` (`sensor_msgs/PointCloud2`)
-- Output: `/competition/map` (`nav_msgs/OccupancyGrid`)
-- Output: `/competition/mapping/status` (`competition_interfaces/ModuleStatus`)
+## 冻结接口
 
-The node never reads Gazebo ground truth, world/layout/truth files, or publishes
-`/cmd_vel`. Point clouds are fused only while localization status and odometry
-are valid and fresh.
+输入：
 
-## Files
+- `/competition/localization/status`：`competition_interfaces/ModuleStatus`；
+- `/competition/localization/odom`：`nav_msgs/Odometry`，必须为 `world/base`；
+- `/livox/Pointcloud2`：`sensor_msgs/PointCloud2`，必须为 `laser_livox`。
 
-- `src/competition_mapping/occupancy_grid_core.py`: ROS-independent grid logic.
-- `scripts/mapping_node`: subscriptions, TF conversion, health checks, map/status publication.
-- `config/mapping.yaml`: all map, filter, timeout, and pose-jump parameters.
-- `launch/mapping.launch`: production launch; it starts no mock nodes.
-- `test/test_occupancy_grid_core.py`: deterministic pure-Python unit tests.
-- `test/mapping_integration.test`: ROS integration and localization-failure test.
+TF：
 
-## Replace the existing package
+- 动态 `world -> base(t_cloud)`；
+- 静态 `base -> laser_livox`。
 
-From the SimEnv repository on the host, first back up or commit your current
-work. Then replace the contents of `src/competition_mapping/` with the contents
-of this directory. Preserve the real maintainer name/email in `package.xml` if
-your repository already has them.
+Mapping 按 `PointCloud2.header.stamp` 查询这两段 TF，不使用最新 Odometry
+代替历史位姿，不使用 `rospy.Time(0)`，也不在本包中硬编码 Livox 外参。
 
-Make scripts executable:
+输出：
+
+- `/competition/map`：`nav_msgs/OccupancyGrid`，frame 为 `world`，latched；
+- `/competition/mapping/status`：`competition_interfaces/ModuleStatus`，latched。
+
+`mapping/status.valid=true` 才表示当前地图可供 Planning 使用。状态变为
+`valid=false` 后，旧 latched map 仍可能存在，Planning 必须停止使用旧地图并
+撤销旧路径；后者由 Planning/Loop 的独立 PR 负责。
+
+## 关键行为
+
+### 地图原点
+
+- `origin_mode: initial_pose`（正式默认）：第一组本 epoch 的合法
+  Localization status 和 Odometry 到达后，将机器人初始 `(x,y)` 放在地图中央；
+  此前不产生有效地图，状态保持 `valid=false`。
+- `origin_mode: fixed`：使用 `origin_x/origin_y`，用于确定性测试和调试。
+
+### latest-only 融合
+
+点云回调只校验 frame 和时间戳并保存一帧 pending cloud；新点云覆盖未处理的
+旧点云。融合定时器按 `integration_rate` 查询时间戳 TF、解码点云并更新地图，
+避免在真实 Livox 点云下阻塞 Localization 回调。
+
+### 异常门控与 epoch 恢复
+
+Localization 失效、status/Odometry 超时或非法、位姿跳变、TF 不可用、ROS
+时间回退等情况会立即使 Mapping 无效并进入新输入 epoch。恢复 `valid=true`
+必须同时满足：
+
+1. 本 epoch 的新合法 Localization status；
+2. 本 epoch 的新合法 `world/base` Odometry；
+3. 本 epoch 的新 `laser_livox` 点云；
+4. 点云时刻两段 TF 查询成功；
+5. 至少成功融合一帧且产生有效栅格更新。
+
+成功融合点云的超时以 `last_cloud_integrated_at` 为准，而不是任意点云的接收
+时间。零、过旧、未来、重复或乱序时间戳会被拒绝；ROS 时间回退会清空时间
+基线、pending cloud、输入 epoch 有效标记和地图，并可在新输入到达后恢复。
+
+### 栅格语义和限制
+
+- `unknown=-1`、`free=0`、`occupied=100`；
+- 同一扫描先汇总 free cells，最后写 occupied endpoints，保证 occupied 优先；
+- 新扫描的 free ray 仍可清除旧扫描留下的障碍；
+- 当前不是概率/log-odds 地图，没有占据概率累积、衰减或动态障碍跟踪；
+- 当前高度过滤只是固定高度切片，不是地面分割；
+- 当前只支持单楼层、固定二维地图。
+
+高度阈值、融合频率、地图尺寸、跳变阈值和 timeout 仍需在真实
+Localization + Livox 连续运动联调后确认。
+
+## 文件结构
+
+- `src/competition_mapping/occupancy_grid_core.py`：ROS 无关的栅格核心；
+- `scripts/mapping_node`：订阅、时间同步、TF、epoch、状态和发布；
+- `config/mapping.yaml`：正式默认参数；
+- `launch/mapping.launch`：正式启动文件，不启动 Mock；
+- `test/test_occupancy_grid_core.py`：纯 Python 单元测试；
+- `test/mapping_integration.test`：Mock Localization、PointCloud 和 TF 的 Rostest。
+
+## 替换现有包
+
+在 SimEnv 仓库中先提交或备份当前修改，然后用本目录内容替换
+`src/competition_mapping/`。如果仓库已有真实 maintainer 姓名和邮箱，请保留；
+压缩包内 `package.xml` 的邮箱仍需由团队确认，未擅自编造。
 
 ```bash
 chmod +x \
@@ -40,9 +96,9 @@ chmod +x \
   src/competition_mapping/test/test_occupancy_grid_core.py
 ```
 
-## Test 1: no-ROS unit test
+## 测试
 
-Run on the host or in the container:
+### 1. 纯 Python 单元测试
 
 ```bash
 cd "$HOME/SimEnv"
@@ -51,11 +107,11 @@ python3 -m unittest -v \
   src/competition_mapping/test/test_occupancy_grid_core.py
 ```
 
-Expected result: `Ran 12 tests` and `OK`.
+预期：`Ran 13 tests`、`OK`。
 
-## Test 2: build and compile checks
+### 2. 编译和 Rostest
 
-Run inside the `simenv-my` container (or use your actual personal service name):
+在个人容器中执行：
 
 ```bash
 cd /workspace/SimEnv
@@ -68,111 +124,33 @@ python3 -m py_compile \
 
 catkin_make --pkg competition_mapping
 source devel/setup.bash
-rospack find competition_mapping
-rosrun competition_mapping mapping_node
-```
-
-The final `rosrun` command starts the node, so a ROS master must already be
-running. Stop it with `Ctrl+C` after confirming the executable is found and the
-node reports that it is waiting for inputs.
-
-## Test 3: automated ROS integration test
-
-With no other mapping node or mock publisher running:
-
-```bash
-cd /workspace/SimEnv
-source /opt/ros/noetic/setup.bash
-source devel/setup.bash
-
 rostest competition_mapping mapping_integration.test
 ```
 
-The test publishes synthetic legal localization, odometry, and base-frame point
-clouds. It verifies map metadata, `-1/0/100` encoding, `status.valid=true`, then
-injects `localization.valid=false` and verifies that the map no longer changes.
+Rostest 使用正式 `world/base/laser_livox` 契约、静态和动态 TF；其 Odometry
+位置故意与动态 TF 不同，用于验证建图实际采用点云时刻 TF。测试还验证
+`initial valid -> localization invalid -> 无新点云不能恢复 -> 新点云融合后恢复`
+的 epoch 行为。合并门槛为 `0 errors / 0 failures / 0 timeouts`。
 
-## Test 4: manual synthetic inspection
+### 3. 真实仿真联调
 
-Terminal 1:
-
-```bash
-source /opt/ros/noetic/setup.bash
-source /workspace/SimEnv/devel/setup.bash
-roslaunch competition_mapping mapping.launch \
-  pointcloud_topic:=/test/points
-```
-
-The automated `rostest` is the preferred synthetic test. For a manual test,
-run the publishers from `test/test_mapping_integration.py` via rostest, or use
-your team's `competition_testing` mock only in `test_mode=true`.
-
-Inspect interfaces in another terminal:
+只启动一套共享 Gazebo，并关闭真值接口。确认上游后再启动 Mapping：
 
 ```bash
-source /opt/ros/noetic/setup.bash
-source /workspace/SimEnv/devel/setup.bash
-rostopic info /competition/map
-rostopic hz /competition/map
-rostopic echo -n 1 /competition/map/info
-rostopic echo -n 1 /competition/mapping/status
-```
-
-Expected map values are `unknown=-1`, `free=0`, and `occupied=100`; the default
-metadata is 0.1 m resolution, 400 x 400 cells, origin (-20, -20), frame `odom`.
-
-## Test 5: real simulation
-
-Reserve the shared simulator first. Start SimEnv only once, with truth disabled:
-
-```bash
-cd /workspace/SimEnv
-ENABLE_GROUND_TRUTH=0 ENABLE_REFEREE_ODOM=0 \
-UNITREE_AUTO_CMD_VEL=1 CONTROLLER_FOREGROUND=0 \
-SEED=77 GUI=true ./auto.sh
-```
-
-In another container terminal:
-
-```bash
-source /opt/ros/noetic/setup.bash
-source /workspace/SimEnv/devel/setup.bash
-
-rostopic type /livox/Pointcloud2
 rostopic hz /livox/Pointcloud2
 rostopic echo -n 1 /livox/Pointcloud2/header
 rostopic echo -n 1 /competition/localization/odom/header
 rostopic echo -n 1 /competition/localization/odom/child_frame_id
-rosrun tf tf_echo base_link <POINTCLOUD_FRAME>
-
+rosrun tf tf_echo world base
+rosrun tf tf_echo base laser_livox
 roslaunch competition_mapping mapping.launch
 ```
 
-Replace `base_link` with the actual odometry `child_frame_id`, and
-`<POINTCLOUD_FRAME>` with the point-cloud header frame. If `tf_echo` cannot find
-that transform, the mapper will correctly report `BLOCKED`; the sensor-to-base
-static TF must be fixed in bringup rather than bypassed in mapping.
+RViz 的 Fixed Frame 设为 `world`，添加 `/competition/map` 和
+`/livox/Pointcloud2`。重点确认地图不随机器人旋转/漂移、墙体连续、机器人周围
+存在 free、未观测区域仍为 unknown，并记录真实点云 z 分布后再调整高度阈值。
 
-In RViz:
-
-1. Set Fixed Frame to `odom`.
-2. Add `Map`, topic `/competition/map`.
-3. Add `PointCloud2`, topic `/livox/Pointcloud2`.
-4. Confirm walls are continuous, robot surroundings are free, unknown space
-   remains unknown, and the whole map does not rotate or drift with the robot.
-
-## Failure injection
-
-Do this only in an isolated test session where a mock localization status
-publisher is allowed. Record one map, publish invalid status, keep sending the
-cloud, and compare the map again. The provided rostest automates this check.
-
-For pose-jump protection, publish an odometry jump larger than `max_pose_jump`
-or `max_yaw_jump`. Mapping status becomes `BLOCKED`. After
-`pose_recovery_samples` mutually consistent poses, the default behavior resets
-the old map and resumes, preventing two coordinate frames from being fused.
-
-## Compliance check
+## 合规检查
 
 ```bash
 rg -n \
@@ -180,5 +158,5 @@ rg -n \
   src/competition_mapping
 ```
 
-Only explanatory README text should match; executable Python and launch/config
-files must contain no forbidden interface or truth-file access.
+可执行 Python、launch 和 config 不应命中任何禁用接口；README 中的说明文字可
+能命中。

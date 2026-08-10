@@ -122,6 +122,10 @@ class OccupancyGridCore:
         """Filter and integrate xyz points expressed in the robot base frame."""
         stats = {
             "input_points": 0,
+            "total_points": 0,
+            "non_finite_rejected": 0,
+            "range_rejected": 0,
+            "height_rejected": 0,
             "valid_points": 0,
             "rejected_points": 0,
             "occupied_endpoints": 0,
@@ -139,21 +143,28 @@ class OccupancyGridCore:
 
         cos_yaw = math.cos(robot_yaw)
         sin_yaw = math.sin(robot_yaw)
+        free_cells = set()
+        occupied_endpoints = set()
         for raw_point in points_in_base:
             stats["input_points"] += 1
+            stats["total_points"] += 1
             try:
                 point_x, point_y, point_z = map(float, raw_point[:3])
             except (IndexError, TypeError, ValueError):
+                stats["non_finite_rejected"] += 1
                 stats["rejected_points"] += 1
                 continue
             if not all(math.isfinite(v) for v in (point_x, point_y, point_z)):
+                stats["non_finite_rejected"] += 1
                 stats["rejected_points"] += 1
                 continue
             point_range = math.hypot(point_x, point_y)
             if not self.min_range <= point_range <= self.max_range:
+                stats["range_rejected"] += 1
                 stats["rejected_points"] += 1
                 continue
             if not self.min_height <= point_z <= self.max_height:
+                stats["height_rejected"] += 1
                 stats["rejected_points"] += 1
                 continue
 
@@ -169,19 +180,26 @@ class OccupancyGridCore:
                     break
                 if endpoint_inside and cell == endpoint:
                     break
-                index = self.grid_to_index(*cell)
-                # A later clear ray is newer evidence, so it clears stale obstacles.
-                if self._data[index] != self.FREE:
-                    self._data[index] = self.FREE
-                    stats["changed_cells"] += 1
-                stats["free_cells_updated"] += 1
+                free_cells.add(cell)
 
             if endpoint_inside:
-                index = self.grid_to_index(*endpoint)
-                if self._data[index] != self.OCCUPIED:
-                    self._data[index] = self.OCCUPIED
-                    stats["changed_cells"] += 1
-                stats["occupied_endpoints"] += 1
+                occupied_endpoints.add(endpoint)
+
+        # Apply every free ray first, then every endpoint. This lets a new scan
+        # clear stale obstacles while guaranteeing occupied wins within one scan.
+        for cell in free_cells:
+            index = self.grid_to_index(*cell)
+            if self._data[index] != self.FREE:
+                self._data[index] = self.FREE
+                stats["changed_cells"] += 1
+        for cell in occupied_endpoints:
+            index = self.grid_to_index(*cell)
+            if self._data[index] != self.OCCUPIED:
+                self._data[index] = self.OCCUPIED
+                stats["changed_cells"] += 1
+
+        stats["free_cells_updated"] = len(free_cells)
+        stats["occupied_endpoints"] = len(occupied_endpoints)
 
         return stats
 

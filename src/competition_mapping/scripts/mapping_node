@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import math
 import threading
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import rospy
 import sensor_msgs.point_cloud2 as point_cloud2
@@ -19,9 +19,12 @@ from competition_mapping import OccupancyGridCore, transform_point_3d
 
 RobotPose = Tuple[float, float, float]
 Point3D = Tuple[float, float, float]
+PendingCloud = Tuple[PointCloud2, int]
 
 
 class MappingNode:
+    """Latest-only mapper with timestamped TF lookup and epoch-based recovery."""
+
     def __init__(self) -> None:
         rospy.init_node("mapping_node", log_level=rospy.INFO)
         self._lock = threading.RLock()
@@ -36,12 +39,21 @@ class MappingNode:
             "~mapping_status_topic", "/competition/mapping/status"
         )
 
-        self._map_frame = rospy.get_param("~map_frame", "odom")
+        self._map_frame = self._normalise_frame(rospy.get_param("~map_frame", "world"))
+        self._expected_base_frame = self._normalise_frame(
+            rospy.get_param("~expected_base_frame", "base")
+        )
+        self._expected_cloud_frame = self._normalise_frame(
+            rospy.get_param("~expected_cloud_frame", "laser_livox")
+        )
+        self._origin_mode = str(rospy.get_param("~origin_mode", "initial_pose"))
         self._resolution = float(rospy.get_param("~resolution", 0.1))
         self._map_width = int(rospy.get_param("~map_width", 400))
         self._map_height = int(rospy.get_param("~map_height", 400))
-        self._origin_x = float(rospy.get_param("~origin_x", -20.0))
-        self._origin_y = float(rospy.get_param("~origin_y", -20.0))
+        self._fixed_origin_x = float(rospy.get_param("~origin_x", -20.0))
+        self._fixed_origin_y = float(rospy.get_param("~origin_y", -20.0))
+        self._origin_x = self._fixed_origin_x
+        self._origin_y = self._fixed_origin_y
 
         self._min_range = float(rospy.get_param("~sensor_min_range", 0.3))
         self._max_range = float(rospy.get_param("~sensor_max_range", 20.0))
@@ -53,49 +65,74 @@ class MappingNode:
         self._odom_timeout = float(rospy.get_param("~odom_timeout", 1.0))
         self._status_timeout = float(rospy.get_param("~localization_status_timeout", 1.0))
         self._pointcloud_timeout = float(rospy.get_param("~pointcloud_timeout", 1.0))
-        self._update_rate = float(rospy.get_param("~update_rate", 2.0))
+        self._integration_rate = float(rospy.get_param("~integration_rate", 5.0))
+        self._map_publish_rate = float(rospy.get_param("~map_publish_rate", 2.0))
+        self._status_rate = float(rospy.get_param("~status_heartbeat_rate", 10.0))
         self._tf_timeout = float(rospy.get_param("~tf_timeout", 0.1))
+        self._max_input_age = float(rospy.get_param("~max_input_age", 2.0))
+        self._future_tolerance = float(rospy.get_param("~future_stamp_tolerance", 0.2))
+        self._time_rollback_tolerance = float(
+            rospy.get_param("~time_rollback_tolerance", 0.001)
+        )
         self._quaternion_tolerance = float(
             rospy.get_param("~quaternion_norm_tolerance", 0.1)
         )
-        self._require_odom_map_frame = bool(
-            rospy.get_param("~require_odom_in_map_frame", True)
-        )
-
         self._max_pose_jump = float(rospy.get_param("~max_pose_jump", 2.0))
         self._max_yaw_jump = float(rospy.get_param("~max_yaw_jump", 1.57))
         self._pose_recovery_samples = int(rospy.get_param("~pose_recovery_samples", 3))
         self._reset_map_on_pose_jump = bool(rospy.get_param("~reset_map_on_pose_jump", True))
         self._validate_parameters()
 
-        self._grid = OccupancyGridCore(
-            self._resolution, self._map_width, self._map_height,
-            self._origin_x, self._origin_y, self._min_range,
-            self._max_range, self._min_height, self._max_height,
-        )
+        self._grid = self._make_grid(self._origin_x, self._origin_y)
+        self._origin_ready = self._origin_mode == "fixed"
         self._tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer)
 
-        self._last_odom_time: Optional[rospy.Time] = None
-        self._last_status_time: Optional[rospy.Time] = None
-        self._last_cloud_time: Optional[rospy.Time] = None
-        self._map_load_time: Optional[rospy.Time] = None
+        self._input_epoch = 0
+        self._fault_active = False
+        self._fault_detail = "waiting for inputs"
+        self._healthy_inputs_since: Optional[rospy.Time] = None
+        self._last_ros_time: Optional[rospy.Time] = None
+
+        self._last_status_received_at: Optional[rospy.Time] = None
+        self._last_status_stamp: Optional[rospy.Time] = None
+        self._status_epoch = -1
         self._localization_valid = False
         self._localization_detail = "localization status not received"
+
+        self._last_odom_received_at: Optional[rospy.Time] = None
+        self._last_odom_stamp: Optional[rospy.Time] = None
+        self._odom_epoch = -1
         self._odom_valid = False
         self._odom_failure_state = ModuleStatus.STARTING
         self._odom_detail = "odometry not received"
         self._latest_pose: Optional[RobotPose] = None
         self._accepted_pose: Optional[RobotPose] = None
-        self._base_frame = ""
         self._pending_jump_pose: Optional[RobotPose] = None
         self._jump_stable_count = 0
-        self._pointcloud_usable = False
+        self._jump_fault_active = False
+
+        self._pending_cloud: Optional[PendingCloud] = None
+        self._last_cloud_received_at: Optional[rospy.Time] = None
+        self._last_cloud_accepted_stamp: Optional[rospy.Time] = None
+        self._last_cloud_integrated_stamp: Optional[rospy.Time] = None
+        self._last_cloud_integrated_at: Optional[rospy.Time] = None
+        self._last_integrated_epoch = -1
         self._pointcloud_failure_state = ModuleStatus.STARTING
         self._pointcloud_detail = "point cloud not received"
+
         self._map_initialized = False
+        self._map_load_time: Optional[rospy.Time] = None
         self._last_scan_stats = self._empty_stats()
         self._last_reported_status = None
+        self._cloud_metrics: Dict[str, float] = {
+            "clouds_received": 0,
+            "clouds_replaced": 0,
+            "clouds_rejected": 0,
+            "clouds_integrated": 0,
+            "last_integration_duration": 0.0,
+            "last_valid_point_count": 0,
+        }
 
         self._map_pub = rospy.Publisher(self._map_topic, OccupancyGrid, queue_size=1, latch=True)
         self._status_pub = rospy.Publisher(
@@ -112,28 +149,48 @@ class MappingNode:
             self._pointcloud_topic, PointCloud2, self._pointcloud_callback,
             queue_size=1, buff_size=32 * 1024 * 1024,
         )
-        self._timer = rospy.Timer(rospy.Duration(1.0 / self._update_rate), self._timer_callback)
+        self._integration_timer = rospy.Timer(
+            rospy.Duration(1.0 / self._integration_rate), self._integration_callback
+        )
+        self._status_timer = rospy.Timer(
+            rospy.Duration(1.0 / self._status_rate), self._status_timer_callback
+        )
+        self._map_timer = rospy.Timer(
+            rospy.Duration(1.0 / self._map_publish_rate), self._map_timer_callback
+        )
         rospy.loginfo(
-            "mapping_node ready: frame=%s map=%dx%d@%.3fm cloud=%s odom=%s",
-            self._map_frame, self._map_width, self._map_height,
-            self._resolution, self._pointcloud_topic, self._odom_topic,
+            "mapping_node ready: frames=%s/%s/%s map=%dx%d@%.3fm origin=%s",
+            self._map_frame, self._expected_base_frame, self._expected_cloud_frame,
+            self._map_width, self._map_height, self._resolution, self._origin_mode,
+        )
+
+    def _make_grid(self, origin_x: float, origin_y: float) -> OccupancyGridCore:
+        return OccupancyGridCore(
+            self._resolution, self._map_width, self._map_height,
+            origin_x, origin_y, self._min_range, self._max_range,
+            self._min_height, self._max_height,
         )
 
     @staticmethod
     def _empty_stats():
         return {
-            "input_points": 0, "valid_points": 0, "rejected_points": 0,
-            "occupied_endpoints": 0, "free_cells_updated": 0,
-            "changed_cells": 0, "robot_outside_map": 0,
+            "input_points": 0, "total_points": 0, "non_finite_rejected": 0,
+            "range_rejected": 0, "height_rejected": 0, "valid_points": 0,
+            "rejected_points": 0, "occupied_endpoints": 0,
+            "free_cells_updated": 0, "changed_cells": 0, "robot_outside_map": 0,
         }
 
     def _validate_parameters(self) -> None:
         positive = {
-            "update_rate": self._update_rate,
+            "integration_rate": self._integration_rate,
+            "map_publish_rate": self._map_publish_rate,
+            "status_heartbeat_rate": self._status_rate,
             "odom_timeout": self._odom_timeout,
             "localization_status_timeout": self._status_timeout,
             "pointcloud_timeout": self._pointcloud_timeout,
             "tf_timeout": self._tf_timeout,
+            "max_input_age": self._max_input_age,
+            "future_stamp_tolerance": self._future_tolerance,
             "quaternion_norm_tolerance": self._quaternion_tolerance,
             "max_pose_jump": self._max_pose_jump,
             "max_yaw_jump": self._max_yaw_jump,
@@ -141,29 +198,97 @@ class MappingNode:
         for name, value in positive.items():
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError("~{} must be finite and > 0".format(name))
+        if not math.isfinite(self._time_rollback_tolerance) or self._time_rollback_tolerance < 0:
+            raise ValueError("~time_rollback_tolerance must be finite and >= 0")
+        if self._map_frame != "world":
+            raise ValueError("~map_frame must be 'world' for the frozen interface")
+        if not self._expected_base_frame or not self._expected_cloud_frame:
+            raise ValueError("expected base/cloud frames must not be empty")
+        if self._origin_mode not in ("initial_pose", "fixed"):
+            raise ValueError("~origin_mode must be 'initial_pose' or 'fixed'")
         if self._point_stride <= 0 or self._max_points <= 0:
             raise ValueError("point_stride and max_points_per_cloud must be > 0")
         if self._pose_recovery_samples <= 0:
             raise ValueError("pose_recovery_samples must be > 0")
 
     def _localization_status_callback(self, msg: ModuleStatus) -> None:
+        now = rospy.Time.now()
         with self._lock:
-            self._last_status_time = rospy.Time.now()
-            self._localization_valid = bool(msg.valid)
-            self._localization_detail = msg.detail or "localization status has no detail"
+            self._check_ros_time_locked(now)
+            valid_stamp, detail = self._validate_stamp_locked(
+                "localization status", msg.header.stamp, now, self._last_status_stamp
+            )
+            self._last_status_received_at = now
+            if not valid_stamp:
+                self._enter_fault_locked(detail, force_new_epoch=True)
+                self._localization_detail = detail
+                return
+            self._last_status_stamp = msg.header.stamp
+            if not bool(msg.valid):
+                detail = "localization invalid: " + (msg.detail or "no detail")
+                self._enter_fault_locked(detail, force_new_epoch=True)
+                self._last_status_stamp = msg.header.stamp
+                self._last_status_received_at = now
+                self._status_epoch = self._input_epoch
+                self._localization_detail = msg.detail or "localization invalid"
+                return
+            self._localization_valid = True
+            self._localization_detail = msg.detail or "localization valid"
+            self._status_epoch = self._input_epoch
+            if self._odom_valid and self._odom_epoch == self._input_epoch:
+                self._initialize_origin_locked(self._latest_pose)
+                self._mark_healthy_inputs_locked(now)
 
     def _odom_callback(self, msg: Odometry) -> None:
         now = rospy.Time.now()
+        with self._lock:
+            self._check_ros_time_locked(now)
+            stamp_valid, stamp_detail = self._validate_stamp_locked(
+                "odometry", msg.header.stamp, now, self._last_odom_stamp
+            )
+            self._last_odom_received_at = now
+            if not stamp_valid:
+                self._enter_fault_locked(stamp_detail, force_new_epoch=True)
+                self._odom_failure_state = ModuleStatus.BLOCKED
+                self._odom_detail = stamp_detail
+                return
+
         valid, state, detail, pose = self._validate_odometry_message(msg)
         with self._lock:
-            self._last_odom_time = now
-            self._base_frame = self._normalise_frame(msg.child_frame_id)
-            if valid and pose is not None:
-                valid, state, detail = self._apply_pose_jump_guard_locked(pose)
-            self._odom_valid = valid
+            self._last_odom_received_at = now
+            self._last_odom_stamp = msg.header.stamp
+            if not valid or pose is None:
+                self._enter_fault_locked(detail, force_new_epoch=True)
+                self._last_odom_received_at = now
+                self._last_odom_stamp = msg.header.stamp
+                self._odom_failure_state = state
+                self._odom_detail = detail
+                return
+
+            valid, state, detail = self._apply_pose_jump_guard_locked(pose)
+            if not valid:
+                if not self._jump_fault_active:
+                    self._jump_fault_active = True
+                    self._enter_fault_locked(
+                        detail, force_new_epoch=True,
+                        reset_map=self._reset_map_on_pose_jump,
+                        reset_origin=self._origin_mode == "initial_pose",
+                    )
+                    self._last_odom_received_at = now
+                    self._last_odom_stamp = msg.header.stamp
+                self._odom_failure_state = state
+                self._odom_detail = detail
+                return
+
+            self._jump_fault_active = False
+            self._odom_valid = True
+            self._odom_epoch = self._input_epoch
             self._odom_failure_state = state
             self._odom_detail = detail
-            self._latest_pose = pose if valid else None
+            self._latest_pose = pose
+            if self._localization_valid and self._status_epoch == self._input_epoch:
+                self._initialize_origin_locked(pose)
+                self._mark_healthy_inputs_locked(now)
 
     def _apply_pose_jump_guard_locked(self, pose: RobotPose):
         if self._accepted_pose is None:
@@ -172,12 +297,20 @@ class MappingNode:
         distance = math.hypot(pose[0] - self._accepted_pose[0], pose[1] - self._accepted_pose[1])
         yaw_delta = abs(self._angle_difference(pose[2], self._accepted_pose[2]))
         if distance <= self._max_pose_jump and yaw_delta <= self._max_yaw_jump:
-            self._accepted_pose = pose
-            self._pending_jump_pose = None
-            self._jump_stable_count = 0
-            return True, ModuleStatus.READY, "odometry valid"
-
-        if self._pending_jump_pose is None:
+            if self._pending_jump_pose is None:
+                self._accepted_pose = pose
+                return True, ModuleStatus.READY, "odometry valid"
+            pending_distance = math.hypot(
+                pose[0] - self._pending_jump_pose[0], pose[1] - self._pending_jump_pose[1]
+            )
+            pending_yaw = abs(self._angle_difference(pose[2], self._pending_jump_pose[2]))
+            if pending_distance > self._max_pose_jump or pending_yaw > self._max_yaw_jump:
+                self._pending_jump_pose = pose
+                self._jump_stable_count = 1
+            else:
+                self._pending_jump_pose = pose
+                self._jump_stable_count += 1
+        elif self._pending_jump_pose is None:
             self._pending_jump_pose = pose
             self._jump_stable_count = 1
         else:
@@ -200,16 +333,19 @@ class MappingNode:
         self._accepted_pose = pose
         self._pending_jump_pose = None
         self._jump_stable_count = 0
-        if self._reset_map_on_pose_jump:
-            self._grid.reset()
-            self._map_initialized = False
-            self._map_load_time = None
-            self._last_scan_stats = self._empty_stats()
-            rospy.logwarn("stable pose recovered after jump; occupancy map was reset")
-            return True, ModuleStatus.READY, "pose recovered; map reset"
-        return True, ModuleStatus.READY, "pose recovered after jump"
+        return True, ModuleStatus.READY, "pose recovered; new point cloud required"
 
     def _validate_odometry_message(self, msg: Odometry):
+        odom_frame = self._normalise_frame(msg.header.frame_id)
+        base_frame = self._normalise_frame(msg.child_frame_id)
+        if odom_frame != self._map_frame:
+            return False, ModuleStatus.BLOCKED, (
+                "odometry frame '{}' != '{}'".format(odom_frame, self._map_frame)
+            ), None
+        if base_frame != self._expected_base_frame:
+            return False, ModuleStatus.BLOCKED, (
+                "odometry child frame '{}' != '{}'".format(base_frame, self._expected_base_frame)
+            ), None
         p = msg.pose.pose.position
         q = msg.pose.pose.orientation
         values = (p.x, p.y, p.z, q.x, q.y, q.z, q.w)
@@ -219,85 +355,136 @@ class MappingNode:
         if norm < 1.0e-6:
             return False, ModuleStatus.FAILED, "odometry quaternion has zero norm", None
         if abs(norm - 1.0) > self._quaternion_tolerance:
-            return False, ModuleStatus.FAILED, "odometry quaternion norm {:.4f}".format(norm), None
-        odom_frame = self._normalise_frame(msg.header.frame_id)
-        if self._require_odom_map_frame and odom_frame != self._normalise_frame(self._map_frame):
-            return False, ModuleStatus.BLOCKED, (
-                "odometry frame '{}' != map frame '{}'"
-            ).format(odom_frame, self._normalise_frame(self._map_frame)), None
-        if not self._normalise_frame(msg.child_frame_id):
-            return False, ModuleStatus.BLOCKED, "odometry child_frame_id is empty", None
+            return False, ModuleStatus.FAILED, (
+                "odometry quaternion norm {:.4f}".format(norm)
+            ), None
         yaw = math.atan2(2.0*(q.w*q.z + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z))
         return True, ModuleStatus.READY, "odometry valid", (float(p.x), float(p.y), yaw)
 
     def _pointcloud_callback(self, msg: PointCloud2) -> None:
         now = rospy.Time.now()
         with self._lock:
-            self._last_cloud_time = now
-            allowed, reason = self._integration_allowed_locked(now)
-            pose = self._latest_pose
-            base_frame = self._base_frame
-        if not allowed or pose is None:
-            self._set_cloud_error(ModuleStatus.BLOCKED, reason)
-            return
-        cloud_frame = self._normalise_frame(msg.header.frame_id)
-        if not cloud_frame:
-            self._set_cloud_error(ModuleStatus.BLOCKED, "point cloud frame_id is empty")
-            return
+            self._check_ros_time_locked(now)
+            self._cloud_metrics["clouds_received"] += 1
+            self._last_cloud_received_at = now
+            cloud_frame = self._normalise_frame(msg.header.frame_id)
+            if cloud_frame != self._expected_cloud_frame:
+                self._reject_cloud_locked(
+                    "point cloud frame '{}' != '{}'".format(
+                        cloud_frame, self._expected_cloud_frame
+                    )
+                )
+                return
+            valid_stamp, detail = self._validate_stamp_locked(
+                "point cloud", msg.header.stamp, now, self._last_cloud_accepted_stamp,
+                max_age=self._pointcloud_timeout,
+            )
+            if not valid_stamp:
+                self._reject_cloud_locked(detail)
+                return
+            if self._pending_cloud is not None:
+                self._cloud_metrics["clouds_replaced"] += 1
+            self._pending_cloud = (msg, self._input_epoch)
+            self._last_cloud_accepted_stamp = msg.header.stamp
+            self._pointcloud_detail = "point cloud pending integration"
+
+    def _integration_callback(self, _event) -> None:
+        now = rospy.Time.now()
+        with self._lock:
+            self._check_ros_time_locked(now)
+            if self._pending_cloud is None:
+                return
+            msg, epoch = self._pending_cloud
+            self._pending_cloud = None
+            allowed, reason = self._integration_allowed_locked(now, epoch)
+            if not allowed:
+                self._reject_cloud_locked(reason)
+                return
+
+        started = rospy.get_time()
         try:
+            world_base = self._tf_buffer.lookup_transform(
+                self._map_frame, self._expected_base_frame, msg.header.stamp,
+                rospy.Duration(self._tf_timeout),
+            )
+            base_cloud = self._tf_buffer.lookup_transform(
+                self._expected_base_frame, self._expected_cloud_frame, msg.header.stamp,
+                rospy.Duration(self._tf_timeout),
+            )
+            pose = self._pose_from_transform(world_base)
             points = self._extract_points(msg)
-            if cloud_frame != base_frame:
-                points = self._transform_points_to_base(points, base_frame, cloud_frame, msg.header.stamp)
+            points = self._transform_points(points, base_cloud)
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
                 tf2_ros.ExtrapolationException) as error:
-            self._set_cloud_error(ModuleStatus.BLOCKED, "point-cloud TF unavailable: {}".format(error))
+            with self._lock:
+                detail = "point-cloud timestamp TF unavailable: {}".format(error)
+                self._enter_fault_locked(detail, force_new_epoch=True)
+                self._pointcloud_failure_state = ModuleStatus.BLOCKED
+                self._pointcloud_detail = detail
+                self._cloud_metrics["clouds_rejected"] += 1
             return
         except Exception as error:
-            self._set_cloud_error(ModuleStatus.FAILED, "point-cloud decode failed: {}".format(error))
-            return
-        if not points:
-            self._set_cloud_error(ModuleStatus.BLOCKED, "point cloud contains no xyz points")
+            with self._lock:
+                detail = "point-cloud decode/transform failed: {}".format(error)
+                self._enter_fault_locked(detail, force_new_epoch=True)
+                self._pointcloud_failure_state = ModuleStatus.FAILED
+                self._pointcloud_detail = detail
+                self._cloud_metrics["clouds_rejected"] += 1
             return
 
         with self._lock:
-            # Recheck after decoding/TF so an invalid status callback cannot race this update.
-            allowed, reason = self._integration_allowed_locked(rospy.Time.now())
+            now = rospy.Time.now()
+            self._check_ros_time_locked(now)
+            allowed, reason = self._integration_allowed_locked(now, epoch)
             if not allowed:
-                self._pointcloud_usable = False
-                self._pointcloud_failure_state = ModuleStatus.BLOCKED
-                self._pointcloud_detail = reason
+                self._reject_cloud_locked(reason)
+                return
+            self._initialize_origin_locked(pose)
+            if not self._origin_ready:
+                self._reject_cloud_locked("waiting for initial pose map origin")
                 return
             try:
                 stats = self._grid.integrate_scan(pose[0], pose[1], pose[2], points)
             except Exception as error:
-                self._pointcloud_usable = False
+                detail = "map update failed: {}".format(error)
+                self._enter_fault_locked(detail, force_new_epoch=True)
                 self._pointcloud_failure_state = ModuleStatus.FAILED
-                self._pointcloud_detail = "map update failed: {}".format(error)
+                self._pointcloud_detail = detail
                 return
             self._last_scan_stats = stats
-            self._pointcloud_usable = stats["valid_points"] > 0 and stats["robot_outside_map"] == 0
-            if not self._pointcloud_usable:
-                self._pointcloud_failure_state = ModuleStatus.BLOCKED
-                self._pointcloud_detail = "all points rejected or robot outside map"
+            self._cloud_metrics["last_integration_duration"] = max(
+                0.0, rospy.get_time() - started
+            )
+            self._cloud_metrics["last_valid_point_count"] = stats["valid_points"]
+            if stats["valid_points"] <= 0 or stats["robot_outside_map"]:
+                self._reject_cloud_locked("all points rejected or robot outside map")
                 return
+            self._cloud_metrics["clouds_integrated"] += 1
+            self._last_cloud_integrated_stamp = msg.header.stamp
+            self._last_cloud_integrated_at = now
+            self._last_integrated_epoch = epoch
             self._pointcloud_failure_state = ModuleStatus.RUNNING
             self._pointcloud_detail = "point cloud integrated"
+            self._fault_active = False
+            self._fault_detail = ""
             if not self._map_initialized and (
                 stats["free_cells_updated"] > 0 or stats["occupied_endpoints"] > 0
             ):
                 self._map_initialized = True
                 self._map_load_time = now
 
-    def _integration_allowed_locked(self, now: rospy.Time):
-        if not self._localization_valid:
-            return False, "localization invalid: " + self._localization_detail
-        if not self._odom_valid or self._latest_pose is None:
-            return False, self._odom_detail
-        if self._last_status_time is None or self._last_odom_time is None:
+    def _integration_allowed_locked(self, now: rospy.Time, epoch: int):
+        if epoch != self._input_epoch:
+            return False, "pending point cloud belongs to an old epoch"
+        if not self._localization_valid or self._status_epoch != epoch:
+            return False, "waiting for new valid localization status"
+        if not self._odom_valid or self._odom_epoch != epoch:
+            return False, "waiting for new valid odometry"
+        if self._last_status_received_at is None or self._last_odom_received_at is None:
             return False, "localization status or odometry missing"
-        if self._message_age(now, self._last_status_time) > self._status_timeout:
+        if self._age(now, self._last_status_received_at) > self._status_timeout:
             return False, "localization status timed out"
-        if self._message_age(now, self._last_odom_time) > self._odom_timeout:
+        if self._age(now, self._last_odom_received_at) > self._odom_timeout:
             return False, "odometry timed out"
         return True, "inputs valid"
 
@@ -313,63 +500,197 @@ class MappingNode:
                 break
         return points
 
-    def _transform_points_to_base(
-        self, points: List[Point3D], base_frame: str, cloud_frame: str, stamp: rospy.Time
-    ) -> List[Point3D]:
-        lookup_stamp = stamp if stamp != rospy.Time() else rospy.Time(0)
-        transform = self._tf_buffer.lookup_transform(
-            base_frame, cloud_frame, lookup_stamp, rospy.Duration(self._tf_timeout)
-        ).transform
+    @staticmethod
+    def _transform_points(points: List[Point3D], stamped_transform) -> List[Point3D]:
+        transform = stamped_transform.transform
         t = transform.translation
         q = transform.rotation
         translation = (t.x, t.y, t.z)
         quaternion = (q.x, q.y, q.z, q.w)
         return [transform_point_3d(point, translation, quaternion) for point in points]
 
-    def _set_cloud_error(self, state: int, detail: str) -> None:
-        with self._lock:
-            self._pointcloud_usable = False
-            self._pointcloud_failure_state = state
-            self._pointcloud_detail = detail
+    def _pose_from_transform(self, stamped_transform) -> RobotPose:
+        transform = stamped_transform.transform
+        t = transform.translation
+        q = transform.rotation
+        values = (t.x, t.y, t.z, q.x, q.y, q.z, q.w)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("world->base transform contains NaN or Inf")
+        norm = math.sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w)
+        if norm < 1.0e-6 or abs(norm - 1.0) > self._quaternion_tolerance:
+            raise ValueError("world->base transform has invalid quaternion")
+        yaw = math.atan2(2.0*(q.w*q.z + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z))
+        return float(t.x), float(t.y), yaw
 
-    def _timer_callback(self, _event) -> None:
+    def _initialize_origin_locked(self, pose: Optional[RobotPose]) -> None:
+        if self._origin_ready or pose is None:
+            return
+        self._origin_x = pose[0] - self._map_width * self._resolution / 2.0
+        self._origin_y = pose[1] - self._map_height * self._resolution / 2.0
+        self._grid = self._make_grid(self._origin_x, self._origin_y)
+        self._origin_ready = True
+        self._map_initialized = False
+        self._map_load_time = None
+        rospy.loginfo("map origin initialized at (%.3f, %.3f)", self._origin_x, self._origin_y)
+
+    def _enter_fault_locked(
+        self, detail: str, force_new_epoch: bool = False,
+        reset_map: bool = False, reset_origin: bool = False,
+    ) -> None:
+        if force_new_epoch or not self._fault_active:
+            self._input_epoch += 1
+            self._healthy_inputs_since = None
+            self._localization_valid = False
+            self._status_epoch = -1
+            self._odom_valid = False
+            self._odom_epoch = -1
+            self._latest_pose = None
+            self._pending_cloud = None
+            self._last_integrated_epoch = -1
+        self._fault_active = True
+        self._fault_detail = detail
+        if reset_map:
+            self._grid.reset()
+            self._map_initialized = False
+            self._map_load_time = None
+            self._last_scan_stats = self._empty_stats()
+        if reset_origin:
+            self._origin_ready = False
+
+    def _reset_for_time_rollback_locked(self, now: rospy.Time) -> None:
+        self._input_epoch += 1
+        self._fault_active = True
+        self._fault_detail = "ROS time moved backwards; waiting for a new input epoch"
+        self._healthy_inputs_since = None
+        self._last_status_received_at = None
+        self._last_status_stamp = None
+        self._status_epoch = -1
+        self._localization_valid = False
+        self._last_odom_received_at = None
+        self._last_odom_stamp = None
+        self._odom_epoch = -1
+        self._odom_valid = False
+        self._latest_pose = None
+        self._accepted_pose = None
+        self._pending_jump_pose = None
+        self._jump_stable_count = 0
+        self._jump_fault_active = False
+        self._pending_cloud = None
+        self._last_cloud_received_at = None
+        self._last_cloud_accepted_stamp = None
+        self._last_cloud_integrated_stamp = None
+        self._last_cloud_integrated_at = None
+        self._last_integrated_epoch = -1
+        self._grid.reset()
+        self._map_initialized = False
+        self._map_load_time = None
+        self._last_scan_stats = self._empty_stats()
+        if self._origin_mode == "initial_pose":
+            self._origin_ready = False
+        self._last_ros_time = now
+        rospy.logwarn("ROS time rollback detected; mapping input epoch reset")
+
+    def _check_ros_time_locked(self, now: rospy.Time) -> None:
+        if self._last_ros_time is not None:
+            delta = (now - self._last_ros_time).to_sec()
+            if delta < -self._time_rollback_tolerance:
+                self._reset_for_time_rollback_locked(now)
+                return
+        self._last_ros_time = now
+
+    def _validate_stamp_locked(
+        self, name: str, stamp: rospy.Time, now: rospy.Time,
+        last_stamp: Optional[rospy.Time], max_age: Optional[float] = None,
+    ):
+        if stamp == rospy.Time():
+            return False, "{} timestamp is zero".format(name)
+        age = (now - stamp).to_sec()
+        if age < -self._future_tolerance:
+            return False, "{} timestamp is {:.3f}s in the future".format(name, -age)
+        allowed_age = self._max_input_age if max_age is None else max_age
+        if age > allowed_age:
+            return False, "{} timestamp is {:.3f}s old".format(name, age)
+        if last_stamp is not None and stamp <= last_stamp:
+            relation = "duplicate" if stamp == last_stamp else "out of order"
+            return False, "{} timestamp is {}".format(name, relation)
+        return True, "{} timestamp valid".format(name)
+
+    def _reject_cloud_locked(self, detail: str) -> None:
+        self._cloud_metrics["clouds_rejected"] += 1
+        self._pointcloud_failure_state = ModuleStatus.BLOCKED
+        self._pointcloud_detail = detail
+
+    def _mark_healthy_inputs_locked(self, now: rospy.Time) -> None:
+        if self._healthy_inputs_since is None:
+            self._healthy_inputs_since = now
+
+    def _status_timer_callback(self, _event) -> None:
         now = rospy.Time.now()
         with self._lock:
+            self._check_ros_time_locked(now)
             state, valid, confidence, detail = self._evaluate_status_locked(now)
-            map_data = self._grid.data_copy() if valid and self._map_initialized else None
-            load_time = self._map_load_time
         self._publish_status(now, state, valid, confidence, detail)
-        if map_data is not None:
-            self._publish_map(now, load_time, map_data)
+
+    def _map_timer_callback(self, _event) -> None:
+        now = rospy.Time.now()
+        with self._lock:
+            self._check_ros_time_locked(now)
+            _, valid, _, _ = self._evaluate_status_locked(now)
+            if not valid or not self._map_initialized:
+                return
+            map_data = self._grid.data_copy()
+            load_time = self._map_load_time
+            origin_x = self._origin_x
+            origin_y = self._origin_y
+        self._publish_map(now, load_time, map_data, origin_x, origin_y)
 
     def _evaluate_status_locked(self, now: rospy.Time):
-        missing = []
-        if self._last_status_time is None: missing.append("localization status")
-        if self._last_odom_time is None: missing.append("odometry")
-        if self._last_cloud_time is None: missing.append("point cloud")
-        if missing:
-            return ModuleStatus.STARTING, False, 0.0, "waiting for " + ", ".join(missing)
-        if not self._odom_valid:
+        if self._last_status_received_at is None and self._last_odom_received_at is None:
+            return ModuleStatus.STARTING, False, 0.0, "waiting for localization status and odometry"
+        if (self._last_status_received_at is not None and
+                self._age(now, self._last_status_received_at) > self._status_timeout):
+            detail = "localization status timed out"
+            self._enter_fault_locked(detail, force_new_epoch=True)
+            self._last_status_received_at = None
+            self._last_status_stamp = None
+            return ModuleStatus.TIMEOUT, False, 0.0, detail
+        if (self._last_odom_received_at is not None and
+                self._age(now, self._last_odom_received_at) > self._odom_timeout):
+            detail = "odometry timed out"
+            self._enter_fault_locked(detail, force_new_epoch=True)
+            self._last_odom_received_at = None
+            self._last_odom_stamp = None
+            return ModuleStatus.TIMEOUT, False, 0.0, detail
+        if not self._localization_valid or self._status_epoch != self._input_epoch:
+            detail = self._fault_detail or "waiting for new valid localization status"
+            return ModuleStatus.BLOCKED, False, 0.0, detail
+        if not self._odom_valid or self._odom_epoch != self._input_epoch:
             return self._odom_failure_state, False, 0.0, self._odom_detail
-        timeout = []
-        if self._message_age(now, self._last_status_time) > self._status_timeout:
-            timeout.append("localization status")
-        if self._message_age(now, self._last_odom_time) > self._odom_timeout:
-            timeout.append("odometry")
-        if self._message_age(now, self._last_cloud_time) > self._pointcloud_timeout:
-            timeout.append("point cloud")
-        if timeout:
-            return ModuleStatus.TIMEOUT, False, 0.0, "input timeout: " + ", ".join(timeout)
-        if not self._localization_valid:
-            return ModuleStatus.BLOCKED, False, 0.0, "localization invalid: " + self._localization_detail
-        if not self._pointcloud_usable:
-            return self._pointcloud_failure_state, False, 0.0, self._pointcloud_detail
+        if not self._origin_ready:
+            return ModuleStatus.STARTING, False, 0.0, "waiting for initial pose map origin"
+        if self._last_integrated_epoch != self._input_epoch:
+            if (self._healthy_inputs_since is not None and
+                    self._age(now, self._healthy_inputs_since) > self._pointcloud_timeout):
+                detail = "no point cloud was successfully integrated before timeout"
+                self._enter_fault_locked(detail, force_new_epoch=True)
+                return ModuleStatus.TIMEOUT, False, 0.0, detail
+            return self._pointcloud_failure_state, False, 0.0, (
+                self._pointcloud_detail + "; new successful integration required"
+            )
+        if self._last_cloud_integrated_at is None:
+            return ModuleStatus.STARTING, False, 0.0, "waiting for a successfully integrated point cloud"
+        if self._age(now, self._last_cloud_integrated_at) > self._pointcloud_timeout:
+            detail = "successfully integrated point cloud timed out"
+            self._enter_fault_locked(detail, force_new_epoch=True)
+            return ModuleStatus.TIMEOUT, False, 0.0, detail
         if not self._map_initialized:
-            return ModuleStatus.STARTING, False, 0.0, "inputs valid; waiting for observed cells"
+            return ModuleStatus.STARTING, False, 0.0, "waiting for observed cells"
         s = self._last_scan_stats
         return ModuleStatus.RUNNING, True, 1.0, (
-            "map updating: valid_points={}, occupied={}, changed_cells={}"
-        ).format(s["valid_points"], s["occupied_endpoints"], s["changed_cells"])
+            "map updating: epoch={}, valid_points={}, occupied={}, changed_cells={}"
+        ).format(
+            self._input_epoch, s["valid_points"], s["occupied_endpoints"], s["changed_cells"]
+        )
 
     def _publish_status(self, stamp, state, valid, confidence, detail) -> None:
         msg = ModuleStatus()
@@ -385,7 +706,7 @@ class MappingNode:
             rospy.loginfo("mapping status: state=%d valid=%s detail=%s", state, valid, detail)
             self._last_reported_status = current
 
-    def _publish_map(self, stamp, load_time, data) -> None:
+    def _publish_map(self, stamp, load_time, data, origin_x, origin_y) -> None:
         msg = OccupancyGrid()
         msg.header.stamp = stamp
         msg.header.frame_id = self._map_frame
@@ -393,8 +714,8 @@ class MappingNode:
         msg.info.resolution = self._resolution
         msg.info.width = self._map_width
         msg.info.height = self._map_height
-        msg.info.origin.position.x = self._origin_x
-        msg.info.origin.position.y = self._origin_y
+        msg.info.origin.position.x = origin_x
+        msg.info.origin.position.y = origin_y
         msg.info.origin.orientation.w = 1.0
         msg.data = data
         self._map_pub.publish(msg)
@@ -404,8 +725,11 @@ class MappingNode:
         return (frame_id or "").lstrip("/")
 
     @staticmethod
-    def _message_age(now: rospy.Time, then: rospy.Time) -> float:
-        return max(0.0, (now - then).to_sec())
+    def _age(now: rospy.Time, then: rospy.Time) -> float:
+        age = (now - then).to_sec()
+        if age < 0.0:
+            raise ValueError("negative message age after ROS time rollback check")
+        return age
 
     @staticmethod
     def _angle_difference(a: float, b: float) -> float:
