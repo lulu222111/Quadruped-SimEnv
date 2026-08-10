@@ -163,10 +163,8 @@ class PathFollower:
 
     def on_path(self, msg):
         """Atomically replace/cancel the current path."""
-        now = rospy.Time.now()
-
         with self._lock:
-            self._observe_ros_time_locked(now)
+            now, _ = self._now_locked()
 
             # Any new Path replaces the old cached Path atomically.
             self._invalidate_path_locked()
@@ -215,10 +213,8 @@ class PathFollower:
             self.target_index = self._initial_target_index_locked()
 
     def on_planning_status(self, msg):
-        now = rospy.Time.now()
-
         with self._lock:
-            self._observe_ros_time_locked(now)
+            now, _ = self._now_locked()
 
             stamp_error = self._validate_message_stamp(
                 msg.header.stamp,
@@ -279,10 +275,8 @@ class PathFollower:
                 )
 
     def on_odom(self, msg):
-        now = rospy.Time.now()
-
         with self._lock:
-            self._observe_ros_time_locked(now)
+            now, _ = self._now_locked()
 
             stamp_error = self._validate_message_stamp(
                 msg.header.stamp,
@@ -319,10 +313,8 @@ class PathFollower:
             self._state_version += 1
 
     def on_localization_status(self, msg):
-        now = rospy.Time.now()
-
         with self._lock:
-            self._observe_ros_time_locked(now)
+            now, _ = self._now_locked()
 
             stamp_error = self._validate_message_stamp(
                 msg.header.stamp,
@@ -420,10 +412,9 @@ class PathFollower:
     # ------------------------------------------------------------------
 
     def step(self):
-        now = rospy.Time.now()
-
         with self._lock:
-            if self._observe_ros_time_locked(now):
+            now, rolled_back = self._now_locked()
+            if rolled_back:
                 self.publish_stop(
                     ModuleStatus.TIMEOUT,
                     "ROS time moved backwards; old generation invalidated",
@@ -460,8 +451,8 @@ class PathFollower:
                 ):
                     return
 
-                now = rospy.Time.now()
-                if self._observe_ros_time_locked(now):
+                now, rolled_back = self._now_locked()
+                if rolled_back:
                     self.publish_stop(
                         ModuleStatus.TIMEOUT,
                         "ROS time moved backwards during control step",
@@ -480,9 +471,9 @@ class PathFollower:
             return
 
         with self._lock:
-            now_after_compute = rospy.Time.now()
+            now_after_compute, rolled_back = self._now_locked()
 
-            if self._observe_ros_time_locked(now_after_compute):
+            if rolled_back:
                 self.publish_stop(
                     ModuleStatus.TIMEOUT,
                     "ROS time moved backwards during control step",
@@ -840,6 +831,11 @@ class PathFollower:
     # ------------------------------------------------------------------
     # ROS time / generation handling
     # ------------------------------------------------------------------
+
+    def _now_locked(self):
+        """Read and observe ROS time inside the same lock critical section."""
+        now = rospy.Time.now()
+        return now, self._observe_ros_time_locked(now)
 
     def _observe_ros_time_locked(self, now):
         now_sec = now.to_sec()
