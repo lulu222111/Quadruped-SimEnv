@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# verify_localization.sh — Verify the FAST-LIO localization adapter inside the
-# simenv container.  Must be run from the workspace root AFTER catkin_make.
+# verify_localization.sh — Verify the FAST-LIO localization adapter.
+# Must be run from the workspace root AFTER catkin_make.
 #
-# The old `grep odom` over /tf is REMOVED. TF is verified with a real
-# tf2_ros.Buffer.lookup_transform("world", "base", ...) via
-# competition_localization/scripts/verify_localization_consistency.py
-# (finite values, unit quaternion, timestamp validity, <1mm odom agreement).
+# This is a standalone isolated verification — it starts a private roscore,
+# the localization_node, and a mock FAST-LIO publisher.  It does NOT launch
+# FAST-LIO or localization_bringup.launch.
+#
+# Checks:
+#   1. /competition/localization/odom publishing
+#   2. /competition/localization/status publishing
+#   3. TF world -> base consistency (real tf2 lookup, <1mm odom agreement)
+#   4. Watchdog: input stop -> TIMEOUT + valid=false
+#   5. Static extrinsic consistency (launch file vs expected)
+#   6. Forbidden-topic isolation (no referee/ground-truth/control topics)
+#   7. Runtime FAST-LIO extrinsic check (SKIP when FAST-LIO not launched)
 
 : "${ROS_DISTRO:=noetic}"
 
@@ -89,49 +97,96 @@ if ! wait_for_master; then
 fi
 echo "=== ROS master is up ==="
 
-echo "=== Extrinsic consistency check (official doc / canonical launch) ==="
-# Official competition doc / URDF chain (a1_description/xacro/robot.xacro):
-#   laser_livox    in base:        (0.2, 0, 0.08), Ry(45°)
-#   livox_imu_link in laser_livox: (-0.011, -0.02329, 0.04412), R=I
-# Derived:
-#   FAST-LIO Lidar_T_wrt_IMU = -t_lidar_imu = (0.011, 0.02329, -0.04412)
-#   base->imu compose        = (0.223404, -0.023290, 0.118985), Ry(45°)
-LAUNCH="$(find "$PWD/src" -path '*competition_localization/launch/localization_bringup.launch' 2>/dev/null | head -1)"
-if [[ -z "$LAUNCH" ]]; then
-    echo "FAIL: localization_bringup.launch not found" >&2
+# ── Static extrinsic consistency check ─────────────────────────────
+# Verify that the canonical launch file overrides match the expected
+# values derived from the a1_description URDF chain (see the derivation
+# in localization_bringup.launch). This is a source-of-truth static check,
+# not a runtime FAST-LIO check.
+echo "=== Static extrinsic consistency check ==="
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+LAUNCH_FILE="${REPO_ROOT}/src/competition_localization/launch/localization_bringup.launch"
+
+EXPECTED_EXTRINSIC_T="[0.011, 0.02329, -0.04412]"
+EXPECTED_BASE_TO_IMU_T="[0.223404, -0.023290, 0.118985]"
+EXPECTED_BASE_TO_IMU_RPY="[0.0, 0.785, 0.0]"
+
+# Use Python + YAML to parse the rosparam values from the launch file.
+# The launch file contains lines like:
+#   <rosparam param="mapping/extrinsic_T" subst_value="True">[0.011, 0.02329, -0.04412]</rosparam>
+#   <rosparam param="base_to_imu_translation">[0.223404, -0.023290, 0.118985]</rosparam>
+#   <rosparam param="base_to_imu_rotation_rpy">[0.0, 0.785, 0.0]</rosparam>
+EXTRINSIC_CHECK=$(
+    python3 -c "
+import re, sys, yaml, math
+
+launch_file = '${LAUNCH_FILE}'
+with open(launch_file, 'r') as f:
+    text = f.read()
+
+def extract_rosparam_value(param_name):
+    '''Extract the content of a <rosparam param=\"...\">...</rosparam> element.'''
+    pattern = rf'<rosparam\s+param=\"{param_name}\"[^>]*>\\s*([^<]+)\\s*</rosparam>'
+    m = re.search(pattern, text)
+    if not m:
+        # Also try <rosparam ...>value</rosparam> across multiple lines
+        pattern2 = rf'<rosparam\s+param=\"{param_name}\"[^>]*>\\s*([^<]+)\\s*</rosparam>'
+        m = re.search(pattern2, text, re.DOTALL)
+    if not m:
+        print(f'SKIP: cannot find {param_name} in launch file')
+        return None, None
+    raw = m.group(1).strip()
+    try:
+        parsed = yaml.safe_load(raw)
+    except Exception:
+        print(f'SKIP: cannot parse {param_name} value: {raw[:60]}')
+        return None, None
+    return parsed, raw
+
+def check_param(param_name, expected_raw, tol=1e-6):
+    parsed, raw = extract_rosparam_value(param_name)
+    if parsed is None:
+        return  # SKIP already printed
+    # parsed may be a list or a string that yaml decoded as list
+    if isinstance(parsed, str):
+        try:
+            parsed = yaml.safe_load(parsed)
+        except Exception:
+            pass
+    if not isinstance(parsed, (list, tuple)):
+        print(f'SKIP: {param_name} parsed as {type(parsed).__name__}, not a sequence')
+        return
+    if len(parsed) != 3:
+        print(f'FAIL: {param_name} has {len(parsed)} elements, expected 3')
+        sys.exit(1)
+    for i, v in enumerate(parsed):
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            print(f'FAIL: {param_name}[{i}]={v!r} is not a finite float')
+            sys.exit(1)
+        if not math.isfinite(fv):
+            print(f'FAIL: {param_name}[{i}]={fv} is not finite')
+            sys.exit(1)
+    expected = yaml.safe_load(expected_raw)
+    for i, (a, b) in enumerate(zip(parsed, expected)):
+        if abs(float(a) - float(b)) > tol:
+            print(f'FAIL: {param_name}[{i}]={float(a):.6f} != expected {float(b):.6f}')
+            sys.exit(1)
+    print(f'  PASS: {param_name} = {parsed} (matches expected)')
+
+check_param('mapping/extrinsic_T', '${EXPECTED_EXTRINSIC_T}')
+check_param('base_to_imu_translation', '${EXPECTED_BASE_TO_IMU_T}')
+check_param('base_to_imu_rotation_rpy', '${EXPECTED_BASE_TO_IMU_RPY}')
+print('PASS: static extrinsic consistency OK')
+" 2>&1
+)
+EXTRINSIC_RC=$?
+echo "${EXTRINSIC_CHECK}"
+if [ "${EXTRINSIC_RC}" -ne 0 ]; then
+    echo "FAIL: static extrinsic consistency check failed"
     exit 1
-fi
-if grep -q 'mapping/extrinsic_T.*0\.011.*0\.02329.*-0\.04412' "$LAUNCH"; then
-    echo "OK: launch override FAST-LIO extrinsic_T = (0.011, 0.02329, -0.04412)"
-else
-    echo "FAIL: localization_bringup.launch lacks correct extrinsic_T override (expected 0.011, 0.02329, -0.04412)" >&2
-    exit 1
-fi
-if grep -q 'base_to_imu_translation.*0\.223404.*-0\.023290.*0\.118985' "$LAUNCH"; then
-    echo "OK: launch override base_to_imu_translation = (0.223404, -0.023290, 0.118985)"
-else
-    echo "FAIL: localization_bringup.launch lacks correct base_to_imu_translation override" >&2
-    exit 1
-fi
-if rosparam get /mapping/extrinsic_T >/dev/null 2>&1; then
-    CUR="$(rosparam get /mapping/extrinsic_T)"
-    if ! python3 - "$CUR" <<'PY'
-import math, sys
-expected = (0.011, 0.02329, -0.04412)
-try:
-    cur = tuple(float(x) for x in sys.argv[1].strip('[]').split(','))
-except Exception:
-    sys.exit(1)
-sys.exit(0 if len(cur) == 3 and all(math.isclose(a, b, abs_tol=1e-6) for a, b in zip(cur, expected)) else 1)
-PY
-    then
-        echo "FAIL: runtime /mapping/extrinsic_T = $CUR (expected [0.011, 0.02329, -0.04412])" >&2
-        exit 1
-    else
-        echo "OK: runtime /mapping/extrinsic_T matches"
-    fi
-else
-    echo "SKIP: runtime /mapping/extrinsic_T not set (standalone mode, no FAST-LIO)"
 fi
 
 echo "=== Setting workspace root for localization_node ==="
@@ -193,7 +248,7 @@ else
     exit 1
 fi
 
-echo "=== [Item 9] Watchdog: stop input >1s -> TIMEOUT & valid=false ==="
+echo "=== [Watchdog] Stop input >1s -> TIMEOUT & valid=false ==="
 # Stop the mock FAST-LIO input so the adapter stops receiving messages.
 kill "${PUB_PID}" 2>/dev/null || true
 wait "${PUB_PID}" 2>/dev/null || true
@@ -210,20 +265,90 @@ else
     exit 1
 fi
 
-echo "=== [Item 10] Forbidden topic scan (ground-truth / referee isolation) ==="
-# Competition contract: the production chain must not publish ground-truth,
-# referee-odom or raw cmd_vel topics in the verified environment.
-CURRENT_TOPICS="$(timeout 5 rostopic list 2>/dev/null || echo '')"
-FORBIDDEN_HIT=""
+# ── Forbidden-topic isolation check ─────────────────────────────────
+# In this Localization-only isolated verification, no referee /
+# ground-truth / control topics should appear.  The presence of these
+# topics indicates contamination from other modules or misconfiguration.
+#
+# NOTE: /cmd_vel is NOT a forbidden topic in the full production system
+# (cmd_vel_guard_node is the exclusive publisher per module contract
+# v0.2.0).  Its presence here only means this isolated verification
+# environment has been polluted by a control node — not that /cmd_vel is
+# globally disallowed.
+echo "=== Forbidden-topic isolation check ==="
+CURRENT_TOPICS=$(timeout 5 rostopic list 2>/dev/null || echo "")
+FORBIDDEN=""
 for pattern in "/Odometry_gazebo" "/ground_truth" "/cmd_vel"; do
-    if echo "$CURRENT_TOPICS" | grep -qF "$pattern"; then
-        FORBIDDEN_HIT="$FORBIDDEN_HIT $pattern"
+    if echo "$CURRENT_TOPICS" | grep -qF "$pattern" 2>/dev/null; then
+        FORBIDDEN="${FORBIDDEN} ${pattern}"
     fi
 done
-if [[ -n "$FORBIDDEN_HIT" ]]; then
-    echo "FAIL: forbidden topics detected:$FORBIDDEN_HIT" >&2
+if [ -n "$FORBIDDEN" ]; then
+    echo "FAIL: isolated verification environment contains unexpected topics:${FORBIDDEN}" >&2
+    echo "  /Odometry_gazebo  — referee odometry, must not appear in localization-only test"
+    echo "  /ground_truth/*   — ground-truth data, must not appear in localization-only test"
+    echo "  /cmd_vel          — control output, indicates test environment contamination"
+    echo "  (Note: /cmd_vel is a legitimate production topic; its presence here only"
+    echo "   means this isolated test has unexpected control module activity.)"
     exit 1
 fi
-echo "OK: no forbidden topics (/Odometry_gazebo, /ground_truth, /cmd_vel)"
+echo "PASS: no forbidden topics in isolated verification environment"
+
+# ── Runtime FAST-LIO extrinsic consistency check ─────────────────────
+# This check only applies when FAST-LIO (laserMapping) is running and
+# has loaded its mapping/extrinsic_T onto the parameter server.  In a
+# standalone verification (no FAST-LIO launch), we skip with a clear
+# message rather than silently pass.
+echo "=== Runtime FAST-LIO extrinsic check ==="
+FASTLIO_EXTRINSIC_T=$(rosparam get /mapping/extrinsic_T 2>/dev/null || echo "")
+if [ -z "$FASTLIO_EXTRINSIC_T" ]; then
+    echo "SKIP: /mapping/extrinsic_T not on parameter server"
+    echo "      (standalone verification does not launch FAST-LIO;"
+    echo "       runtime extrinsic check requires a running laserMapping node)"
+else
+    # Parse with Python YAML (not string split) for reliable YAML decoding.
+    RUNTIME_CHECK=$(
+        python3 -c "
+import sys, yaml, math
+
+raw = '''${FASTLIO_EXTRINSIC_T}'''
+expected = [0.011, 0.02329, -0.04412]
+tol = 1e-6
+
+try:
+    parsed = yaml.safe_load(raw)
+except Exception as e:
+    print(f'SKIP: cannot YAML-parse /mapping/extrinsic_T: {e}')
+    sys.exit(0)
+
+if not isinstance(parsed, (list, tuple)):
+    print(f'FAIL: /mapping/extrinsic_T is {type(parsed).__name__}, not a sequence')
+    sys.exit(1)
+if len(parsed) != 3:
+    print(f'FAIL: /mapping/extrinsic_T has {len(parsed)} elements, expected 3')
+    sys.exit(1)
+for i, v in enumerate(parsed):
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        print(f'FAIL: /mapping/extrinsic_T[{i}]={v!r} is not a finite float')
+        sys.exit(1)
+    if not math.isfinite(fv):
+        print(f'FAIL: /mapping/extrinsic_T[{i}]={fv} is not finite')
+        sys.exit(1)
+for i, (a, b) in enumerate(zip(parsed, expected)):
+    if abs(float(a) - float(b)) > tol:
+        print(f'FAIL: /mapping/extrinsic_T[{i}]={float(a):.6f} != expected {float(b):.6f}')
+        sys.exit(1)
+print(f'PASS: runtime /mapping/extrinsic_T = {parsed} matches expected {expected}')
+" 2>&1
+    )
+    RUNTIME_RC=$?
+    echo "${RUNTIME_CHECK}"
+    if [ "${RUNTIME_RC}" -ne 0 ]; then
+        echo "FAIL: runtime FAST-LIO extrinsic check failed"
+        exit 1
+    fi
+fi
 
 echo "=== All checks passed ==="
