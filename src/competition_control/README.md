@@ -223,7 +223,7 @@ raw velocity 继续使用本地接收 watchdog；PathFollower status 则检查
 | `~goal_tolerance`              |  `0.2` | 航点到达容差（m）                   |
 | `~path_timeout`                |  `5.0` | Path 接收超时（s）                |
 | `~odom_timeout`                |  `1.0` | Odom 接收超时（s）                |
-| `~planning_status_timeout`     |  `1.0` | Planning status 接收超时（s）     |
+| `~planning_status_timeout`     |  `3.0` | Planning status 接收超时（s）     |
 | `~localization_status_timeout` |  `1.0` | Localization status 接收超时（s） |
 | `~max_future_stamp_skew`        |  `0.2` | 允许消息时间戳领先当前 ROS time 的最大偏差（s） |
 

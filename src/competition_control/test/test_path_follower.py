@@ -273,7 +273,7 @@ class TestPathFollower(unittest.TestCase):
         self.follower.goal_tolerance = 0.2
         self.follower.path_timeout = _MockDuration(5.0)
         self.follower.odom_timeout = _MockDuration(1.0)
-        self.follower.planning_status_timeout = _MockDuration(1.0)
+        self.follower.planning_status_timeout = _MockDuration(3.0)
         self.follower.localization_status_timeout = _MockDuration(1.0)
         self.follower.max_future_stamp_skew = 0.2
 
@@ -594,8 +594,36 @@ class TestPathFollower(unittest.TestCase):
 
     def test_planning_status_receive_timeout(self):
         self._arm()
-        self.follower.planning_status_received_at = _MockTimeInstance(8.0)
+        self.follower.planning_status_received_at = _MockTimeInstance(6.0)
         self.follower.step()
+        self._assert_zero()
+        self.assertEqual(self._last_status().state, _ModuleStatus.TIMEOUT)
+        self.assertEqual(self.follower.path, [])
+
+    def test_planning_status_two_second_period_fits_three_second_timeout(self):
+        self._arm()
+
+        # Current Planning publishes status every 2 s. Allow that cadence
+        # plus a small scheduling/jitter margin without a false timeout.
+        _MockTime.set(12.5)
+        self._localization(True, stamp=12.5)
+        self._odom(stamp=12.5)
+
+        self.follower.step()
+
+        self.assertGreater(self._last_cmd().linear.x, 0.0)
+        self.assertEqual(self._last_status().state, _ModuleStatus.RUNNING)
+        self.assertTrue(self._last_status().valid)
+
+    def test_planning_status_over_three_seconds_still_times_out(self):
+        self._arm()
+
+        _MockTime.set(13.1)
+        self._localization(True, stamp=13.1)
+        self._odom(stamp=13.1)
+
+        self.follower.step()
+
         self._assert_zero()
         self.assertEqual(self._last_status().state, _ModuleStatus.TIMEOUT)
         self.assertEqual(self.follower.path, [])
@@ -668,7 +696,7 @@ class TestPathFollower(unittest.TestCase):
         self._assert_failed_with("non-zero")
 
     def test_planning_status_stale_stamp_rejected(self):
-        self._planning(True, stamp=8.0)
+        self._planning(True, stamp=6.0)
         self._assert_failed_with("stale")
 
     def test_planning_status_future_stamp_rejected(self):
