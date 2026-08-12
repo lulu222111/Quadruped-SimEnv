@@ -19,6 +19,51 @@ else
     echo "未检测到 build/devel，本次为干净编译。"
 fi
 
+# --- Submodule pre-check (fail early if missing) ---
+MISSING_SUBMODULES=""
+for sm in src/fast_lio src/livox_ros_driver; do
+    if [ ! -f "$REPO_ROOT/$sm/CMakeLists.txt" ] && \
+       [ -z "$(find "$REPO_ROOT/$sm" -name 'CMakeLists.txt' -maxdepth 2 2>/dev/null | head -1)" ]; then
+        MISSING_SUBMODULES="$MISSING_SUBMODULES $sm"
+    fi
+done
+
+if [ -n "$MISSING_SUBMODULES" ]; then
+    echo "ERROR: 以下子模块未初始化或内容缺失:${MISSING_SUBMODULES}" >&2
+    echo "" >&2
+    echo "请先运行:" >&2
+    echo "  git submodule update --init --recursive" >&2
+    echo "" >&2
+    echo "或使用递归克隆:" >&2
+    echo "  git clone --recurse-submodules <repo-url>" >&2
+    exit 1
+fi
+
+# Nested ikd-Tree submodule check
+if [ ! -f "$REPO_ROOT/src/fast_lio/include/ikd-Tree/ikd_Tree.cpp" ]; then
+    echo "ERROR: fast_lio 嵌套子模块 include/ikd-Tree 未初始化。" >&2
+    echo "请运行:  git submodule update --init --recursive" >&2
+    echo "或手动:  cd src/fast_lio && git submodule update --init include/ikd-Tree" >&2
+    exit 1
+fi
+
+# Patch file existence check
+LIVOX_PATCH="$REPO_ROOT/scripts/patches/livox_ros_driver_skip_sdk_clone.patch"
+if [ ! -f "$LIVOX_PATCH" ]; then
+    echo "ERROR: livox_ros_driver 补丁文件缺失: $LIVOX_PATCH" >&2
+    echo "此补丁是离线构建的必要文件，请确认仓库完整。" >&2
+    exit 1
+fi
+
+FASTLIO_PATCH="$REPO_ROOT/scripts/patches/fast_lio_message_dependency.patch"
+if [ ! -f "$FASTLIO_PATCH" ]; then
+    echo "ERROR: fast_lio 补丁文件缺失: $FASTLIO_PATCH" >&2
+    echo "此补丁是离线构建的必要文件，请确认仓库完整。" >&2
+    exit 1
+fi
+
+echo "所有子模块和依赖已就绪。"
+
 set +e
 sudo docker compose \
     --file compose.yaml \
@@ -40,9 +85,69 @@ echo "CMAKE_PREFIX_PATH=$CMAKE_PREFIX_PATH"
 echo "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
 echo "并行任务数=$CATKIN_JOBS"
 
+# --- SimEnv: apply livox_ros_driver patch (skip Livox-SDK clone when SDK absent) ---
+LIVOX_PATCH="/workspace/SimEnv/scripts/patches/livox_ros_driver_skip_sdk_clone.patch"
+
+# Verify submodule present in container
+if [ ! -f /workspace/SimEnv/src/livox_ros_driver/livox_ros_driver/CMakeLists.txt ]; then
+    echo "FATAL: src/livox_ros_driver submodule not initialized inside container." >&2
+    echo "Run 'git submodule update --init --recursive' on the host." >&2
+    exit 1
+fi
+
+if [ ! -f "$LIVOX_PATCH" ]; then
+    echo "FATAL: livox_ros_driver patch file missing inside container: $LIVOX_PATCH" >&2
+    exit 1
+fi
+
+# Patch: fail-fast — reverse-check (already applied?) then forward-apply.
+# If BOTH fail, exit non-zero — no silent continuation with unpatched code.
+if git -C /workspace/SimEnv/src/livox_ros_driver apply --reverse --check "$LIVOX_PATCH" >/dev/null 2>&1; then
+    echo "livox_ros_driver: patch already applied (idempotent skip)"
+elif git -C /workspace/SimEnv/src/livox_ros_driver apply "$LIVOX_PATCH" 2>&1; then
+    echo "livox_ros_driver: SDK-clone-skip patch applied"
+else
+    echo "FATAL: failed to apply livox_ros_driver patch." >&2
+    echo "The patch is required for offline builds. Check if the submodule" >&2
+    echo "commit matches the patch baseline." >&2
+    exit 1
+fi
+
+# Verify ikd-Tree in container
+if [ ! -f /workspace/SimEnv/src/fast_lio/include/ikd-Tree/ikd_Tree.cpp ]; then
+    echo "FATAL: fast_lio nested submodule include/ikd-Tree missing inside container." >&2
+    echo "Run 'git submodule update --init --recursive' on the host." >&2
+    exit 1
+fi
+
+# --- SimEnv: apply FAST-LIO message dependency patch ---
+# fastlio_mapping depends on Pose6D.h generated from Pose6D.msg, but the
+# CMakeLists.txt lacks an explicit add_dependencies().  In a parallel build
+# laserMapping.cpp can be compiled before the message header is generated,
+# causing: fatal error: fast_lio/Pose6D.h: No such file or directory.
+# This patch adds the missing dependency without modifying the submodule.
+FASTLIO_PATCH="/workspace/SimEnv/scripts/patches/fast_lio_message_dependency.patch"
+
+if [ ! -f "$FASTLIO_PATCH" ]; then
+    echo "FATAL: fast_lio patch file missing inside container: $FASTLIO_PATCH" >&2
+    exit 1
+fi
+
+if git -C /workspace/SimEnv/src/fast_lio apply --reverse --check "$FASTLIO_PATCH" >/dev/null 2>&1; then
+    echo "fast_lio: message-dependency patch already applied (idempotent skip)"
+elif git -C /workspace/SimEnv/src/fast_lio apply "$FASTLIO_PATCH" 2>&1; then
+    echo "fast_lio: message-dependency patch applied"
+else
+    echo "FATAL: failed to apply fast_lio message-dependency patch." >&2
+    echo "The patch is required for parallel builds. Check if the submodule" >&2
+    echo "commit matches the patch baseline." >&2
+    exit 1
+fi
+
 catkin_make \
     -j"$CATKIN_JOBS" \
     -l"$CATKIN_JOBS" \
+    -DCATKIN_WHITELIST_PACKAGES="" \
     -DCMAKE_BUILD_TYPE=Release \
     -DTORCH_CUDA_ARCH_LIST=12.0 \
     -DLOCAL_SENSING_CUDA_ARCH=120 \

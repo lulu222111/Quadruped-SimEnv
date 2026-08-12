@@ -43,7 +43,16 @@ planning:
 
 # --- Localization ---
 localization:
-  publish_tf: true           # Publish odom -> base TF
+  publish_tf: true         # Publish dynamic TF world -> base (only dynamic TF publisher)
+  imu_frame: "livox_imu_link"   # FAST-LIO `body` == IMU frame (team contract)
+  base_frame: "base"            # Robot base frame
+  # Fixed extrinsic base -> livox_imu_link. FAST-LIO body is the IMU frame, so
+  # the adapter composes T_world_base = T_world_body * (T_base_imu)^-1.
+  # Value derived from a1_description URDF chain:
+  #   base->laser_livox (0.2 0 0.08, rpy 0 0.785 0) *
+  #   laser_livox->livox_imu_link (-0.011 -0.02329 0.04412, rpy 0 0 0)
+  base_to_imu_translation: [0.223404, -0.023290, 0.118985]
+  base_to_imu_rotation_rpy: [0.0, 0.785, 0.0]
 
 # --- Perception ---
 perception:

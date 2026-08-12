@@ -1,54 +1,807 @@
 #!/usr/bin/env python3
-"""localization_node — robot pose estimation using allowed sensors only.
+"""localization_node — FAST-LIO adapter for the competition localization interface.
 
-SKELETON ONLY — algorithm not implemented.
+This node bridges FAST-LIO outputs to the team-frozen competition interface:
+  /competition/localization/odom   (nav_msgs/Odometry)
+  /competition/localization/status (competition_interfaces/ModuleStatus)
+  TF: world -> base   (single dynamic TF publisher for world -> base)
+
+This node is the ONLY dynamic TF publisher for the world -> base chain.
+The odom frame is intentionally removed from the whole system.
 
 Allowed inputs:
-  /trunk_imu     (sensor_msgs/Imu)
-  /livox/imu     (sensor_msgs/Imu)
-  /scan          (sensor_msgs/PointCloud)
-  /livox/Pointcloud2 (sensor_msgs/PointCloud2)
+  /Odometry      (nav_msgs/Odometry) from FAST-LIO
+  team_scene_info.json (public scene file, allowed)
 
-Forbidden inputs (must never subscribe):
+Forbidden inputs (must never subscribe or read):
   /Odometry_gazebo
-  /ground_truth/base_w
-  /ground_truth/base_trunk
-  /ground_truth/FL_foot, FR_foot, RL_foot, RR_foot
-  Gazebo get_model_state service
-  Any file under results/ or generated_building/ except team_scene_info.json
+  /ground_truth/*
+  danger_truth.json
+  layout_metadata.json
+  building_config.json
+  scene_manifest.json
+  Any file under results/
 
-This skeleton publishes only ModuleStatus with state=STARTING, valid=false.
-It does NOT publish fake odometry or pose estimates.
+Coordinate convention:
+  FAST-LIO publishes odometry in frame_id="camera_init", child_frame_id="body",
+  where `body` is the IMU frame == `livox_imu_link` (see mid360_sim.yaml
+  extrinsic_T/extrinsic_R and the a1_description URDF).
+
+  This node compensates the fixed extrinsic base -> livox_imu_link so that the
+  output describes the robot BASE pose:
+      T_world_to_base = T_world_to_body * (T_base_to_body)^-1
+  The extrinsic T_base_to_body is loaded from the parameter server
+  (~base_to_imu_*) or, as a fallback, from the TF tree (base -> ~imu_frame).
+
+  The output odometry (frame_id="world", child_frame_id="base") and the dynamic
+  TF world -> base always carry the SAME pose and timestamp.
 """
 
 from __future__ import annotations
 
+import json
+import math
+import os
+import threading
+from typing import List, Optional, Tuple
+
 import rospy
+import tf2_ros
 from competition_interfaces.msg import ModuleStatus
+from geometry_msgs.msg import TransformStamped
+from nav_msgs.msg import Odometry
+
+
+# Team coordinate-frame contract (see docs/team/module_contracts.md):
+#   global frame = world, robot base frame = base, IMU frame = livox_imu_link
+BASE_FRAME = "base"
+IMU_FRAME = "livox_imu_link"
+
+
+# --- pure-Python quaternion / 3-D transform helpers -----------------------------
+
+
+def _quat_mul(q1: Tuple[float, float, float, float],
+              q2: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+    """Hamilton product of two quaternions (x, y, z, w)."""
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    return (
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    )
+
+
+def _quat_conj(q: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+    """Conjugate of a unit quaternion (inverse for unit quaternions)."""
+    return (-q[0], -q[1], -q[2], q[3])
+
+
+def _quat_rotate(q: Tuple[float, float, float, float],
+                 v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """Rotate vector v by unit quaternion q."""
+    qv = _quat_mul(q, (v[0], v[1], v[2], 0.0))
+    qr = _quat_mul(qv, _quat_conj(q))
+    return qr[0], qr[1], qr[2]
+
+
+def _quat_from_euler_rpy(roll: float, pitch: float, yaw: float
+                         ) -> Tuple[float, float, float, float]:
+    """Convert XYZ intrinsic Euler angles (radians) to quaternion (x, y, z, w)."""
+    cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+    return (
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    )
+
+
+def _normalize_quat(q: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+    """Normalize a quaternion; return identity if degenerate."""
+    norm = math.sqrt(sum(c * c for c in q))
+    if norm < 1e-12:
+        return (0.0, 0.0, 0.0, 1.0)
+    inv = 1.0 / norm
+    return (q[0] * inv, q[1] * inv, q[2] * inv, q[3] * inv)
+
+
+# A 4x4 homogeneous transform is stored as a flat 16-element list in row-major
+# order.  This avoids any dependency on numpy.
+Transform = List[float]
+
+
+def _identity_transform() -> Transform:
+    return [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ]
+
+
+def _transform_from_translation_quat(
+    t: Tuple[float, float, float],
+    q: Tuple[float, float, float, float],
+) -> Transform:
+    """Build a 4x4 homogeneous transform from translation and unit quaternion."""
+    x, y, z, w = _normalize_quat(q)
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return [
+        1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy), t[0],
+        2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx), t[1],
+        2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy), t[2],
+        0.0, 0.0, 0.0, 1.0,
+    ]
+
+
+def _transform_multiply(a: Transform, b: Transform) -> Transform:
+    """Multiply two 4x4 row-major transforms (a * b)."""
+    result = [0.0] * 16
+    for i in range(4):
+        for j in range(4):
+            result[i * 4 + j] = sum(a[i * 4 + k] * b[k * 4 + j] for k in range(4))
+    return result
+
+
+def _transform_inverse(a: Transform) -> Transform:
+    """Invert a 4x4 homogeneous transform whose rotation is orthonormal."""
+    # Rotation part transpose.
+    r_inv: Transform = [
+        a[0], a[4], a[8], 0.0,
+        a[1], a[5], a[9], 0.0,
+        a[2], a[6], a[10], 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ]
+    tx = -(r_inv[0] * a[3] + r_inv[1] * a[7] + r_inv[2] * a[11])
+    ty = -(r_inv[4] * a[3] + r_inv[5] * a[7] + r_inv[6] * a[11])
+    tz = -(r_inv[8] * a[3] + r_inv[9] * a[7] + r_inv[10] * a[11])
+    r_inv[3] = tx
+    r_inv[7] = ty
+    r_inv[11] = tz
+    return r_inv
+
+
+def _transform_to_translation_quat(
+    t: Transform,
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]:
+    """Extract (translation, quaternion) from a 4x4 transform."""
+    translation = (t[3], t[7], t[11])
+    # Rotation matrix -> quaternion (Shepperd's stable method).
+    r00, r01, r02 = t[0], t[1], t[2]
+    r10, r11, r12 = t[4], t[5], t[6]
+    r20, r21, r22 = t[8], t[9], t[10]
+    trace = r00 + r11 + r22
+    if trace > 0.0:
+        s = 0.5 / math.sqrt(trace + 1.0)
+        qw = 0.25 / s
+        qx = (r21 - r12) * s
+        qy = (r02 - r20) * s
+        qz = (r10 - r01) * s
+    elif r00 > r11 and r00 > r22:
+        s = 2.0 * math.sqrt(1.0 + r00 - r11 - r22)
+        qw = (r21 - r12) / s
+        qx = 0.25 * s
+        qy = (r01 + r10) / s
+        qz = (r02 + r20) / s
+    elif r11 > r22:
+        s = 2.0 * math.sqrt(1.0 + r11 - r00 - r22)
+        qw = (r02 - r20) / s
+        qx = (r01 + r10) / s
+        qy = 0.25 * s
+        qz = (r12 + r21) / s
+    else:
+        s = 2.0 * math.sqrt(1.0 + r22 - r00 - r11)
+        qw = (r10 - r01) / s
+        qx = (r02 + r20) / s
+        qy = (r12 + r21) / s
+        qz = 0.25 * s
+    return translation, _normalize_quat((qx, qy, qz, qw))
+
+
+def transform_from_odom(odom: Odometry) -> Transform:
+    """Convert Odometry pose to a 4x4 homogeneous transform."""
+    t = (
+        odom.pose.pose.position.x,
+        odom.pose.pose.position.y,
+        odom.pose.pose.position.z,
+    )
+    q = (
+        odom.pose.pose.orientation.x,
+        odom.pose.pose.orientation.y,
+        odom.pose.pose.orientation.z,
+        odom.pose.pose.orientation.w,
+    )
+    return _transform_from_translation_quat(t, q)
+
+
+def compose_world_to_base(T_world_to_body: Transform, T_base_to_body: Transform) -> Transform:
+    """Compose the world -> base transform from the world -> body pose.
+
+    FAST-LIO's `body` is the IMU frame (livox_imu_link), not the robot base.
+    The fixed extrinsic base -> body (T_base_to_body) is therefore removed:
+        T_world_to_base = T_world_to_body * (T_base_to_body)^-1
+                      = T_world_to_body * T_body_to_base
+    """
+    T_body_to_base = _transform_inverse(T_base_to_body)
+    return _transform_multiply(T_world_to_body, T_body_to_base)
+
+
+def odom_from_transform(
+    t: Transform,
+    stamp,
+    frame_id: str,
+    child_frame_id: str,
+) -> Odometry:
+    """Build an Odometry message from a 4x4 homogeneous transform."""
+    odom = Odometry()
+    odom.header.stamp = stamp
+    odom.header.frame_id = frame_id
+    odom.child_frame_id = child_frame_id
+    translation, quaternion = _transform_to_translation_quat(t)
+    odom.pose.pose.position.x = translation[0]
+    odom.pose.pose.position.y = translation[1]
+    odom.pose.pose.position.z = translation[2]
+    odom.pose.pose.orientation.x = quaternion[0]
+    odom.pose.pose.orientation.y = quaternion[1]
+    odom.pose.pose.orientation.z = quaternion[2]
+    odom.pose.pose.orientation.w = quaternion[3]
+    return odom
+
+
+def is_finite_pose(pose) -> bool:
+    """Return True if pose position/orientation contains only finite values."""
+    pos = pose.position
+    ori = pose.orientation
+    values = [pos.x, pos.y, pos.z, ori.x, ori.y, ori.z, ori.w]
+    return all(math.isfinite(v) for v in values)
+
+
+def is_valid_quaternion(pose) -> bool:
+    """Return True if quaternion is non-zero and nearly normalized."""
+    ori = pose.orientation
+    norm = math.sqrt(ori.x**2 + ori.y**2 + ori.z**2 + ori.w**2)
+    return math.isfinite(norm) and norm > 1e-6 and abs(norm - 1.0) < 1e-3
+
+
+def _coerce_float_list(value):
+    """Coerce a numeric sequence from a list/tuple or a string like
+    '[a, b, c]' / 'a, b, c' into a list of floats."""
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("[") and text.endswith("]"):
+            text = text[1:-1]
+        elif text.startswith("(") and text.endswith(")"):
+            text = text[1:-1]
+        parts = [p.strip() for p in text.split(",") if p.strip()]
+        return [float(p) for p in parts]
+    return [float(v) for v in value]
+
+
+# --- node -----------------------------------------------------------------------
+
+
+class LocalizationAdapter:
+    """Adapter that converts FAST-LIO /Odometry to competition interface."""
+
+    def __init__(self):
+        rospy.init_node("localization_node", log_level=rospy.INFO)
+
+        # Parameters
+        self.odom_input_topic = rospy.get_param("~odom_input_topic", "/Odometry")
+        self.publish_tf_enabled = rospy.get_param("~publish_tf", True)
+        self.input_timeout = rospy.get_param("~input_timeout", 0.5)
+        self.status_rate = rospy.get_param("~status_rate", 10.0)
+        self.team_scene_info_path = rospy.get_param(
+            "~team_scene_info_path", "generated_building/team_scene_info.json"
+        )
+        self.start_alignment_delay = rospy.get_param("~start_alignment_delay", 2.0)
+        # FAST-LIO input frame contract + watchdog timeout.
+        self.input_frame_id = rospy.get_param("~input_frame_id", "camera_init")
+        self.input_child_frame_id = rospy.get_param("~input_child_frame_id", "body")
+        self.watchdog_timeout = rospy.get_param("~watchdog_timeout", 1.0)
+        # Future-timestamp tolerance: stamps ahead of now() by more than this
+        # are rejected (clock skew / simulator glitch guard).
+        self._max_future_stamp_skew = rospy.get_param("~max_future_stamp_skew", 1.0)
+
+        # Frames: base frame and FAST-LIO body/IMU frame (team contract).
+        self._base_frame = rospy.get_param("~base_frame", BASE_FRAME)
+        self._imu_frame = rospy.get_param("~imu_frame", IMU_FRAME)
+
+        # Formal/competition mode: strict validation, NO silent degradation.
+        self.competition_mode = rospy.get_param("/competition_loop/competition_mode", True)
+
+        # State
+        self._lock = threading.Lock()
+        self._last_odom_time: Optional[rospy.Time] = None
+        self._last_input_stamp: Optional[rospy.Time] = None  # timestamp jump-back check
+        self._first_valid_pose_time: Optional[rospy.Time] = None
+        # Latched first valid FAST-LIO pose (t0); NEVER refreshed afterwards.
+        self._first_valid_pose: Optional[Transform] = None
+        # True only when the scene file passed strict validation.
+        self._start_pose_valid = False
+        self._aligned = False
+        self._T_world_to_camera_init: Optional[Transform] = None
+        self._T_base_to_imu: Optional[Transform] = None
+        self._state = ModuleStatus.STARTING
+        self._valid = False
+        self._detail = "waiting for first FAST-LIO odometry"
+        self._odom_msg: Optional[Odometry] = None
+
+        # TF broadcaster: publishes dynamic world -> base only.
+        # NOTE: The odom frame is removed from the system, so there is no
+        # static world -> odom and no dynamic odom -> base transform.
+        self._br = tf2_ros.TransformBroadcaster() if self.publish_tf_enabled else None
+
+        # Publishers
+        self._odom_pub = rospy.Publisher(
+            "/competition/localization/odom", Odometry, queue_size=10
+        )
+        self._status_pub = rospy.Publisher(
+            "/competition/localization/status", ModuleStatus, queue_size=10, latch=True
+        )
+
+        # Subscriber
+        self._odom_sub = rospy.Subscriber(
+            self.odom_input_topic, Odometry, self._odom_callback, queue_size=10
+        )
+
+        # Watchdog timer: auto-TIMEOUT when no valid input arrives.
+        self._watchdog_timer = rospy.Timer(
+            rospy.Duration(self.watchdog_timeout), self._watchdog_cb
+        )
+
+        # Load public scene info for world-frame alignment
+        self._load_start_pose()
+
+        # Load fixed extrinsic base -> livox_imu_link (params first, TF fallback)
+        self._load_base_to_imu_extrinsic()
+
+        rospy.loginfo(
+            "localization_node: adapter ready. input=%s, publish_tf=%s, timeout=%.2f s",
+            self.odom_input_topic, self.publish_tf_enabled, self.input_timeout,
+        )
+
+    # --- initialization ---------------------------------------------------------
+
+    def _load_start_pose(self) -> None:
+        """Load and STRICTLY validate the public scene file.
+
+        Formal-mode checks:
+          - file exists and is readable;
+          - JSON root is an object;
+          - coordinate_frame == "world";
+          - robot_start is an object containing x, y, z, yaw;
+          - all four values are finite (not NaN/Inf).
+
+        On ANY failure the node is set to FAILED (valid=false) and valid
+        localization publishing is cut off. There is NO silent fallback to
+        (0, 0, 0, 0).
+        """
+        path = self.team_scene_info_path
+        if not os.path.isabs(path):
+            ws_root = rospy.get_param("/competition_loop/workspace_root", "")
+            if ws_root:
+                path = os.path.join(ws_root, path)
+
+        if not path or not os.path.isfile(path):
+            # __file__ is <ws>/src/competition_localization/scripts/localization_node
+            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+            candidate = os.path.join(repo_root, self.team_scene_info_path)
+            if os.path.isfile(candidate):
+                path = candidate
+            else:
+                self._fail_start_pose(
+                    f"scene file not found: {path or self.team_scene_info_path}"
+                )
+                return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:  # noqa: BLE001
+            self._fail_start_pose(f"scene file unreadable / invalid JSON: {exc}")
+            return
+
+        if not isinstance(data, dict):
+            self._fail_start_pose("scene JSON root is not an object")
+            return
+
+        if data.get("coordinate_frame") != "world":
+            self._fail_start_pose(
+                f"scene coordinate_frame != 'world' (got {data.get('coordinate_frame')!r})"
+            )
+            return
+
+        start = data.get("robot_start")
+        if not isinstance(start, dict):
+            self._fail_start_pose("scene robot_start missing or not an object")
+            return
+
+        missing = [k for k in ("x", "y", "z", "yaw") if k not in start]
+        if missing:
+            self._fail_start_pose(f"scene robot_start missing fields: {missing}")
+            return
+
+        try:
+            values = {k: float(start[k]) for k in ("x", "y", "z", "yaw")}
+        except (TypeError, ValueError) as exc:  # noqa: BLE001
+            self._fail_start_pose(f"scene robot_start values not numeric: {exc}")
+            return
+
+        if not all(math.isfinite(v) for v in values.values()):
+            self._fail_start_pose("scene robot_start contains non-finite (NaN/Inf) values")
+            return
+
+        self._start_x = values["x"]
+        self._start_y = values["y"]
+        self._start_z = values["z"]
+        self._start_yaw = values["yaw"]
+        self._start_pose_valid = True
+        rospy.loginfo(
+            "localization_node: loaded & validated robot_start from %s: "
+            "x=%.3f y=%.3f z=%.3f yaw=%.3f (coordinate_frame=world)",
+            path, self._start_x, self._start_y, self._start_z, self._start_yaw,
+        )
+
+    def _fail_start_pose(self, reason: str) -> None:
+        """Fail-safe: mark the module FAILED and cut off valid localization.
+
+        No silent fallback — the node keeps running but never publishes a
+        valid /competition/localization/odom.
+        """
+        self._start_pose_valid = False
+        self._state = ModuleStatus.FAILED
+        self._valid = False
+        self._detail = f"scene config invalid: {reason}"
+        if self.competition_mode:
+            rospy.logfatal("localization_node: %s", self._detail)
+        else:
+            rospy.logerr("localization_node: %s", self._detail)
+
+    def _load_base_to_imu_extrinsic(self) -> None:
+        """Load the fixed extrinsic T_base_to_body (body = IMU frame).
+
+        FAST-LIO's `body` is the IMU frame (livox_imu_link), not `base`.
+        Resolution order:
+          1. Parameter server: ~base_to_imu_translation + (~base_to_imu_rotation_rpy
+             or ~base_to_imu_quaternion). Recommended in competition mode
+             (default.yaml) — no TF timing dependency.
+          2. TF tree: lookup_transform(base_frame, imu_frame, time=0).
+          3. MISSING:
+             - competition mode: FATAL + status FAILED + raise (NO silent
+               degradation).
+             - debug mode only: warn + degrade to identity.
+        """
+        # --- 1) Parameter server ---
+        trans = rospy.get_param("~base_to_imu_translation", None)
+        rpy = rospy.get_param("~base_to_imu_rotation_rpy", None)
+        quat = rospy.get_param("~base_to_imu_quaternion", None)
+
+        if trans is not None and (rpy is not None or quat is not None):
+            try:
+                trans_f = _coerce_float_list(trans)
+                if rpy is not None:
+                    rpy_f = _coerce_float_list(rpy)
+                    q = _quat_from_euler_rpy(rpy_f[0], rpy_f[1], rpy_f[2])
+                else:
+                    quat_f = _coerce_float_list(quat)
+                    q = (quat_f[0], quat_f[1], quat_f[2], quat_f[3])
+            except (TypeError, ValueError, IndexError) as exc:
+                rospy.logwarn(
+                    "localization_node: invalid ~base_to_imu_* params (%s). "
+                    "Falling back to TF tree.", exc,
+                )
+            else:
+                self._T_base_to_imu = _transform_from_translation_quat(
+                    (trans_f[0], trans_f[1], trans_f[2]), q
+                )
+                rospy.loginfo(
+                    "localization_node: base -> %s extrinsic from params: "
+                    "t=(%.4f, %.4f, %.4f)",
+                    self._imu_frame, trans_f[0], trans_f[1], trans_f[2],
+                )
+                return
+
+        # --- 2) TF tree fallback ---
+        try:
+            buffer = tf2_ros.Buffer()
+            tf2_ros.TransformListener(buffer)
+            tf = buffer.lookup_transform(
+                self._base_frame, self._imu_frame, rospy.Time(0), rospy.Duration(5.0)
+            )
+            self._T_base_to_imu = _transform_from_translation_quat(
+                (
+                    tf.transform.translation.x,
+                    tf.transform.translation.y,
+                    tf.transform.translation.z,
+                ),
+                (
+                    tf.transform.rotation.x,
+                    tf.transform.rotation.y,
+                    tf.transform.rotation.z,
+                    tf.transform.rotation.w,
+                ),
+            )
+            rospy.loginfo(
+                "localization_node: base -> %s extrinsic from TF tree", self._imu_frame
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            rospy.logwarn(
+                "localization_node: could not load base -> %s from params or TF (%s)",
+                self._imu_frame, exc,
+            )
+
+        # --- 3) Extrinsic MISSING ---
+        if self.competition_mode:
+            rospy.logfatal(
+                "localization_node: base -> %s extrinsic is MISSING. "
+                "Formal mode forbids silent degradation. Terminating.",
+                self._imu_frame,
+            )
+            self._state = ModuleStatus.FAILED
+            self._valid = False
+            self._detail = "missing base -> livox_imu_link extrinsic"
+            raise RuntimeError(
+                f"localization_node: missing base -> {self._imu_frame} extrinsic "
+                "in competition mode"
+            )
+
+        # Debug mode only: warn + degrade (previous approximation).
+        rospy.logwarn(
+            "localization_node: base -> %s extrinsic missing (debug mode). "
+            "Degrading to identity (body treated as base).",
+            self._imu_frame,
+        )
+        self._T_base_to_imu = _identity_transform()
+
+    # --- odometry callback ------------------------------------------------------
+
+    def _odom_callback(self, msg: Odometry) -> None:
+        """Handle incoming FAST-LIO odometry."""
+        with self._lock:
+            # Fail-safe: if the scene config failed validation the module is
+            # FAILED and valid localization publishing is cut off.
+            if not self._start_pose_valid:
+                return
+
+            now = rospy.Time.now()
+
+            # Validate input message
+            if not is_finite_pose(msg.pose.pose):
+                self._state = ModuleStatus.FAILED
+                self._valid = False
+                self._detail = "received non-finite odometry values"
+                rospy.logwarn_throttle(1.0, "localization_node: non-finite odometry values")
+                return
+
+            if not is_valid_quaternion(msg.pose.pose):
+                self._state = ModuleStatus.FAILED
+                self._valid = False
+                self._detail = "received invalid odometry quaternion"
+                rospy.logwarn_throttle(1.0, "localization_node: invalid odometry quaternion")
+                return
+
+            # --- Input timestamp safety (no zero, no jump-back) ---
+            stamp = msg.header.stamp
+            if stamp is None or stamp.to_sec() <= 0.0:
+                self._state = ModuleStatus.FAILED
+                self._valid = False
+                self._detail = "input odometry has invalid (zero) timestamp"
+                rospy.logwarn_throttle(1.0, "localization_node: zero input timestamp")
+                return
+            if self._last_input_stamp is not None and stamp.to_sec() < self._last_input_stamp.to_sec():
+                self._state = ModuleStatus.FAILED
+                self._valid = False
+                self._detail = "input odometry timestamp jumped backwards"
+                rospy.logwarn_throttle(1.0, "localization_node: input timestamp jumped backwards")
+                return
+            # Reject timestamps significantly in the future (clock skew guard).
+            stamp_age = (now - stamp).to_sec()
+            if stamp_age < -self._max_future_stamp_skew:
+                self._state = ModuleStatus.FAILED
+                self._valid = False
+                self._detail = (
+                    f"input odometry timestamp is {abs(stamp_age):.2f} s in the future "
+                    f"(max allowed: {self._max_future_stamp_skew:.2f} s)"
+                )
+                rospy.logwarn_throttle(
+                    1.0,
+                    "localization_node: future timestamp rejected (age=%.2f s, skew=%.2f s)",
+                    stamp_age,
+                    self._max_future_stamp_skew,
+                )
+                return
+            self._last_input_stamp = stamp
+
+            # --- Strict frame validation: BLOCKED, no TF/odom publish ---
+            if (msg.header.frame_id != self.input_frame_id
+                    or msg.child_frame_id != self.input_child_frame_id):
+                # Keep the watchdog quiet (we ARE receiving input) while the
+                # module stays BLOCKED and publishes nothing.
+                self._last_odom_time = now
+                self._state = ModuleStatus.BLOCKED
+                self._valid = False
+                self._detail = (
+                    f"unexpected FAST-LIO frames frame_id={msg.header.frame_id} "
+                    f"child_frame_id={msg.child_frame_id} (expected "
+                    f"{self.input_frame_id} / {self.input_child_frame_id})"
+                )
+                rospy.logwarn_throttle(
+                    5.0, "localization_node: frame mismatch -> BLOCKED: %s", self._detail
+                )
+                return
+
+            self._last_odom_time = now
+
+            # Latch the FIRST valid FAST-LIO pose at t0 immediately. It is
+            # NEVER refreshed, so a robot moving during the stabilization
+            # delay cannot bias the world alignment.
+            if self._first_valid_pose is None:
+                self._first_valid_pose = transform_from_odom(msg)
+                self._first_valid_pose_time = now
+                rospy.loginfo("localization_node: latched first FAST-LIO pose (t0)")
+
+            # start_alignment_delay only waits for input stability; alignment
+            # ALWAYS uses the latched first pose, not the pose at this moment.
+            if not self._aligned:
+                elapsed = (now - self._first_valid_pose_time).to_sec()
+                if elapsed >= self.start_alignment_delay:
+                    self._compute_alignment(self._first_valid_pose)
+                    self._aligned = True
+                    rospy.loginfo(
+                        "localization_node: world alignment computed from latched t0 pose"
+                    )
+
+            if self._aligned and self._T_world_to_camera_init is not None:
+                T_camera_init_to_body = transform_from_odom(msg)
+                T_world_to_body = _transform_multiply(
+                    self._T_world_to_camera_init, T_camera_init_to_body
+                )
+                # FAST-LIO `body` is the IMU frame (livox_imu_link): remove the
+                # fixed extrinsic base -> livox_imu_link to get the BASE pose.
+                T_base_to_imu = (
+                    self._T_base_to_imu if self._T_base_to_imu is not None
+                    else _identity_transform()
+                )
+                T_world_to_base = compose_world_to_base(T_world_to_body, T_base_to_imu)
+                out = odom_from_transform(
+                    T_world_to_base, msg.header.stamp, "world", "base"
+                )
+                # Covariance: marked UNKNOWN (all zeros).
+                # The incoming covariance from FAST-LIO is expressed in the
+                # IMU/body frame.  Without a proper frame transformation
+                # (J * C * J^T with the rotation Jacobian), copying it
+                # verbatim would be incorrect and misleading.  See README
+                # for the documented limitation.
+                out.pose.covariance = [0.0] * 36
+                self._odom_msg = out
+                self._state = ModuleStatus.RUNNING
+                self._valid = True
+                self._detail = "FAST-LIO odometry valid"
+                self._odom_pub.publish(out)
+
+                if self.publish_tf_enabled and self._br is not None:
+                    self._publish_tf(out)
+            else:
+                self._state = ModuleStatus.STARTING
+                self._valid = False
+                self._detail = "aligning FAST-LIO frame to world (t0 pose latched)"
+
+    def _compute_alignment(self, first_pose: Transform) -> None:
+        """Compute world -> camera_init using ONLY the latched first pose P0.
+
+        Formula (team contract):
+            T_world_to_camera_init = T_start * T_base_to_body * (P0)^-1
+        where T_start is the world -> base start pose read from the scene
+        file, T_base_to_body is the fixed base -> livox_imu_link extrinsic,
+        and P0 is the FIRST valid FAST-LIO body pose (t0), latched once and
+        never refreshed. This guarantees the output world -> base equals the
+        start pose at t0 even if the robot moved during the stabilization
+        delay.
+        """
+        # Start pose in world (roll/pitch assumed zero on ground start)
+        q_ws = _quat_from_euler_rpy(0.0, 0.0, self._start_yaw)
+        T_ws = _transform_from_translation_quat(
+            (self._start_x, self._start_y, self._start_z), q_ws
+        )
+
+        # Inverse of the latched first body pose (P0)^-1
+        T_bc = _transform_inverse(first_pose)
+
+        T_base_to_imu = (
+            self._T_base_to_imu if self._T_base_to_imu is not None
+            else _identity_transform()
+        )
+        T_ws_imu = _transform_multiply(T_ws, T_base_to_imu)
+        self._T_world_to_camera_init = _transform_multiply(T_ws_imu, T_bc)
+
+        rospy.loginfo(
+            "World alignment: start=(%.3f, %.3f, %.3f, yaw=%.3f), based on latched t0 pose",
+            self._start_x, self._start_y, self._start_z, self._start_yaw,
+        )
+
+    def _publish_tf(self, odom: Odometry) -> None:
+        """Publish dynamic transform world -> base.
+
+        The transform values and timestamp are taken verbatim from the
+        odometry message so the TF and /competition/localization/odom are
+        always consistent.
+        """
+        tf = TransformStamped()
+        tf.header.stamp = odom.header.stamp
+        tf.header.frame_id = "world"
+        tf.child_frame_id = "base"
+        tf.transform.translation.x = odom.pose.pose.position.x
+        tf.transform.translation.y = odom.pose.pose.position.y
+        tf.transform.translation.z = odom.pose.pose.position.z
+        tf.transform.rotation = odom.pose.pose.orientation
+        self._br.sendTransform(tf)
+
+    # --- status loop ------------------------------------------------------------
+
+    def _watchdog_cb(self, event) -> None:
+        """Watchdog timer callback: auto-TIMEOUT when no valid input arrives."""
+        self._check_timeout()
+
+    def _check_timeout(self) -> None:
+        """Update state if FAST-LIO input has timed out (watchdog)."""
+        with self._lock:
+            # Fail-safe: scene config invalid -> module stays FAILED.
+            if not self._start_pose_valid:
+                self._state = ModuleStatus.FAILED
+                self._valid = False
+                return
+
+            # Hard/terminal states are not overridden by the watchdog.
+            if self._state in (ModuleStatus.FAILED, ModuleStatus.BLOCKED):
+                return
+
+            if self._last_odom_time is None:
+                self._state = ModuleStatus.STARTING
+                self._valid = False
+                self._detail = "waiting for first FAST-LIO odometry"
+                return
+
+            elapsed = (rospy.Time.now() - self._last_odom_time).to_sec()
+            if elapsed > self.input_timeout:
+                if self._state != ModuleStatus.TIMEOUT:
+                    rospy.logwarn(
+                        "localization_node: FAST-LIO input timeout (%.2f s)", elapsed
+                    )
+                self._state = ModuleStatus.TIMEOUT
+                self._valid = False
+                self._detail = f"FAST-LIO input timeout ({elapsed:.2f} s)"
+
+    def _publish_status(self) -> None:
+        """Publish current module status."""
+        with self._lock:
+            status = ModuleStatus()
+            status.header.stamp = rospy.Time.now()
+            status.state = self._state
+            status.valid = self._valid
+            status.confidence = 1.0 if self._valid else 0.0
+            status.detail = self._detail
+            self._status_pub.publish(status)
+
+    def run(self) -> None:
+        """Main loop: publish status. The watchdog runs on its own timer."""
+        rate = rospy.Rate(self.status_rate)
+        while not rospy.is_shutdown():
+            self._publish_status()
+            rate.sleep()
 
 
 def main():
-    rospy.init_node("localization_node", log_level=rospy.INFO)
-
-    status_pub = rospy.Publisher(
-        "/competition/localization/status", ModuleStatus, queue_size=10, latch=True
-    )
-
-    rospy.loginfo(
-        "localization_node: skeleton only / algorithm not implemented. "
-        "Publishing ModuleStatus(state=STARTING, valid=false)."
-    )
-
-    rate = rospy.Rate(1)  # 1 Hz status heartbeat
-    while not rospy.is_shutdown():
-        msg = ModuleStatus()
-        msg.header.stamp = rospy.Time.now()
-        msg.state = ModuleStatus.STARTING
-        msg.valid = False
-        msg.confidence = 0.0
-        msg.detail = "skeleton only / algorithm not implemented"
-        status_pub.publish(msg)
-        rate.sleep()
+    node = LocalizationAdapter()
+    node.run()
 
 
 if __name__ == "__main__":
