@@ -1,284 +1,353 @@
 #!/usr/bin/env python3
-"""Unit tests for cmd_vel_guard_node — pure Python, no ROS infrastructure needed.
-
-Tests: disabled, emergency stop, timeout, velocity limiting, normal forwarding.
-"""
+"""Pure-Python tests for control status aggregation and velocity gating."""
 
 from __future__ import annotations
 
+import math
 import sys
-import time
 import unittest
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Minimal ROS mock — we test the CmdVelGuard logic without rospy infrastructure
-# ---------------------------------------------------------------------------
 
 class _MockDuration:
     def __init__(self, secs):
-        self._s = secs
+        self._seconds = float(secs)
+
     def to_sec(self):
-        return self._s
+        return self._seconds
+
 
 class _MockTimeInstance:
-    __slots__ = ('_sec',)
-    def __init__(self, s=0.0): self._sec = s
-    def to_sec(self): return self._sec
+    def __init__(self, seconds=0.0):
+        self._seconds = float(seconds)
+
+    def to_sec(self):
+        return self._seconds
+
     def __sub__(self, other):
-        if isinstance(other, _MockTimeInstance):
-            return _MockDuration(self._sec - other._sec)
-        return NotImplemented
+        return _MockDuration(self._seconds - other._seconds)
+
 
 class _MockTime:
     _now = 0.0
+
     @classmethod
     def now(cls):
         return _MockTimeInstance(cls._now)
-    @classmethod
-    def advance(cls, s):
-        cls._now += s
 
-class _MockLog:
-    @staticmethod
-    def info(*a, **kw): pass
-    @staticmethod
-    def warn(*a, **kw): pass
-    @staticmethod
-    def loginfo(*a, **kw): pass
-    @staticmethod
-    def logwarn(*a, **kw): pass
-    @staticmethod
-    def logerr(*a, **kw): pass
-    @staticmethod
-    def error(*a, **kw): pass
+    @classmethod
+    def set(cls, seconds):
+        cls._now = float(seconds)
+
+    @classmethod
+    def advance(cls, seconds):
+        cls._now += float(seconds)
+
+
+class _Publisher:
+    def __init__(self, topic):
+        self.topic = topic
+        self.messages = []
+
+    def publish(self, message):
+        self.messages.append(message)
+
 
 class _MockRospy:
     Time = _MockTime
     Duration = _MockDuration
-    def __getattr__(self, n):
-        if n in ("loginfo","logwarn","logerr","info","warn","error"):
-            return getattr(_MockLog, n)
-        return lambda *a,**kw: None
-    def init_node(self, *a, **kw): pass
-    def get_param(self, name, default):
+    INFO = 20
+
+    def __init__(self):
+        self.publishers = []
+        self.subscribers = []
+
+    def init_node(self, *args, **kwargs):
+        pass
+
+    def get_param(self, _name, default):
         return default
-    def Publisher(self, *a, **kw):
-        return type("P", (), {"publish": lambda s,m: None})()
-    def Subscriber(self, *a, **kw):
-        return None
-    def Timer(self, *a, **kw):
-        return None
-    def spin(self): pass
-    Rate = lambda hz: type("R", (), {"sleep": lambda: None})()
-    def on_shutdown(self, fn): pass
-    def sleep(self, d): pass
 
-sys.modules["rospy"] = _MockRospy()
+    def Publisher(self, topic, *_args, **_kwargs):
+        publisher = _Publisher(topic)
+        self.publishers.append(publisher)
+        return publisher
 
-# Fake geometry_msgs and std_msgs — must match geometry_msgs.msg.Twist etc.
+    def Subscriber(self, topic, *_args, **_kwargs):
+        self.subscribers.append(topic)
+        return object()
+
+    def Timer(self, *_args, **_kwargs):
+        return object()
+
+    def on_shutdown(self, _callback):
+        pass
+
+    def sleep(self, _duration):
+        pass
+
+    def spin(self):
+        pass
+
+    def loginfo(self, *_args, **_kwargs):
+        pass
+
+
+ROSPY = _MockRospy()
+sys.modules["rospy"] = ROSPY
+
+
+class _Vector3:
+    def __init__(self):
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+
+
 class _Twist:
     def __init__(self):
-        self.linear = type("L", (), {"x": 0.0, "y": 0.0, "z": 0.0})()
-        self.angular = type("A", (), {"x": 0.0, "y": 0.0, "z": 0.0})()
+        self.linear = _Vector3()
+        self.angular = _Vector3()
+
 
 class _Bool:
     def __init__(self, data=False):
         self.data = data
 
+
 class _GeometryMsgsMsg:
     Twist = _Twist
+
 
 class _GeometryMsgs:
     msg = _GeometryMsgsMsg()
 
+
 class _StdMsgsMsg:
     Bool = _Bool
 
+
 class _StdMsgs:
     msg = _StdMsgsMsg()
+
 
 sys.modules["geometry_msgs"] = _GeometryMsgs()
 sys.modules["geometry_msgs.msg"] = _GeometryMsgsMsg()
 sys.modules["std_msgs"] = _StdMsgs()
 sys.modules["std_msgs.msg"] = _StdMsgsMsg()
 
-# Fake competition_interfaces
-class _ModuleStatus:
-    UNKNOWN=0; STARTING=1; READY=2; RUNNING=3; SUCCEEDED=4
-    BLOCKED=5; TIMEOUT=6; FAILED=7
+
+class _Header:
     def __init__(self):
-        self.header = type("H",(),{"stamp": type("S",(),{"to_sec": lambda:0.0})()})()
-        self.state=0; self.valid=False; self.confidence=0.0; self.detail=""
+        self.stamp = _MockTime.now()
 
-sys.modules["competition_interfaces"] = type("m",(),{})()
-sys.modules["competition_interfaces.msg"] = type("m",(),{"ModuleStatus": _ModuleStatus})()
 
-# Now import the module under test
-_SRC = str(Path(__file__).resolve().parents[1] / "scripts")
-_NODE_PATH = f"{_SRC}/cmd_vel_guard_node"
+class _ModuleStatus:
+    UNKNOWN = 0
+    STARTING = 1
+    READY = 2
+    RUNNING = 3
+    SUCCEEDED = 4
+    BLOCKED = 5
+    TIMEOUT = 6
+    FAILED = 7
 
-# Load the cmd_vel_guard module without triggering its __main__ block.
-# Using exec since the file has no .py extension and spec_from_file_location
-# may not resolve it.
-mod = type("mod", (), {})()
-with open(_NODE_PATH) as f:
-    source = f.read()
-# Remove the __main__ guard block so we only get the class definition
-_source_no_main = source.split("if __name__")[0]
-exec(compile(_source_no_main, _NODE_PATH, "exec"), mod.__dict__)
+    def __init__(self):
+        self.header = _Header()
+        self.state = self.UNKNOWN
+        self.valid = False
+        self.confidence = 0.0
+        self.detail = ""
+
+
+sys.modules["competition_interfaces"] = type("CompetitionInterfaces", (), {})()
+sys.modules["competition_interfaces.msg"] = type(
+    "CompetitionInterfacesMsg", (), {"ModuleStatus": _ModuleStatus}
+)()
+
+
+def _load_node(filename):
+    path = Path(__file__).resolve().parents[1] / "scripts" / filename
+    namespace = {"__name__": "test_module"}
+    with path.open(encoding="utf-8") as source_file:
+        exec(compile(source_file.read(), str(path), "exec"), namespace)
+    return namespace
+
+
+NODE = _load_node("cmd_vel_guard_node")
+CmdVelGuard = NODE["CmdVelGuard"]
 
 
 class TestCmdVelGuard(unittest.TestCase):
-    """Test cmd_vel_guard safety logic in isolation."""
-
     def setUp(self):
-        _MockTime._now = 0.0
-        # Create a guard instance with known parameters
-        self.guard = mod.CmdVelGuard.__new__(mod.CmdVelGuard)
-        # Manually init fields to avoid __init__ which hits rospy
+        _MockTime.set(10.0)
+        self.guard = CmdVelGuard.__new__(CmdVelGuard)
         self.guard._timeout = 0.5
+        self.guard._path_status_timeout = 1.0
         self.guard._max_linear_x = 0.5
         self.guard._max_linear_y = 0.3
         self.guard._max_angular_z = 1.0
         self.guard._last_raw_cmd_time = None
-        self.guard._control_enabled = False
-        self.guard._emergency_stop = True
+        self.guard._last_path_status_time = None
+        self.guard._path_status = None
+        self.guard._control_enabled = True
+        self.guard._emergency_stop = False
+        self.guard._raw_cmd_finite = True
         self.guard._raw_linear_x = 0.0
         self.guard._raw_linear_y = 0.0
         self.guard._raw_angular_z = 0.0
-        # Track published cmd_vel for inspection
-        self._published = []
-        self.guard._cmd_vel_pub = type("P", (), {"publish": lambda s, m: self._published.append(m)})()
-        self.guard._status_pub = type("P", (), {"publish": lambda s, m: None})()
-        self.guard._timer = None
+        self.guard._cmd_vel_pub = _Publisher("/cmd_vel")
+        self.guard._status_pub = _Publisher("/competition/control/status")
 
-    # ------------------------------------------------------------------
-    # Disabled — should output zero regardless of raw input
-    # ------------------------------------------------------------------
-
-    def test_disabled_outputs_zero(self):
-        self.guard._control_enabled = False
-        self.guard._emergency_stop = False
-        self.guard._raw_linear_x = 1.0
+    def _set_fresh_raw(self, x=0.25, y=0.0, angular=0.0):
         self.guard._last_raw_cmd_time = _MockTime.now()
+        self.guard._raw_cmd_finite = True
+        self.guard._raw_linear_x = x
+        self.guard._raw_linear_y = y
+        self.guard._raw_angular_z = angular
+
+    def _set_path_status(
+        self, state=_ModuleStatus.RUNNING, valid=True, detail="following"
+    ):
+        status = _ModuleStatus()
+        status.state = state
+        status.valid = valid
+        status.confidence = 0.8 if valid else 0.0
+        status.detail = detail
+        self.guard._path_status = status
+        self.guard._last_path_status_time = _MockTime.now()
+
+    def _run(self):
         self.guard._control_loop(None)
-        cmd = self._published[-1]
+        return (
+            self.guard._cmd_vel_pub.messages[-1],
+            self.guard._status_pub.messages[-1],
+        )
+
+    def test_constructor_declares_unique_public_topics(self):
+        ROSPY.publishers.clear()
+        ROSPY.subscribers.clear()
+        CmdVelGuard()
+        publisher_topics = [publisher.topic for publisher in ROSPY.publishers]
+        self.assertEqual(publisher_topics.count("/cmd_vel"), 1)
+        self.assertEqual(
+            publisher_topics.count("/competition/control/status"), 1
+        )
+        self.assertIn(
+            "/competition/control/path_follower_status", ROSPY.subscribers
+        )
+
+    def test_never_received_path_status_is_starting_and_zero(self):
+        self._set_fresh_raw()
+        cmd, status = self._run()
         self.assertEqual(cmd.linear.x, 0.0)
-        self.assertEqual(cmd.linear.y, 0.0)
-        self.assertEqual(cmd.angular.z, 0.0)
+        self.assertEqual(status.state, _ModuleStatus.STARTING)
+        self.assertFalse(status.valid)
 
-    # ------------------------------------------------------------------
-    # Emergency stop — should output zero regardless of everything
-    # ------------------------------------------------------------------
+    def test_expired_path_status_is_timeout_and_zero(self):
+        self._set_fresh_raw()
+        self._set_path_status()
+        self.guard._last_path_status_time = _MockTimeInstance(8.0)
+        cmd, status = self._run()
+        self.assertEqual(cmd.linear.x, 0.0)
+        self.assertEqual(status.state, _ModuleStatus.TIMEOUT)
+        self.assertFalse(status.valid)
 
-    def test_estop_outputs_zero(self):
-        self.guard._control_enabled = True
+    def test_path_status_time_rollback_is_timeout(self):
+        self._set_fresh_raw()
+        self._set_path_status()
+        self.guard._last_path_status_time = _MockTimeInstance(11.0)
+        _, status = self._run()
+        self.assertEqual(status.state, _ModuleStatus.TIMEOUT)
+        self.assertIn("backwards", status.detail)
+
+    def test_failed_path_status_stops_and_is_propagated(self):
+        self._set_fresh_raw()
+        self._set_path_status(_ModuleStatus.FAILED, False, "frame mismatch")
+        cmd, status = self._run()
+        self.assertEqual(cmd.linear.x, 0.0)
+        self.assertEqual(status.state, _ModuleStatus.FAILED)
+        self.assertFalse(status.valid)
+        self.assertEqual(status.detail, "frame mismatch")
+
+    def test_valid_false_running_status_stops(self):
+        self._set_fresh_raw()
+        self._set_path_status(_ModuleStatus.RUNNING, False, "invalid path")
+        cmd, status = self._run()
+        self.assertEqual(cmd.linear.x, 0.0)
+        self.assertFalse(status.valid)
+
+    def test_running_valid_status_forwards_limited_velocity(self):
+        self._set_fresh_raw(x=2.0, y=-1.0, angular=3.0)
+        self._set_path_status()
+        cmd, status = self._run()
+        self.assertEqual(cmd.linear.x, 0.5)
+        self.assertEqual(cmd.linear.y, -0.3)
+        self.assertEqual(cmd.angular.z, 1.0)
+        self.assertEqual(status.state, _ModuleStatus.RUNNING)
+        self.assertTrue(status.valid)
+
+    def test_succeeded_status_is_public_and_zero(self):
+        self._set_fresh_raw(x=0.4)
+        self._set_path_status(
+            _ModuleStatus.SUCCEEDED, True, "path finished"
+        )
+        cmd, status = self._run()
+        self.assertEqual(cmd.linear.x, 0.0)
+        self.assertEqual(status.state, _ModuleStatus.SUCCEEDED)
+        self.assertTrue(status.valid)
+
+    def test_estop_overrides_running_status(self):
+        self._set_fresh_raw(x=0.4)
+        self._set_path_status()
         self.guard._emergency_stop = True
-        self.guard._raw_linear_x = 1.0
-        self.guard._last_raw_cmd_time = _MockTime.now()
-        self.guard._control_loop(None)
-        cmd = self._published[-1]
+        cmd, status = self._run()
         self.assertEqual(cmd.linear.x, 0.0)
-        self.assertEqual(cmd.linear.y, 0.0)
-        self.assertEqual(cmd.angular.z, 0.0)
+        self.assertEqual(status.state, _ModuleStatus.BLOCKED)
+        self.assertFalse(status.valid)
+        self.assertIn("emergency_stop", status.detail)
 
-    # ------------------------------------------------------------------
-    # Timeout — no raw_cmd_vel within timeout → zero
-    # ------------------------------------------------------------------
-
-    def test_timeout_when_no_raw_cmd_ever(self):
-        self.guard._control_enabled = True
-        self.guard._emergency_stop = False
-        self.guard._last_raw_cmd_time = None
-        self.guard._control_loop(None)
-        cmd = self._published[-1]
+    def test_disabled_overrides_running_status(self):
+        self._set_fresh_raw(x=0.4)
+        self._set_path_status()
+        self.guard._control_enabled = False
+        cmd, status = self._run()
         self.assertEqual(cmd.linear.x, 0.0)
+        self.assertEqual(status.state, _ModuleStatus.READY)
+        self.assertFalse(status.valid)
 
-    def test_timeout_after_delay(self):
-        self.guard._control_enabled = True
-        self.guard._emergency_stop = False
-        self.guard._raw_linear_x = 0.4
-        self.guard._last_raw_cmd_time = _MockTime.now()  # t=0
-        self.guard._control_loop(None)
-        # Should still be fresh → forward
-        self.assertAlmostEqual(self._published[-1].linear.x, 0.4)
-        # Advance time past timeout
-        _MockTime.advance(0.6)
-        self.guard._control_loop(None)
-        self.assertEqual(self._published[-1].linear.x, 0.0)
+    def test_non_finite_raw_velocity_is_failed_and_zero(self):
+        self._set_path_status()
+        message = _Twist()
+        message.linear.x = math.nan
+        self.guard._raw_cmd_callback(message)
+        cmd, status = self._run()
+        self.assertEqual(cmd.linear.x, 0.0)
+        self.assertEqual(status.state, _ModuleStatus.FAILED)
+        self.assertFalse(status.valid)
 
-    # ------------------------------------------------------------------
-    # Velocity limiting
-    # ------------------------------------------------------------------
+    def test_raw_timeout_overrides_running_status(self):
+        self._set_path_status()
+        self.guard._last_raw_cmd_time = _MockTimeInstance(9.0)
+        cmd, status = self._run()
+        self.assertEqual(cmd.linear.x, 0.0)
+        self.assertEqual(status.state, _ModuleStatus.TIMEOUT)
+        self.assertFalse(status.valid)
 
-    def test_clamp_linear_x_positive(self):
-        self._enable_normal()
-        self.guard._raw_linear_x = 2.0  # exceeds max 0.5
-        self.guard._last_raw_cmd_time = _MockTime.now()
-        self.guard._control_loop(None)
-        self.assertAlmostEqual(self._published[-1].linear.x, 0.5)
+    def test_raw_time_rollback_is_timeout(self):
+        self._set_path_status()
+        self.guard._last_raw_cmd_time = _MockTimeInstance(11.0)
+        _, status = self._run()
+        self.assertEqual(status.state, _ModuleStatus.TIMEOUT)
+        self.assertIn("backwards", status.detail)
 
-    def test_clamp_linear_x_negative(self):
-        self._enable_normal()
-        self.guard._raw_linear_x = -2.0
-        self.guard._last_raw_cmd_time = _MockTime.now()
-        self.guard._control_loop(None)
-        self.assertAlmostEqual(self._published[-1].linear.x, -0.5)
-
-    def test_clamp_linear_y(self):
-        self._enable_normal()
-        self.guard._raw_linear_y = 1.0  # exceeds max 0.3
-        self.guard._last_raw_cmd_time = _MockTime.now()
-        self.guard._control_loop(None)
-        self.assertAlmostEqual(self._published[-1].linear.y, 0.3)
-
-    def test_clamp_angular_z(self):
-        self._enable_normal()
-        self.guard._raw_angular_z = 3.0  # exceeds max 1.0
-        self.guard._last_raw_cmd_time = _MockTime.now()
-        self.guard._control_loop(None)
-        self.assertAlmostEqual(self._published[-1].angular.z, 1.0)
-
-    # ------------------------------------------------------------------
-    # Normal forwarding
-    # ------------------------------------------------------------------
-
-    def test_forward_within_limits(self):
-        self._enable_normal()
-        self.guard._raw_linear_x = 0.25
-        self.guard._raw_linear_y = -0.1
-        self.guard._raw_angular_z = 0.5
-        self.guard._last_raw_cmd_time = _MockTime.now()
-        self.guard._control_loop(None)
-        cmd = self._published[-1]
-        self.assertAlmostEqual(cmd.linear.x, 0.25)
-        self.assertAlmostEqual(cmd.linear.y, -0.1)
-        self.assertAlmostEqual(cmd.angular.z, 0.5)
-
-    # ------------------------------------------------------------------
-    # Unused DOF must be zero
-    # ------------------------------------------------------------------
-
-    def test_unused_dof_always_zero(self):
-        self._enable_normal()
-        self.guard._raw_linear_x = 0.2
-        self.guard._raw_linear_y = 0.1
-        self.guard._raw_angular_z = 0.3
-        self.guard._last_raw_cmd_time = _MockTime.now()
-        self.guard._control_loop(None)
-        cmd = self._published[-1]
+    def test_unused_twist_dof_remain_zero(self):
+        self._set_fresh_raw()
+        self._set_path_status()
+        cmd, _ = self._run()
         self.assertEqual(cmd.linear.z, 0.0)
         self.assertEqual(cmd.angular.x, 0.0)
         self.assertEqual(cmd.angular.y, 0.0)
-
-    # ------------------------------------------------------------------
-    # Helper
-    # ------------------------------------------------------------------
-
-    def _enable_normal(self):
-        self.guard._control_enabled = True
-        self.guard._emergency_stop = False
 
 
 if __name__ == "__main__":

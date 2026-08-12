@@ -34,6 +34,8 @@
     <param name="start_delay" value="5.0" />
     <param name="auto_start" value="$(arg auto_start)" />
     <param name="competition_mode" value="$(arg competition_mode)" />
+    <param name="workspace_root" value="/workspace/SimEnv" />
+    <param name="result_path" value="results/detected_danger.json" />
   </node>
 
   <!-- === cmd_vel Guard (safety gateway — ALWAYS start) === -->
@@ -52,9 +54,10 @@
 
   <!-- === Production modules (competition mode or when mocks disabled) === -->
   <group unless="$(arg use_mocks)">
-    <!-- Localization -->
-    <node pkg="competition_localization" type="localization_node" name="localization"
-          output="screen" respawn="true" />
+    <!-- Localization (FAST-LIO + adapter, single canonical bringup) -->
+    <include file="$(find competition_localization)/launch/localization_bringup.launch">
+      <arg name="rviz" value="false"/>
+    </include>
 
     <!-- Perception -->
     <node pkg="competition_perception" type="perception_node" name="perception"
@@ -68,7 +71,7 @@
     <node pkg="competition_planning" type="planning_node" name="planning"
           output="screen" respawn="true" />
 
-    <!-- Path follower (skeleton) -->
+    <!-- Path follower -->
     <node pkg="competition_control" type="path_follower_node" name="path_follower"
           output="screen" respawn="true" />
   </group>

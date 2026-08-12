@@ -1,111 +1,168 @@
 # competition_control
 
-**负责人**: 杨渊浩（运动控制与执行）
+**负责人**：杨渊浩（运动控制与执行）
 
 ## 模块目标
 
-安全地执行路径跟踪，并通过唯一 `/cmd_vel` 发布者 (`cmd_vel_guard_node`)
-提供速度限幅、超时停车和 watchdog 保护。
+接收 planning 发布的路径和 localization 发布的里程计，生成原始速度，
+再由安全网关统一检查并发布最终速度与控制模块权威状态。
 
-**关键原则**：
-1. 只有 `cmd_vel_guard_node` 可以发布 `/cmd_vel`
-2. 所有其他控制代码只能发布 `/competition/raw_cmd_vel`
-3. 路径跟踪代码不直接发布 `/cmd_vel`
+```text
+planning_node
+  -> /competition/path
+  -> path_follower_node
+  -> /competition/raw_cmd_vel
+  -> cmd_vel_guard_node
+  -> /cmd_vel
+```
+
+## 唯一发布者约束
+
+- `path_follower_node` 是
+  `/competition/control/path_follower_status` 的唯一发布者。
+- `cmd_vel_guard_node` 是 `/competition/control/status` 的唯一发布者。
+- `cmd_vel_guard_node` 是 `/cmd_vel` 的唯一发布者。
+- `path_follower_node` 只发布 `/competition/raw_cmd_vel`，不得发布
+  `/cmd_vel`。
+- `/competition/control/path_follower_status` 是
+  `competition_control` 包内部接口。
+- `/competition/control/status` 是提供给 `competition_loop` 等下游模块的
+  控制模块权威状态。
+
+未修改 `competition_interfaces/ModuleStatus.msg` 或其他冻结公共接口。
 
 ## 节点
 
-### 1. `cmd_vel_guard_node` — 安全网关（**本轮已实现**）
+### `path_follower_node`
 
-这是整个系统唯一允许发布 `/cmd_vel` 的节点。
+订阅：
 
-**功能**：
-- [x] 订阅 `/competition/raw_cmd_vel`（原始速度指令）
-- [x] 订阅 `/competition/control_enabled`（运动使能）
-- [x] 订阅 `/competition/emergency_stop`（紧急停车）
-- [x] 独占发布 `/cmd_vel`
-- [x] 默认 `control_enabled=false`
-- [x] 默认 `emergency_stop=true`（安全初态）
-- [x] 超时检测：超过 `cmd_vel_timeout` 无新 raw 指令 → 持续发布零速度
-- [x] 参数化限幅：`linear.x`、`linear.y`、`angular.z`
-- [x] 关闭时发布多次零速度
-- [x] 不转发 Twist 中未使用的自由度
-- [x] 单元测试覆盖：禁用、急停、超时、限幅、正常转发
+| 话题 | 类型 | 来源 |
+|---|---|---|
+| `/competition/path` | `nav_msgs/Path` | planning |
+| `/competition/localization/odom` | `nav_msgs/Odometry` | localization |
 
-### 2. `path_follower_node` — 路径跟踪（骨架）
+发布：
 
-仅占位，默认发布零速度到 `/competition/raw_cmd_vel`。
+| 话题 | 类型 | 消费者 | 说明 |
+|---|---|---|---|
+| `/competition/raw_cmd_vel` | `geometry_msgs/Twist` | `cmd_vel_guard_node` | 未经过安全网关的原始速度 |
+| `/competition/control/path_follower_status` | `competition_interfaces/ModuleStatus` | `cmd_vel_guard_node` | 包内部路径跟踪状态 |
 
-## 输入
+行为：
 
-| 输入 | 类型 | 来源 | 说明 |
-|------|------|------|------|
-| `/competition/raw_cmd_vel` | `Twist` | path_follower 或其他算法 | 原始速度指令 |
-| `/competition/control_enabled` | `Bool` | competition_loop | 运动使能 |
-| `/competition/emergency_stop` | `Bool` | competition_loop | 紧急停车 |
-| `/competition/navigation_goal` | `PoseStamped` | planning | 导航目标 |
-| `/competition/path` | `Path` | planning | 规划路径 |
+- 缺少路径或里程计时持续输出零速度和 `STARTING, valid=false`。
+- 路径、里程计或内部计算超时时输出零速度和
+  `TIMEOUT, valid=false`。
+- 路径与里程计 `frame_id` 非空且一致时才执行；当前不进行 TF 转换。
+- 拒绝 `NaN`、`Inf`、空坐标系和零范数四元数。
+- 空路径代表撤销，立即清除旧路径并停车。
+- 新路径安全替换旧路径，并跳过机器人附近已经到达的起始点。
+- 正常跟踪时报告 `RUNNING, valid=true`。
+- 到达路径终点时输出零速度并报告 `SUCCEEDED, valid=true`。
 
-## 输出
+### `cmd_vel_guard_node`
 
-| 输出 | 类型 | 消费者 | 说明 |
-|------|------|--------|------|
-| `/cmd_vel` | `Twist` | junior_ctrl | **独占发布** |
-| `/competition/raw_cmd_vel` | `Twist` | cmd_vel_guard | 原始速度（path_follower 输出） |
-| `/competition/control/status` | `ModuleStatus` | competition_loop | 控制模块状态 |
+订阅：
+
+| 话题 | 类型 | 来源 |
+|---|---|---|
+| `/competition/raw_cmd_vel` | `geometry_msgs/Twist` | `path_follower_node` |
+| `/competition/control/path_follower_status` | `competition_interfaces/ModuleStatus` | `path_follower_node` |
+| `/competition/control_enabled` | `std_msgs/Bool` | `competition_loop` |
+| `/competition/emergency_stop` | `std_msgs/Bool` | `competition_loop` |
+
+发布：
+
+| 话题 | 类型 | 消费者 | 说明 |
+|---|---|---|---|
+| `/cmd_vel` | `geometry_msgs/Twist` | 底盘控制器 | 最终速度，唯一发布者 |
+| `/competition/control/status` | `competition_interfaces/ModuleStatus` | `competition_loop` 等 | 控制模块权威状态，唯一发布者 |
+
+安全网关拒绝非有限速度，对使用的三个自由度进行限幅，并保证其他 Twist
+自由度为零。节点关闭时会连续发布多次零速度。
 
 ## 参数
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `~cmd_vel_timeout` | float | 0.5 | raw_cmd_vel 超时（秒） |
-| `~max_linear_x` | float | 0.5 | 前进速度限幅（m/s） |
-| `~max_linear_y` | float | 0.3 | 横向速度限幅（m/s） |
-| `~max_angular_z` | float | 1.0 | 转向速度限幅（rad/s） |
+### `path_follower_node`
 
-## 当前状态
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `~max_linear` | `0.25` | 最大前进速度（m/s） |
+| `~max_angular` | `0.8` | 最大角速度（rad/s） |
+| `~goal_tolerance` | `0.2` | 航点到达容差（m） |
+| `~path_timeout` | `5.0` | 路径接收超时（s） |
+| `~odom_timeout` | `1.0` | 里程计接收超时（s） |
 
-**v0.1.0**
+### `cmd_vel_guard_node`
 
-- [x] `cmd_vel_guard_node` 完整实现（本轮唯一功能节点）
-- [x] 单元测试：禁用、急停、超时、限幅、正常转发、未使用 DOF 归零
-- [x] `path_follower_node` 骨架占位（零速度）
-- [ ] 路径跟踪算法（Pure Pursuit / DWA / MPC）
-- [ ] 目标到达判断
-- [ ] 路径阻塞检测与重规划请求
-- [ ] 多楼层路径执行（开/关门 + 乘梯配合）
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `~cmd_vel_timeout` | `0.5` | `/competition/raw_cmd_vel` 超时（s） |
+| `~path_follower_status_timeout` | `1.0` | 内部路径跟踪状态超时（s） |
+| `~max_linear_x` | `0.5` | `linear.x` 限幅（m/s） |
+| `~max_linear_y` | `0.3` | `linear.y` 限幅（m/s） |
+| `~max_angular_z` | `1.0` | `angular.z` 限幅（rad/s） |
 
-## 禁止事项
+上述参数必须为有限且大于零的数值。
 
-- 禁止 path_follower_node 直接发布 `/cmd_vel`
-- 禁止绕过 `cmd_vel_guard` 的安全检查
-- 禁止在骨架模式下发布非零速度
-- 不得订阅 `/Odometry_gazebo` 或 `/ground_truth/*`
+## 状态优先级
 
-## 最小运行命令
+`cmd_vel_guard_node` 按以下顺序决定最终速度和公共状态：
+
+1. 急停：零速度，`BLOCKED, valid=false`。
+2. 控制禁用：零速度，`READY, valid=false`。
+3. 非法 `raw_cmd_vel`：零速度，`FAILED, valid=false`。
+4. `raw_cmd_vel` 从未收到、超时或 ROS 时间回退：零速度，
+   `TIMEOUT, valid=false`。
+5. 从未收到路径跟踪状态：零速度，`STARTING, valid=false`。
+6. 路径跟踪状态超时或 ROS 时间回退：零速度，
+   `TIMEOUT, valid=false`。
+7. 路径跟踪器报告 `FAILED`、`TIMEOUT`、`BLOCKED` 或
+   `valid=false`：零速度，并汇总相应失败状态和 `detail`。
+8. 路径跟踪器报告 `SUCCEEDED, valid=true`：零速度，并发布
+   `SUCCEEDED, valid=true`。
+9. 只有路径跟踪器报告 `RUNNING, valid=true` 且所有安全检查通过时，
+   才限幅转发原始速度并发布 `RUNNING, valid=true`。
+
+因此，路径跟踪器的 `RUNNING` 永远不能覆盖急停、控制禁用、非法速度或
+安全网关超时。
+
+## 自动测试
+
+测试不需要启动 roscore：
 
 ```bash
-source devel/setup.bash
-
-# 仅启动安全网关
-rosrun competition_control cmd_vel_guard_node
-
-# 仅启动路径跟踪（骨架）
-rosrun competition_control path_follower_node
+python3 src/competition_control/test/test_cmd_vel_guard.py
+python3 src/competition_control/test/test_path_follower.py
 ```
 
-## 验收标准
+覆盖内容包括：
 
-- [x] `cmd_vel_guard` 是唯一 `/cmd_vel` 发布者（代码审计确认）
-- [x] 禁用时输出零速
-- [x] 急停时输出零速
-- [x] 超时时输出零速
-- [x] 超限时正确限幅
-- [x] 关闭时发布多次零速
-- [x] 单元测试全部通过
-- [ ] 与 real 控制器联调通过
+- 唯一发布者和内部状态订阅关系；
+- 从未收到内部状态与内部状态超时；
+- Gazebo/ROS 仿真时间回退；
+- `RUNNING`、`SUCCEEDED`、失败状态和 `valid=false`；
+- 急停、禁用、非法速度、raw 速度超时与限幅；
+- 空路径撤销、坐标系不一致、非法数值和非法四元数；
+- 正常跟踪和终点停车。
 
-## 需要向上下游成员交付的内容
+## ROS 联调验收
 
-- 闫雨萱（planning）：路径跟踪状态，用于重规划
-- 黄誉铭（loop）：`/competition/control/status` 用于模块就绪检查
-- 所有人：`/cmd_vel` 的唯一可靠发布者
+```bash
+rostopic info /competition/control/status
+rostopic info /competition/control/path_follower_status
+rostopic info /competition/raw_cmd_vel
+rostopic info /cmd_vel
+```
+
+预期：
+
+- `/competition/control/status` 只有 `cmd_vel_guard_node` 发布。
+- `/competition/control/path_follower_status` 只有
+  `path_follower_node` 发布。
+- `/competition/raw_cmd_vel` 由 `path_follower_node` 发布。
+- `/cmd_vel` 只有 `cmd_vel_guard_node` 发布。
+
+禁止正式算法订阅 `/Odometry_gazebo`、`/ground_truth/*`，或读取真值接口
+绕过 localization。

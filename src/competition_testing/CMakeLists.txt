@@ -25,3 +25,9 @@ install(DIRECTORY scripts launch
   PATTERN "__pycache__" EXCLUDE
   PATTERN "*.pyc" EXCLUDE
 )
+
+# --- Tests ---
+if(CATKIN_ENABLE_TESTING)
+  # Pure-Python unit test (no ROS master needed)
+  catkin_add_nosetests(test/test_mock_isolation.py)
+endif()

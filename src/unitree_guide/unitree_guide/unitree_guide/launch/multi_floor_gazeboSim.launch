@@ -15,13 +15,13 @@
     <arg name="enable_livox_imu" default="$(arg enable_livox)"/>
     <arg name="enable_realsense" default="$(arg enable_sensor_data)"/>
     <arg name="enable_front_camera" default="false"/>
-    <arg name="enable_referee_odom" default="true"/>
+    <arg name="enable_referee_odom" default="false"/>
     <arg name="enable_ground_truth" default="true"/>
     <arg name="enable_foot_contact_sensor" default="false"/>
     <arg name="enable_foot_force_visual" default="false"/>
     <arg name="enable_joy_node" default="false"/>
     <arg name="enable_pointcloud_converter" default="true"/>
-    <arg name="pointcloud_use_ground_truth_odom" default="true"/>
+    <arg name="pointcloud_use_world_odom" default="false"/>
     <arg name="controller_spawner_timeout" default="$(optenv CONTROLLER_SPAWNER_TIMEOUT 120)"/>
 
     <arg name="world_file" default="$(optenv BUILDING_WORLD_FILE)"/>
@@ -59,6 +59,10 @@
                     -J RR_hip_joint -0.50 -J RR_thigh_joint 1.36 -J RR_calf_joint -2.65
                     -J RL_hip_joint 0.50 -J RL_thigh_joint 1.36 -J RL_calf_joint -2.65"/>
 
+    <!-- Legacy referee odom: OFF by default in competition mode.
+         Enable with enable_referee_odom:=true for debug only.
+         The competition localization module is the ONLY production
+         publisher of world -> base TF and /competition/localization/odom. -->
     <node if="$(arg enable_referee_odom)" pkg="unitree_guide" type="state_from_gazebo" name="state_from_gazebo" args="0 0 0 0 0 0" output="screen">
         <param name="robot_name" value="$(arg rname)" />
     </node>
@@ -92,7 +96,7 @@
             <param name="laser_blind" value="0.5" />
             <param name="min_angle" value="-7"/>
             <param name="max_angle" value="55"/>
-            <param name="use_ground_truth_odom" value="$(arg pointcloud_use_ground_truth_odom)"/>
+            <param name="use_world_odom" value="$(arg pointcloud_use_world_odom)"/>
         </node>
     </group>
 </launch>

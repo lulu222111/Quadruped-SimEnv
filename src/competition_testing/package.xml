@@ -25,4 +25,7 @@
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>competition_interfaces</exec_depend>
+
+  <!-- Test dependencies for catkin_add_nosetests -->
+  <test_depend>rosunit</test_depend>
 </package>

@@ -3,40 +3,50 @@
 
 # --- Competition loop ---
 competition_loop:
-  max_time: 600.0          # Maximum exploration time (seconds)
-  start_delay: 5.0         # Delay before auto-start (seconds)
-  auto_start: true         # Auto-start after validation passes
-  competition_mode: true   # true = competition, false = test
+  max_time: 600.0            # Maximum exploration time (seconds)
+  start_delay: 5.0           # Delay before auto-start after all checks pass (seconds)
+  auto_start: true           # Auto-start after validation + delay complete
+  competition_mode: true     # true = competition, false = test
+  workspace_root: "/workspace/SimEnv"  # Root for resolving team_scene_info.json and results
   result_path: "results/detected_danger.json"
 
 # --- cmd_vel guard ---
 cmd_vel_guard:
-  cmd_vel_timeout: 0.5     # Timeout for raw_cmd_vel (seconds)
-  max_linear_x: 0.5        # Max forward velocity (m/s)
-  max_linear_y: 0.3        # Max lateral velocity (m/s)
-  max_angular_z: 1.0       # Max yaw rate (rad/s)
+  cmd_vel_timeout: 0.5       # Timeout for raw_cmd_vel (seconds)
+  max_linear_x: 0.5          # Max forward velocity (m/s)
+  max_linear_y: 0.3          # Max lateral velocity (m/s)
+  max_angular_z: 1.0         # Max yaw rate (rad/s)
 
 # --- Mapping ---
 mapping:
-  resolution: 0.1          # Grid resolution (m/cell)
-  map_width: 400           # Map width in cells
-  map_height: 400          # Map height in cells
-  update_rate: 2.0         # Map publish rate (Hz)
-  sensor_max_range: 20.0   # Max sensor range (m)
+  resolution: 0.1            # Grid resolution (m/cell)
+  map_width: 400             # Map width in cells
+  map_height: 400            # Map height in cells
+  update_rate: 2.0           # Map publish rate (Hz)
+  sensor_max_range: 20.0     # Max sensor range (m)
 
 # --- Planning ---
 planning:
-  frontier_min_size: 5     # Minimum frontier cluster size (cells)
-  replan_interval: 2.0     # Replanning interval (seconds)
-  goal_tolerance: 0.5      # Goal arrival tolerance (m)
+  frontier_min_size: 5       # Minimum frontier cluster size (cells)
+  replan_interval: 2.0       # Replanning interval (seconds)
+  goal_tolerance: 0.5        # Goal arrival tolerance (m)
 
 # --- Localization ---
 localization:
-  publish_tf: true         # Publish odom -> base TF
+  publish_tf: true         # Publish dynamic TF world -> base (only dynamic TF publisher)
+  imu_frame: "livox_imu_link"   # FAST-LIO `body` == IMU frame (team contract)
+  base_frame: "base"            # Robot base frame
+  # Fixed extrinsic base -> livox_imu_link. FAST-LIO body is the IMU frame, so
+  # the adapter composes T_world_base = T_world_body * (T_base_imu)^-1.
+  # Value derived from a1_description URDF chain:
+  #   base->laser_livox (0.2 0 0.08, rpy 0 0.785 0) *
+  #   laser_livox->livox_imu_link (-0.011 -0.02329 0.04412, rpy 0 0 0)
+  base_to_imu_translation: [0.223404, -0.023290, 0.118985]
+  base_to_imu_rotation_rpy: [0.0, 0.785, 0.0]
 
 # --- Perception ---
 perception:
-  red_hue_min: 0           # Red hue lower bound (HSV, 0-180 for OpenCV)
-  red_hue_max: 10          # Red hue upper bound (HSV)
-  min_confidence: 0.5      # Minimum detection confidence
+  red_hue_min: 0             # Red hue lower bound (HSV, 0-180 for OpenCV)
+  red_hue_max: 10            # Red hue upper bound (HSV)
+  min_confidence: 0.5        # Minimum detection confidence
   publish_debug_image: false
