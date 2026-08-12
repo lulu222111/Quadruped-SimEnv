@@ -211,6 +211,15 @@ PathFollower status 才允许恢复运动。由于 `geometry_msgs/Twist` 没有 
 raw velocity 继续使用本地接收 watchdog；PathFollower status 则检查
 `header.stamp`，拒绝 zero / stale / future / old-generation 时间戳。
 
+Guard 同时维护本地 generation 与 raw/status generation。PathFollower
+进入 `valid=false` 或 follower status 时间戳非法时，此前缓存的 raw velocity
+立即失效，之后即使 follower 恢复 `RUNNING, valid=true`，也不能复用失效前的
+旧 raw command。恢复允许 fresh raw 与 fresh valid follower status 以任意顺序到达，
+但两者最终都必须属于当前 generation。
+
+当 raw callback 本身检测到 ROS time rollback 时，触发 rollback 的那条
+`Twist` 会被直接丢弃；只有随后到达的 raw command 才能成为新 epoch 的候选输入。
+
 ## 参数
 
 ### `path_follower_node`
@@ -307,8 +316,8 @@ python3 src/competition_control/test/test_path_follower.py
 当前回归结果：
 
 ```text
-test_path_follower.py: 49 tests passed
-test_cmd_vel_guard.py: 25 tests passed
+test_path_follower.py: 51 tests passed
+test_cmd_vel_guard.py: 30 tests passed
 ```
 
 ## ROS 联调验收

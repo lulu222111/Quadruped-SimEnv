@@ -188,6 +188,8 @@ class TestCmdVelGuard(unittest.TestCase):
         self.guard._generation = 0
         self.guard._last_ros_time = 10.0
         self.guard._min_path_status_stamp = None
+        self.guard._raw_generation = None
+        self.guard._path_status_generation = None
 
         self.guard._timeout = 0.5
         self.guard._path_status_timeout = 1.0
@@ -213,6 +215,7 @@ class TestCmdVelGuard(unittest.TestCase):
 
     def _set_fresh_raw(self, x=0.25, y=0.0, angular=0.0):
         self.guard._last_raw_cmd_time = _MockTime.now()
+        self.guard._raw_generation = self.guard._generation
         self.guard._raw_cmd_finite = True
         self.guard._raw_linear_x = x
         self.guard._raw_linear_y = y
@@ -230,6 +233,7 @@ class TestCmdVelGuard(unittest.TestCase):
         self.guard._path_status = status
         self.guard._last_path_status_time = _MockTime.now()
         self.guard._path_status_stamp = status.header.stamp
+        self.guard._path_status_generation = self.guard._generation
         self.guard._path_status_error = None
         return status
 
@@ -345,6 +349,129 @@ class TestCmdVelGuard(unittest.TestCase):
         cmd, status = self._run()
         self.assertEqual(cmd.linear.x, 0.0)
         self.assertFalse(status.valid)
+
+    def test_follower_invalid_then_valid_does_not_reuse_old_raw(self):
+        self._set_fresh_raw(x=0.4)
+        self._set_path_status()
+
+        invalid = _ModuleStatus()
+        invalid.header.stamp = _MockTime.now()
+        invalid.state = _ModuleStatus.FAILED
+        invalid.valid = False
+        invalid.detail = "follower invalid"
+        self.guard._path_status_callback(invalid)
+
+        self.assertIsNone(self.guard._raw_generation)
+        self.assertEqual(self.guard._raw_linear_x, 0.0)
+
+        valid = _ModuleStatus()
+        valid.header.stamp = _MockTime.now()
+        valid.state = _ModuleStatus.RUNNING
+        valid.valid = True
+        valid.confidence = 0.8
+        valid.detail = "follower recovered"
+        self.guard._path_status_callback(valid)
+
+        cmd, status = self._run()
+        self.assertEqual(cmd.linear.x, 0.0)
+        self.assertFalse(status.valid)
+        self.assertIn("raw_cmd_vel", status.detail)
+
+    def test_follower_invalid_new_raw_then_valid_recovers(self):
+        self._set_fresh_raw(x=0.4)
+        self._set_path_status()
+
+        invalid = _ModuleStatus()
+        invalid.header.stamp = _MockTime.now()
+        invalid.state = _ModuleStatus.FAILED
+        invalid.valid = False
+        invalid.detail = "follower invalid"
+        self.guard._path_status_callback(invalid)
+
+        raw = _Twist()
+        raw.linear.x = 0.3
+        self.guard._raw_cmd_callback(raw)
+
+        valid = _ModuleStatus()
+        valid.header.stamp = _MockTime.now()
+        valid.state = _ModuleStatus.RUNNING
+        valid.valid = True
+        valid.confidence = 0.8
+        valid.detail = "follower recovered"
+        self.guard._path_status_callback(valid)
+
+        cmd, status = self._run()
+        self.assertEqual(cmd.linear.x, 0.3)
+        self.assertTrue(status.valid)
+
+    def test_follower_invalid_valid_then_new_raw_recovers(self):
+        self._set_fresh_raw(x=0.4)
+        self._set_path_status()
+
+        invalid = _ModuleStatus()
+        invalid.header.stamp = _MockTime.now()
+        invalid.state = _ModuleStatus.FAILED
+        invalid.valid = False
+        invalid.detail = "follower invalid"
+        self.guard._path_status_callback(invalid)
+
+        valid = _ModuleStatus()
+        valid.header.stamp = _MockTime.now()
+        valid.state = _ModuleStatus.RUNNING
+        valid.valid = True
+        valid.confidence = 0.8
+        valid.detail = "follower recovered"
+        self.guard._path_status_callback(valid)
+
+        cmd, status = self._run()
+        self.assertEqual(cmd.linear.x, 0.0)
+        self.assertFalse(status.valid)
+
+        raw = _Twist()
+        raw.linear.x = 0.3
+        self.guard._raw_cmd_callback(raw)
+
+        cmd, status = self._run()
+        self.assertEqual(cmd.linear.x, 0.3)
+        self.assertTrue(status.valid)
+
+    def test_rollback_triggering_raw_is_discarded(self):
+        _MockTime.set(100.0)
+        self.guard._last_ros_time = 100.0
+        self._set_fresh_raw(x=0.4)
+        self._set_path_status()
+
+        _MockTime.set(10.0)
+        triggering_raw = _Twist()
+        triggering_raw.linear.x = 0.35
+        self.guard._raw_cmd_callback(triggering_raw)
+
+        self.assertIsNone(self.guard._last_raw_cmd_time)
+        self.assertIsNone(self.guard._raw_generation)
+        self.assertEqual(self.guard._raw_linear_x, 0.0)
+
+        cmd = self.guard._cmd_vel_pub.messages[-1]
+        status = self.guard._status_pub.messages[-1]
+        self.assertEqual(cmd.linear.x, 0.0)
+        self.assertEqual(status.state, _ModuleStatus.TIMEOUT)
+        self.assertFalse(status.valid)
+
+    def test_invalid_follower_timestamp_invalidates_raw_generation(self):
+        self._set_fresh_raw(x=0.4)
+        self._set_path_status()
+
+        invalid_stamp = _ModuleStatus()
+        invalid_stamp.header.stamp = _MockTimeInstance(10.5)
+        invalid_stamp.state = _ModuleStatus.RUNNING
+        invalid_stamp.valid = True
+        invalid_stamp.detail = "future stamp"
+
+        self.guard._path_status_callback(invalid_stamp)
+
+        self.assertIsNone(self.guard._raw_generation)
+        self.assertEqual(self.guard._raw_linear_x, 0.0)
+        self.assertIsNotNone(self.guard._path_status_error)
+        self.assertIn("future", self.guard._path_status_error)
 
     def test_running_valid_status_forwards_limited_velocity(self):
         self._set_fresh_raw(x=2.0, y=-1.0, angular=3.0)

@@ -38,6 +38,8 @@ class CmdVelGuard:
         self._generation = 0
         self._last_ros_time = None
         self._min_path_status_stamp = None
+        self._raw_generation = None
+        self._path_status_generation = None
 
         self._timeout = self._positive_param("~cmd_vel_timeout", 0.5)
         self._path_status_timeout = self._positive_param(
@@ -118,9 +120,13 @@ class CmdVelGuard:
             now, rolled_back = self._now_locked()
             if rolled_back:
                 self._publish_rollback_stop_locked(now)
+                # Twist has no Header, so the message that observed the
+                # rollback cannot be proven to belong to the new epoch.
+                return
 
             values = (msg.linear.x, msg.linear.y, msg.angular.z)
             self._last_raw_cmd_time = now
+            self._raw_generation = self._generation
             self._raw_cmd_finite = all(math.isfinite(value) for value in values)
 
             if self._raw_cmd_finite:
@@ -146,15 +152,48 @@ class CmdVelGuard:
             )
 
             if stamp_error is not None:
+                # Invalid follower status starts a new local safety generation.
+                # A raw command accepted before this fault must not revive
+                # after a later valid follower status arrives.
+                self._generation += 1
+                self._min_path_status_stamp = self._max_stamp(
+                    self._min_path_status_stamp,
+                    now.to_sec(),
+                )
+                self._invalidate_raw_generation_locked()
+
                 self._path_status = None
                 self._last_path_status_time = None
                 self._path_status_stamp = None
+                self._path_status_generation = None
                 self._path_status_error = stamp_error
                 return
+
+            previous = self._path_status
+            entering_invalid = (
+                not msg.valid
+                and (
+                    previous is None
+                    or self._path_status_error is not None
+                    or bool(previous.valid)
+                )
+            )
+
+            if entering_invalid:
+                # Only the transition into invalid starts a new generation.
+                # Repeated invalid heartbeats must not invalidate a new raw
+                # command that arrived while waiting for recovery.
+                self._generation += 1
+                self._min_path_status_stamp = self._max_stamp(
+                    self._min_path_status_stamp,
+                    self._safe_stamp_sec(msg.header.stamp),
+                )
+                self._invalidate_raw_generation_locked()
 
             self._path_status = msg
             self._last_path_status_time = now
             self._path_status_stamp = msg.header.stamp
+            self._path_status_generation = self._generation
             self._path_status_error = None
 
     def _enabled_callback(self, msg):
@@ -244,6 +283,17 @@ class CmdVelGuard:
                 False,
             )
 
+        # Preserve the actual follower-status validation failure even though
+        # that failure also invalidates the cached raw command.
+        if self._path_status_error is not None:
+            return (
+                ModuleStatus.FAILED,
+                False,
+                0.0,
+                self._path_status_error,
+                False,
+            )
+
         raw_age = self._age(self._last_raw_cmd_time, now)
         if raw_age is None:
             return (
@@ -267,15 +317,6 @@ class CmdVelGuard:
                 False,
                 0.0,
                 "raw_cmd_vel timeout ({:.2f}s)".format(self._timeout),
-                False,
-            )
-
-        if self._path_status_error is not None:
-            return (
-                ModuleStatus.FAILED,
-                False,
-                0.0,
-                self._path_status_error,
                 False,
             )
 
@@ -308,6 +349,15 @@ class CmdVelGuard:
                 False,
             )
 
+        if self._path_status_generation != self._generation:
+            return (
+                ModuleStatus.STARTING,
+                False,
+                0.0,
+                "waiting for current-generation path_follower_status",
+                False,
+            )
+
         follower = self._path_status
         follower_failed = follower.state in (
             ModuleStatus.FAILED,
@@ -323,6 +373,15 @@ class CmdVelGuard:
             return state, False, 0.0, follower.detail, False
 
         if follower.state == ModuleStatus.RUNNING:
+            if self._raw_generation != self._generation:
+                return (
+                    ModuleStatus.TIMEOUT,
+                    False,
+                    0.0,
+                    "waiting for current-generation /competition/raw_cmd_vel",
+                    False,
+                )
+
             return (
                 ModuleStatus.RUNNING,
                 True,
@@ -377,17 +436,23 @@ class CmdVelGuard:
             now,
         )
 
-    def _invalidate_epoch_inputs_locked(self):
-        """Discard inputs that are unsafe to reuse across a ROS-time epoch."""
+    def _invalidate_raw_generation_locked(self):
+        """Make every previously accepted raw command unusable."""
         self._last_raw_cmd_time = None
+        self._raw_generation = None
         self._raw_cmd_finite = True
         self._raw_linear_x = 0.0
         self._raw_linear_y = 0.0
         self._raw_angular_z = 0.0
 
+    def _invalidate_epoch_inputs_locked(self):
+        """Discard inputs that are unsafe to reuse across a ROS-time epoch."""
+        self._invalidate_raw_generation_locked()
+
         self._last_path_status_time = None
         self._path_status_stamp = None
         self._path_status = None
+        self._path_status_generation = None
         self._path_status_error = None
 
     def _validate_path_status_stamp_locked(self, stamp, now):
