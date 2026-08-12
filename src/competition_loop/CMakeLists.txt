@@ -30,3 +30,14 @@ install(DIRECTORY launch/
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/launch
   PATTERN "__pycache__" EXCLUDE
 )
+
+# --- Tests ---
+if(CATKIN_ENABLE_TESTING)
+  find_package(catkin REQUIRED COMPONENTS rostest)
+
+  # Pure-Python unit tests (no ROS master needed)
+  catkin_add_nosetests(test/test_interface_validator.py)
+  catkin_add_nosetests(test/test_time_keeper.py)
+  catkin_add_nosetests(test/test_state_machine.py)
+  catkin_add_nosetests(test/test_result_writer.py)
+endif()
