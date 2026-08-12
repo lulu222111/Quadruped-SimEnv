@@ -1,0 +1,28 @@
+<launch>
+  <param name="/use_sim_time" value="true"/>
+
+  <node pkg="competition_mapping" type="mapping_node" name="mapping_clock_node" output="screen">
+    <param name="pointcloud_topic" value="/mapping_clock/points"/>
+    <param name="map_topic" value="/mapping_clock/map"/>
+    <param name="mapping_status_topic" value="/mapping_clock/status"/>
+    <param name="resolution" value="1.0"/>
+    <param name="map_width" value="20"/>
+    <param name="map_height" value="20"/>
+    <param name="origin_mode" value="fixed"/>
+    <param name="origin_x" value="-10.0"/>
+    <param name="origin_y" value="-10.0"/>
+    <param name="sensor_min_range" value="0.0"/>
+    <param name="sensor_max_range" value="10.0"/>
+    <param name="min_height" value="-1.0"/>
+    <param name="max_height" value="2.0"/>
+    <param name="map_publish_rate" value="10.0"/>
+    <param name="status_heartbeat_rate" value="20.0"/>
+    <param name="integration_rate" value="10.0"/>
+    <param name="odom_timeout" value="0.8"/>
+    <param name="localization_status_timeout" value="0.8"/>
+    <param name="pointcloud_timeout" value="0.8"/>
+  </node>
+
+  <test test-name="mapping_clock_rollback" pkg="competition_mapping"
+        type="test_mapping_clock_rollback.py" time-limit="45"/>
+</launch>

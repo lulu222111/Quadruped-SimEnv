@@ -1,0 +1,27 @@
+<launch>
+  <node pkg="competition_mapping" type="mapping_node" name="mapping_fault_node" output="screen">
+    <param name="pointcloud_topic" value="/mapping_faults/points"/>
+    <param name="map_topic" value="/mapping_faults/map"/>
+    <param name="mapping_status_topic" value="/mapping_faults/status"/>
+    <param name="resolution" value="1.0"/>
+    <param name="map_width" value="20"/>
+    <param name="map_height" value="20"/>
+    <param name="origin_mode" value="fixed"/>
+    <param name="origin_x" value="-10.0"/>
+    <param name="origin_y" value="-10.0"/>
+    <param name="sensor_min_range" value="0.0"/>
+    <param name="sensor_max_range" value="10.0"/>
+    <param name="min_height" value="-1.0"/>
+    <param name="max_height" value="2.0"/>
+    <param name="map_publish_rate" value="20.0"/>
+    <param name="status_heartbeat_rate" value="30.0"/>
+    <param name="integration_rate" value="20.0"/>
+    <param name="odom_timeout" value="0.6"/>
+    <param name="localization_status_timeout" value="0.6"/>
+    <param name="pointcloud_timeout" value="0.6"/>
+    <param name="tf_timeout" value="0.05"/>
+  </node>
+
+  <test test-name="mapping_faults" pkg="competition_mapping"
+        type="test_mapping_faults.py" time-limit="60"/>
+</launch>

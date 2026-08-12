@@ -18,6 +18,7 @@
   <depend>tf2_ros</depend>
 
   <test_depend>rostest</test_depend>
-
+  <test_depend>rostest</test_depend>
+  <test_depend>rospy</test_depend>
   <export/>
 </package>

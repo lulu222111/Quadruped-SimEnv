@@ -36,5 +36,8 @@ install(DIRECTORY config launch
 if(CATKIN_ENABLE_TESTING)
   find_package(rostest REQUIRED)
   catkin_add_nosetests(test/test_occupancy_grid_core.py)
+  catkin_add_nosetests(test/test_mapping_node_safety.py)
   add_rostest(test/mapping_integration.test)
+  add_rostest(test/mapping_faults.test)
+  add_rostest(test/mapping_clock_rollback.test)
 endif()
