@@ -2,8 +2,10 @@
 <package format="2">
   <name>competition_perception</name>
   <version>0.1.0</version>
-  <description>Hazard source detection using RealSense RGB-D data.
-  Distinguishes red spheres (danger) from red boxes and green spheres (distractors).</description>
+  <description>
+    Hazard source detection using RealSense RGB-D data.
+    Distinguishes red spheres (danger) from red boxes and green spheres (distractors).
+  </description>
 
   <maintainer email="baoyufei@example.com">baoyufei</maintainer>
   <license>Apache-2.0</license>
@@ -14,11 +16,15 @@
   <build_depend>sensor_msgs</build_depend>
   <build_depend>geometry_msgs</build_depend>
   <build_depend>tf2_ros</build_depend>
+  <build_depend>cv_bridge</build_depend>
+  <build_depend>message_filters</build_depend>
   <build_depend>competition_interfaces</build_depend>
 
   <exec_depend>rospy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>message_filters</exec_depend>
   <exec_depend>competition_interfaces</exec_depend>
 </package>

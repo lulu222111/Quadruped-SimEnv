@@ -58,19 +58,19 @@ RUN apt-get update \
         python3-rosdep \
         python3-vcstool \
         python3-yaml \
-        ros-nortic-rospy \
-        ros-nortic-roscpp \
-        ros-nortic-std-msgs \
-        ros-nortic-sensor-msgs \
-        ros-nortic-geometry-msgs \
+        ros-noetic-rospy \
+        ros-noetic-roscpp \
+        ros-noetic-std-msgs \
+        ros-noetic-sensor-msgs \
+        ros-noetic-geometry-msgs \
         ros-noetic-desktop-full \
         ros-noetic-cv-bridge \
-        ros-nortic-message-filters \
-        ros-nortic-message-generation \
-        ros-nortic-message-runtime \
-        ros-nortic-tf2 \
-        ros-nortic-tf2-ros \
-        ros-nortic-tf2-geometry-msgs \
+        ros-noetic-message-filters \
+        ros-noetic-message-generation \
+        ros-noetic-message-runtime \
+        ros-noetic-tf2 \
+        ros-noetic-tf2-ros \
+        ros-noetic-tf2-geometry-msgs \
         libarmadillo-dev \
         libeigen3-dev \
         liblcm-dev \

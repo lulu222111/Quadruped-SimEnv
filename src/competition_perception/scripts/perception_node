@@ -1,0 +1,1369 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+perception_node — hazard source detection using RealSense RGB-D.
+
+允许订阅的 RealSense 话题：
+  /real_sense/rgb/image_raw
+      sensor_msgs/Image
+  /real_sense/rgb/camera_info
+      sensor_msgs/CameraInfo
+  /real_sense/depth/image_raw
+      sensor_msgs/Image
+  /real_sense/depth/camera_info
+      sensor_msgs/CameraInfo
+
+
+处理流程：
+
+  1. 同步接收 RGB 图像、RGB CameraInfo、深度图像和深度 CameraInfo；
+  2. 将 RGB 图像转换到 HSV 颜色空间；
+  3. 提取红色和绿色区域；
+  4. 对颜色掩码进行形态学去噪；
+  5. 提取候选轮廓并计算面积、圆度和宽高比；
+  6. 在轮廓中心附近读取深度中值；
+  7. 使用深度 CameraInfo 将像素反投影到深度相机坐标系；
+  8. 根据颜色和形状生成 HazardCandidate；
+  9. 发布 /competition/hazard_candidates；
+ 10. 发布 /competition/perception/status。
+
+"""
+
+from __future__ import annotations
+
+import math
+
+import cv2
+import message_filters
+import numpy as np
+import rospy
+
+from cv_bridge import CvBridge, CvBridgeError
+from sensor_msgs.msg import CameraInfo, Image
+
+from competition_interfaces.msg import (
+    HazardCandidate,
+    HazardCandidateArray,
+    ModuleStatus,
+)
+#解决open_cv库冲突问题
+try:
+    original_init = CvBridge.__init__
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self.cvtype_to_name[0] = "8UC1"
+        self.cvtype_to_name[2] = "16UC1"
+        self.cvtype_to_name[5] = "32FC1"
+        self.cvtype_to_name[16] = "8UC3"
+    CvBridge.__init__ = patched_init
+except Exception:
+    pass
+
+class PerceptionNode(object):
+    """基于 RealSense RGB-D 的危险源感知节点。"""
+
+    def __init__(self):
+        rospy.init_node(
+            "perception_node",
+            log_level=rospy.INFO,
+        )
+
+        self.bridge = CvBridge()
+
+    # RealSense 话题
+        self.rgb_topic = rospy.get_param(
+            "~rgb_topic",
+            "/real_sense/rgb/image_raw",
+        )
+
+        self.rgb_info_topic = rospy.get_param(
+            "~rgb_info_topic",
+            "/real_sense/rgb/camera_info",
+        )
+
+        self.depth_topic = rospy.get_param(
+            "~depth_topic",
+            "/real_sense/depth/image_raw",
+        )
+
+        self.depth_info_topic = rospy.get_param(
+            "~depth_info_topic",
+            "/real_sense/depth/camera_info",
+        )
+
+    # 输出话题
+        self.candidate_pub = rospy.Publisher(
+            "/competition/hazard_candidates",
+            HazardCandidateArray,
+            queue_size=10,
+        )
+
+        self.status_pub = rospy.Publisher(
+            "/competition/perception/status",
+            ModuleStatus,
+            queue_size=10,
+            latch=True,
+        )
+
+
+    # 算法参数
+        # 轮廓面积阈值，面积过小的区域不作为候选
+        self.min_contour_area = rospy.get_param(
+            "~min_contour_area",
+            150.0,
+        )
+
+        # RealSense 深度有效测距范围，单位：米
+        self.min_depth = rospy.get_param(
+            "~min_depth",
+            0.4,
+        )
+
+        self.max_depth = rospy.get_param(
+            "~max_depth",
+            8.0,
+        )
+
+        # HSV 红色阈值
+        self.red_lower_1 = np.array(
+            [0, 80, 60],
+            dtype=np.uint8,
+        )
+        self.red_upper_1 = np.array(
+            [10, 255, 255],
+            dtype=np.uint8,
+        )
+
+        self.red_lower_2 = np.array(
+            [170, 80, 60],
+            dtype=np.uint8,
+        )
+        self.red_upper_2 = np.array(
+            [179, 255, 255],
+            dtype=np.uint8,
+        )
+
+        # HSV 绿色阈值
+        self.green_lower = np.array(
+            [35, 60, 50],
+            dtype=np.uint8,
+        )
+        self.green_upper = np.array(
+            [90, 255, 255],
+            dtype=np.uint8,
+        )
+
+        # 同步订阅 RGB、RGB CameraInfo、深度和深度 CameraInfo
+        rgb_sub = message_filters.Subscriber(
+            self.rgb_topic,
+            Image,
+        )
+
+        rgb_info_sub = message_filters.Subscriber(
+            self.rgb_info_topic,
+            CameraInfo,
+        )
+
+        depth_sub = message_filters.Subscriber(
+            self.depth_topic,
+            Image,
+        )
+
+        depth_info_sub = message_filters.Subscriber(
+            self.depth_info_topic,
+            CameraInfo,
+        )
+        self.sync = message_filters.ApproximateTimeSynchronizer(
+            [
+                rgb_sub,
+                rgb_info_sub,
+                depth_sub,
+                depth_info_sub,
+            ],
+            queue_size=20,
+            slop=0.20,
+            allow_headerless=False,
+        )
+
+        self.sync.registerCallback(self.image_callback)
+        # 输入 freshness 和 watchdog 参数。
+        self.input_timeout_sec = rospy.get_param(
+            "~input_timeout_sec",
+            1.0,
+        )
+        self.watchdog_period_sec = rospy.get_param(
+            "~watchdog_period_sec",
+            0.1,
+        )
+        self.future_stamp_tolerance_sec = rospy.get_param(
+            "~future_stamp_tolerance_sec",
+            0.5,
+        )
+
+        # 最近一次成功处理的同步 RGB-D
+        self.last_valid_receive_time = None
+        self.last_valid_observation_stamp = None
+
+        # 区分 timeout 前后的输入
+        self.timed_out = False
+        self.timeout_reference_stamp = None
+
+        # 检测 ROS /clock 回退。
+        self.last_clock_time = rospy.Time(0)
+
+        # 启动阶段没有任何输入时的 timeout 判断。
+        self.start_time = rospy.Time.now()
+
+        self.watchdog_timer = rospy.Timer(
+            rospy.Duration(self.watchdog_period_sec),
+            self.watchdog_callback,
+        )
+        self.publish_status(
+            ModuleStatus.STARTING,
+            False,
+            0.0,
+            (
+                "waiting for synchronized RGB image, RGB CameraInfo, "
+                "depth image and depth CameraInfo"
+            ),
+        )
+
+        rospy.loginfo("perception_node started")
+        rospy.loginfo("RGB image topic: %s", self.rgb_topic)
+        rospy.loginfo("RGB CameraInfo topic: %s", self.rgb_info_topic)
+        rospy.loginfo("Depth image topic: %s", self.depth_topic)
+        rospy.loginfo(
+            "Depth CameraInfo topic: %s",
+            self.depth_info_topic,
+        )
+        rospy.loginfo(
+            "Output candidate topic: /competition/hazard_candidates"
+        )
+        rospy.loginfo(
+            "Output status topic: /competition/perception/status"
+        )
+
+    # 状态发布
+
+    def publish_status(
+        self,
+        state,
+        valid,
+        confidence,
+        detail,
+    ):
+        """发布感知模块状态。"""
+
+        msg = ModuleStatus()
+
+        msg.header.stamp = rospy.Time.now()
+        msg.state = state
+        msg.valid = bool(valid)
+
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            confidence_value = 0.0
+
+        if not math.isfinite(confidence_value):
+            confidence_value = 0.0
+
+        # 防止 confidence 超出 [0, 1]
+        msg.confidence = max(
+            0.0,
+            min(1.0, confidence_value),
+        )
+
+        msg.detail = str(detail)
+        self.status_pub.publish(msg)
+
+
+    def valid_camera_info(self, camera_info, name):
+        """
+        检查 CameraInfo 是否包含可用的内参和坐标系。
+        必要条件：
+
+          - K 至少包含 9 个元素；
+          - fx、fy 有限且大于 0；
+          - frame_id 非空。
+        """
+
+        if camera_info is None:
+            return False
+
+        if len(camera_info.K) < 9:
+            rospy.logwarn_throttle(
+                5.0,
+                "%s CameraInfo.K has fewer than 9 elements",
+                name,
+            )
+            return False
+        try:
+            fx = float(camera_info.K[0])
+            fy = float(camera_info.K[4])
+            cx = float(camera_info.K[2])
+            cy = float(camera_info.K[5])
+        except(TypeError,ValueError):
+            rospy.logwarn_throttle(
+                5.0,
+                "%s CameraInfo intrinsics are not numeric",
+                name,
+            )
+            return False
+
+        if not all(math.isfinite(value) for value in(fx,fy,cx,cy) ):
+            rospy.logwarn_throttle(
+                5.0,
+                "%s CameraInfo focal length is not finite",
+                name,
+            )
+            return False
+
+        if fx <= 0.0 or fy <= 0.0:
+            rospy.logwarn_throttle(
+                5.0,
+                (
+                    "%s CameraInfo has invalid focal length: "
+                    "fx=%f fy=%f"
+                ),
+                name,
+                fx,
+                fy,
+            )
+            return False
+
+        if not camera_info.header.frame_id:
+            rospy.logwarn_throttle(
+                5.0,
+                "%s CameraInfo has empty frame_id",
+                name,
+            )
+            return False
+
+        return True
+    def check_clock(self):
+        """
+        检测 ROS /clock 是否发生回退。
+
+        返回：
+            True  - 当前 ROS 时间正常；
+            False - 检测到时间回退。
+        """
+
+        now = rospy.Time.now()
+
+        if (
+            self.last_clock_time != rospy.Time(0)
+            and now < self.last_clock_time
+        ):
+            self.last_valid_receive_time = None
+            self.last_valid_observation_stamp = None
+            self.timed_out = True
+            self.timeout_reference_stamp = None
+            self.start_time = now
+
+            self.publish_status(
+                ModuleStatus.TIMEOUT,
+                False,
+                0.0,
+                "ROS clock moved backward; waiting for fresh RGB-D",
+            )
+
+            self.last_clock_time = now
+            return False
+
+        self.last_clock_time = now
+        return True
+
+    def valid_observation_stamp(self, stamp, name):
+        """
+        检查观测时间戳是否可用于正式输出。
+        拒绝：
+        - zero stamp；
+        - 明显未来时间戳。
+        """
+
+        if stamp is None or stamp == rospy.Time(0):
+            rospy.logwarn_throttle(
+                5.0,
+                "%s has zero timestamp",
+                name,
+            )
+            return False
+
+        now = rospy.Time.now()
+
+        # 仿真刚启动、/clock 仍为 0 时，不做 future 判断。
+        if now != rospy.Time(0):
+            future_limit = now + rospy.Duration(
+                self.future_stamp_tolerance_sec
+            )
+
+            if stamp > future_limit:
+                rospy.logwarn_throttle(
+                    5.0,
+                    (
+                        "%s timestamp is too far in the future: "
+                        "stamp=%.6f now=%.6f"
+                    ),
+                    name,
+                    stamp.to_sec(),
+                    now.to_sec(),
+                )
+                return False
+
+        return True
+    # RGB-D 同步回调
+    def image_callback(
+        self,
+        rgb_msg,
+        rgb_info_msg,
+        depth_msg,
+        depth_info_msg,
+    ):
+        """
+        同步处理：
+          - RGB 图像；
+          - RGB CameraInfo；
+          - 深度图像；
+          - 深度 CameraInfo。
+        """
+        if not self.check_clock():
+            return
+
+        observation_stamp = depth_msg.header.stamp
+
+        # 所有参与 RGB-D 配对的消息都必须有有效时间戳。
+        for stamp, name in (
+            (rgb_msg.header.stamp, "RGB image"),
+            (rgb_info_msg.header.stamp, "RGB CameraInfo"),
+            (depth_msg.header.stamp, "depth image"),
+            (depth_info_msg.header.stamp, "depth CameraInfo"),
+        ):
+            if not self.valid_observation_stamp(stamp, name):
+                self.publish_status(
+                    ModuleStatus.FAILED,
+                    False,
+                    0.0,
+                    "{} has invalid timestamp".format(name),
+                )
+                return
+
+        # 由深度图像产生三维位置，此使用 Depth CameraInfo 的 frame。
+        observation_frame = depth_info_msg.header.frame_id
+
+        if not observation_frame:
+            self.publish_status(
+                ModuleStatus.FAILED,
+                False,
+                0.0,
+                "depth CameraInfo has empty frame_id",
+            )
+            return
+
+        # 深度图和 Depth CameraInfo 如果都提供 frame，应保持一致。
+        if (
+            depth_msg.header.frame_id
+            and depth_msg.header.frame_id != observation_frame
+        ):
+            self.publish_status(
+                ModuleStatus.FAILED,
+                False,
+                0.0,
+                (
+                    "depth image and depth CameraInfo frame_id "
+                    "do not match"
+                ),
+            )
+            return
+
+        if not self.valid_camera_info(
+            rgb_info_msg,
+            "RGB",
+        ):
+            self.publish_status(
+                ModuleStatus.STARTING,
+                False,
+                0.0,
+                "invalid RGB CameraInfo",
+            )
+            return
+
+        if not self.valid_camera_info(
+            depth_info_msg,
+            "depth",
+        ):
+            self.publish_status(
+                ModuleStatus.STARTING,
+                False,
+                0.0,
+                "invalid depth CameraInfo",
+            )
+            return
+
+        # timeout 之后，旧观测不能恢复模块。
+        if (
+            self.timed_out
+            and self.timeout_reference_stamp is not None
+            and observation_stamp <= self.timeout_reference_stamp
+        ):
+            rospy.logwarn_throttle(
+                5.0,
+                (
+                    "ignoring stale RGB-D observation after timeout: "
+                    "stamp=%.6f reference=%.6f"
+                ),
+                observation_stamp.to_sec(),
+                self.timeout_reference_stamp.to_sec(),
+            )
+            return
+
+        try:
+            bgr_image = self.bridge.imgmsg_to_cv2(
+                rgb_msg,
+                desired_encoding="bgr8",
+            )
+
+            depth_image = self.depth_to_meters(depth_msg)
+
+        except CvBridgeError as exc:
+            rospy.logwarn_throttle(
+                2.0,
+                "cv_bridge conversion failed: %s",
+                str(exc),
+            )
+
+            self.publish_status(
+                ModuleStatus.FAILED,
+                False,
+                0.0,
+                "cv_bridge conversion failed",
+            )
+            return
+
+        if bgr_image is None or depth_image is None:
+            self.publish_status(
+                ModuleStatus.FAILED,
+                False,
+                0.0,
+                "RGB or depth image conversion returned empty data",
+            )
+            return
+
+        if bgr_image.size == 0 or depth_image.size == 0:
+            self.publish_status(
+                ModuleStatus.FAILED,
+                False,
+                0.0,
+                "RGB or depth image is empty",
+            )
+            return
+
+        if depth_image.ndim !=2:
+            self.publish_status(
+                ModuleStatus.FAILED,
+                False,
+                0.0,
+                "depth image does not have two dimensions",
+            )
+            return
+
+        if bgr_image.ndim != 3 or bgr_image.shape[2] != 3:
+            self.publish_status(
+                ModuleStatus.FAILED,
+                False,
+                0.0,
+                "RGB image is not a 3-channel BGR image",
+            )
+            return
+
+        # 检查 RGB CameraInfo 与 RGB 图像尺寸是否一致
+        if (
+            rgb_info_msg.width > 0
+            and rgb_info_msg.height > 0
+            and (
+                rgb_info_msg.width != bgr_image.shape[1]
+                or rgb_info_msg.height != bgr_image.shape[0]
+            )
+        ):
+            rospy.logwarn_throttle(
+                5.0,
+                (
+                    "RGB CameraInfo size %dx%d differs from "
+                    "image size %dx%d"
+                ),
+                rgb_info_msg.width,
+                rgb_info_msg.height,
+                bgr_image.shape[1],
+                bgr_image.shape[0],
+            )
+
+        # 检查深度 CameraInfo 与深度图像尺寸是否一致
+        if (
+            depth_info_msg.width > 0
+            and depth_info_msg.height > 0
+            and (
+                depth_info_msg.width != depth_image.shape[1]
+                or depth_info_msg.height != depth_image.shape[0]
+            )
+        ):
+            rospy.logwarn_throttle(
+                5.0,
+                (
+                    "Depth CameraInfo size %dx%d differs from "
+                    "image size %dx%d"
+                ),
+                depth_info_msg.width,
+                depth_info_msg.height,
+                depth_image.shape[1],
+                depth_image.shape[0],
+            )
+
+        try:
+            candidates = self.detect_objects(
+                bgr_image=bgr_image,
+                depth_image=depth_image,
+                rgb_camera_info=rgb_info_msg,
+                depth_camera_info=depth_info_msg,
+                observation_stamp=observation_stamp,
+                observation_frame=observation_frame,
+            )
+        except (cv2.error, ValueError, TypeError) as exc:
+            rospy.logwarn_throttle(
+                2.0,
+                "perception algorithm failed: %s",
+                str(exc),
+            )
+
+            self.publish_status(
+                ModuleStatus.FAILED,
+                False,
+                0.0,
+                "perception algorithm failed",
+            )
+            return
+
+        array_msg = HazardCandidateArray()
+
+        # 数组与 candidate 使用同一个实际观测时间。
+        array_msg.header.stamp = observation_stamp
+
+        # 数组 frame 与 candidate frame 必须一致。
+        array_msg.header.frame_id = observation_frame
+        array_msg.candidates = candidates
+
+        self.candidate_pub.publish(array_msg)
+
+        # 只要 RGB-D 和算法本身正常，模块就是 valid。
+        # position_valid 只描述单个 candidate 的三维位置。
+        frame_confidence = max(
+            (
+                self.clamp_confidence(candidate.confidence)
+                for candidate in candidates
+            ),
+            default=0.0,
+        )
+
+        if not candidates:
+            detail = (
+                "RGB-D perception is ready; "
+                "no candidate detected"
+            )
+        elif any(
+            candidate.position_valid
+            for candidate in candidates
+        ):
+            detail = (
+                "RGB-D perception is ready and "
+                "detecting candidates"
+            )
+        else:
+            detail = (
+                "RGB-D perception is ready; candidates "
+                "detected but positions are invalid"
+            )
+
+        self.publish_status(
+            ModuleStatus.RUNNING,
+            True,
+            frame_confidence,
+            detail,
+        )
+
+        # 只有完整成功处理的新同步 RGB-D 才更新 freshness
+        self.last_valid_receive_time = rospy.Time.now()
+        self.last_valid_observation_stamp = observation_stamp
+
+        if self.timed_out:
+            self.timed_out = False
+            self.timeout_reference_stamp = None
+
+            rospy.loginfo(
+                "perception recovered with fresh RGB-D observation"
+            )  
+
+    def clamp_confidence(self, confidence):
+        """将置信度限制为有限的 [0, 1] 数值。"""
+
+        try:
+            value = float(confidence)
+        except (TypeError, ValueError):
+            return 0.0
+
+        if not math.isfinite(value):
+            return 0.0
+
+        return max(
+            0.0,
+            min(1.0, value),
+        )
+
+    def watchdog_callback(self, _event):
+        """检测 RGB-D 输入是否超时。"""
+
+        if not self.check_clock():
+            return
+        now = rospy.Time.now()
+        if self.start_time == rospy.Time(0) and now != rospy.Time(0):
+            self.start_time = now
+
+        if self.last_valid_receive_time is None:
+            if (
+                now != rospy.Time(0)
+                and self.start_time != rospy.Time(0)
+                and (
+                    now - self.start_time
+                ).to_sec() > self.input_timeout_sec
+                and not self.timed_out
+            ):
+                self.timed_out = True
+                self.timeout_reference_stamp = None
+
+                self.publish_status(
+                    ModuleStatus.TIMEOUT,
+                    False,
+                    0.0,
+                    (
+                        "synchronized RGB-D input timeout; "
+                        "waiting for first valid observation"
+                    ),
+                )
+
+            return
+
+        age_sec = (
+            now - self.last_valid_receive_time
+        ).to_sec()
+
+        if (
+            age_sec > self.input_timeout_sec
+            and not self.timed_out
+        ):
+            self.timed_out = True
+            self.timeout_reference_stamp = (
+                self.last_valid_observation_stamp
+            )
+
+            self.publish_status(
+                ModuleStatus.TIMEOUT,
+                False,
+                0.0,
+                "synchronized RGB-D input timeout",
+            )
+
+    # 深度转换
+    def depth_to_meters(self, depth_msg):
+        """
+        将 ROS 深度图像转换为单位为米的 float32 数组。
+        16UC1 / mono16:
+            单位为毫米，需要除以 1000。
+        32FC1 / 32FC:
+            单位为米。
+        """
+        encoding = depth_msg.encoding.lower()
+
+        if encoding in ("16uc1", "mono16"):
+            depth = self.bridge.imgmsg_to_cv2(
+                depth_msg,
+                desired_encoding="passthrough",
+            )
+
+            depth = np.asarray(
+                depth,
+                dtype=np.float32,
+            ) / 1000.0
+
+        elif encoding in ("32fc1", "32fc"):
+            depth = self.bridge.imgmsg_to_cv2(
+                depth_msg,
+                desired_encoding="passthrough",
+            )
+
+            depth = np.asarray(
+                depth,
+                dtype=np.float32,
+            )
+
+        else:
+            rospy.logwarn_throttle(
+                5.0,
+                "unsupported depth encoding: %s",
+                depth_msg.encoding,
+            )
+            return None
+
+        # 清理 NaN 和无穷大
+        depth[~np.isfinite(depth)] = 0.0
+
+        return depth
+
+    # 颜色检测
+    def detect_objects(
+        self,
+        bgr_image,
+        depth_image,
+        rgb_camera_info,
+        depth_camera_info,
+        observation_stamp,
+        observation_frame,
+    ):
+        """从 RGB 图像中提取红色和绿色目标。"""
+
+        del rgb_camera_info
+
+        hsv_image = cv2.cvtColor(
+            bgr_image,
+            cv2.COLOR_BGR2HSV,
+        )
+
+        # 红色掩码。
+        red_mask_1 = cv2.inRange(
+            hsv_image,
+            self.red_lower_1,
+            self.red_upper_1,
+        )
+
+        red_mask_2 = cv2.inRange(
+            hsv_image,
+            self.red_lower_2,
+            self.red_upper_2,
+        )
+
+        red_mask = cv2.bitwise_or(
+            red_mask_1,
+            red_mask_2,
+        )
+
+        # 绿色掩码。
+        green_mask = cv2.inRange(
+            hsv_image,
+            self.green_lower,
+            self.green_upper,
+        )
+
+        # 形态学去噪
+        red_mask = self.clean_mask(red_mask)
+        green_mask = self.clean_mask(green_mask)
+
+        candidates = []
+
+        candidates.extend(
+            self.detect_from_mask(
+                mask=red_mask,
+                color_name="red",
+                depth_image=depth_image,
+                depth_camera_info=depth_camera_info,
+                rgb_shape=bgr_image.shape,
+                observation_stamp=observation_stamp,
+                observation_frame=observation_frame,
+            )
+        )
+
+        candidates.extend(
+            self.detect_from_mask(
+                mask=green_mask,
+                color_name="green",
+                depth_image=depth_image,
+                depth_camera_info=depth_camera_info,
+                rgb_shape=bgr_image.shape,
+                observation_stamp=observation_stamp,
+                observation_frame=observation_frame,
+            )
+        )
+
+        return candidates
+
+    def clean_mask(self, mask):
+        """对颜色掩码进行形态学去噪。"""
+
+        kernel = np.ones(
+            (5, 5),
+            np.uint8,
+        )
+
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_OPEN,
+            kernel,
+            iterations=1,
+        )
+
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            kernel,
+            iterations=2,
+        )
+
+        return mask
+
+    # 轮廓检测和候选生成
+
+    def detect_from_mask(
+        self,
+        mask,
+        color_name,
+        depth_image,
+        depth_camera_info,
+        rgb_shape,
+        observation_stamp,
+        observation_frame,
+    ):
+        """从单个颜色掩码中提取轮廓并生成候选消息。"""
+
+        contours_result = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        contours = contours_result[-2]
+        detections = []
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+
+            if area < self.min_contour_area:
+                continue
+
+            # 计算外接矩形。
+            _, _, width, height = cv2.boundingRect(contour)
+
+            if width <= 0 or height <= 0:
+                continue
+
+            # 计算轮廓周长和圆度。
+            perimeter = cv2.arcLength(
+                contour,
+                True,
+            )
+
+            if perimeter <= 0.0:
+                continue
+
+            circularity = 4.0 * math.pi * area / (perimeter * perimeter)
+            aspect_ratio = float(width) / float(height)
+
+            (cx,cy),radius = cv2.minEnclosingCircle(contour)
+            circle_area = math.pi * radius *radius
+            circle_ratio = area / circle_area if circle_area > 0 else 0.0
+
+            # 计算轮廓质心。
+            moments = cv2.moments(contour)
+
+            if abs(moments["m00"]) < 1e-6:
+                continue
+
+            center_u = moments["m10"] / moments["m00"]
+            center_v = moments["m01"] / moments["m00"]
+
+            # 读取轮廓中心附近的有效深度中值。
+            depth_value = self.robust_depth(
+                depth_image=depth_image,
+                center_u=center_u,
+                center_v=center_v,
+                width=width,
+                height=height,
+                rgb_shape=rgb_shape,
+            )
+            depth_valid = (
+                depth_value is not None
+                and math.isfinite(depth_value)
+                and self.min_depth <= depth_value <= self.max_depth
+            )
+            point = None
+            if depth_valid:
+                point = self.project_to_3d(
+                    center_u=center_u,
+                    center_v=center_v,
+                    depth_value=depth_value,
+                    depth_shape=depth_image.shape,
+                    rgb_shape=rgb_shape,
+                    depth_camera_info=depth_camera_info,
+                )
+
+
+            position_valid = (
+                point is not None
+                and all(
+                    math.isfinite(value)
+                    for value in point
+                )
+            )
+
+            if not position_valid:
+                point = (0.0, 0.0, 0.0)
+
+            label = self.classify_object(
+                color_name=color_name,
+                circularity=circularity,
+                aspect_ratio=aspect_ratio,
+                width=width,
+                height=height,
+                depth_value=depth_value,
+                depth_camera_info=depth_camera_info,
+                depth_shape=depth_image.shape,
+                rgb_shape=rgb_shape,
+                circle_ratio=circle_ratio,
+            )
+
+            confidence = self.calculate_confidence(
+                area=area,
+                circularity=circularity,
+                aspect_ratio=aspect_ratio,
+                position_valid=position_valid,
+                label=label,
+            )
+
+            candidate = HazardCandidate()
+
+            candidate.header.stamp = observation_stamp
+            candidate.header.frame_id = observation_frame
+
+            candidate.position.x = point[0]
+            candidate.position.y = point[1]
+            candidate.position.z = point[2]
+
+            candidate.label = label
+            candidate.confidence = self.clamp_confidence(confidence)
+            candidate.position_valid = position_valid
+
+            detections.append(candidate)
+
+        return detections
+
+    # 深度读取
+
+    def robust_depth(
+        self,
+        depth_image,
+        center_u,
+        center_v,
+        width,
+        height,
+        rgb_shape,
+    ):
+        """获取目标中心区域的有效深度中值。"""
+
+        depth_height, depth_width = depth_image.shape[:2]
+        rgb_height, rgb_width = rgb_shape[:2]
+
+        if rgb_width <= 0 or rgb_height <= 0:
+            return None
+
+        # 当前实现假设 RGB 和深度图像已对齐，
+        # 这里按照图像尺寸比例将 RGB 像素映射到深度图。
+        scale_x = float(depth_width) / float(rgb_width)
+        scale_y = float(depth_height) / float(rgb_height)
+
+        u = int(round(center_u * scale_x))
+        v = int(round(center_v * scale_y))
+
+        # 防止中心点落到图像边界外。
+        u = max(0, min(depth_width - 1, u))
+        v = max(0, min(depth_height - 1, v))
+
+        half_w = max(
+            2,
+            int(round(width * scale_x * 0.2)),
+        )
+
+        half_h = max(
+            2,
+            int(round(height * scale_y * 0.2)),
+        )
+
+        u0 = max(0, u - half_w)
+        u1 = min(depth_width, u + half_w + 1)
+
+        v0 = max(0, v - half_h)
+        v1 = min(depth_height, v + half_h + 1)
+
+        if u0 >= u1 or v0 >= v1:
+            return None
+
+        roi = depth_image[v0:v1, u0:u1]
+
+        valid = roi[
+            np.isfinite(roi)
+            & (roi >= self.min_depth)
+            & (roi <= self.max_depth)
+        ]
+
+        if valid.size == 0:
+            return None
+
+        return float(np.median(valid))
+
+    # 三维反投影
+    def project_to_3d(
+        self,
+        center_u,
+        center_v,
+        depth_value,
+        depth_shape,
+        rgb_shape,
+        depth_camera_info,
+    ):
+        """
+        将 RGB 图像中的像素点反投影到深度相机坐标系。
+
+        针孔相机模型：
+
+            X = (u - cx) * Z / fx
+            Y = (v - cy) * Z / fy
+            Z = depth
+        ROS optical frame 约定：
+
+            X 向右；
+            Y 向下；
+            Z 向前。
+
+        注意：
+        当前实现假设 RGB 图像和深度图已经对齐，
+        使用图像尺寸比例将 RGB 像素映射到深度图像像素。
+        """
+        if (
+            depth_shape is None
+            or rgb_shape is None
+            or len(depth_shape) < 2
+            or len(rgb_shape) < 2
+        ):
+            return None
+
+        depth_height, depth_width = depth_shape[:2]
+        rgb_height, rgb_width = rgb_shape[:2]
+
+        if (
+            depth_width <= 0
+            or depth_height <= 0
+            or rgb_width <= 0
+            or rgb_height <= 0
+        ):
+            return None
+
+        if (
+            depth_value is None
+            or not math.isfinite(depth_value)
+            or depth_value < self.min_depth
+            or depth_value > self.max_depth
+        ):
+            return None
+
+        if depth_camera_info is None or len(depth_camera_info.K) < 9:
+            return None
+        # CameraInfo.K：
+
+        # [fx,  0, cx,
+        #   0, fy, cy,
+        #   0,  0,  1]
+
+        try:
+            fx = float(depth_camera_info.K[0])
+            fy = float(depth_camera_info.K[4])
+            cx = float(depth_camera_info.K[2])
+            cy = float(depth_camera_info.K[5])
+        except (TypeError, ValueError):
+            return None
+
+        if not all(
+            math.isfinite(value)
+            for value in (fx, fy, cx, cy)
+        ):
+            return None
+
+        if fx <= 0.0 or fy <= 0.0:
+            return None
+
+        if not math.isfinite(center_u) or not math.isfinite(center_v):
+            return None
+
+        # RGB 像� 坐� �� 射到 Depth 图像的像� 坐� �。
+        depth_u = (
+            float(center_u)
+            * float(depth_width)
+            / float(rgb_width)
+        )
+        depth_v = (
+            float(center_v)
+            * float(depth_height)
+            / float(rgb_height)
+        )
+
+        if not math.isfinite(depth_u) or not math.isfinite(depth_v):
+            return None
+
+        x = (depth_u - cx) * depth_value / fx
+        y = (depth_v - cy) * depth_value / fy
+        z = depth_value
+
+        if not all(
+            math.isfinite(value)
+            for value in (x, y, z)
+        ):
+            return None
+
+        return (
+            float(x),
+            float(y),
+            float(z),
+        )
+
+    # 目标分类
+    def classify_object(
+        self,
+        color_name,
+        circularity,
+        aspect_ratio,
+        width,
+        height,
+        depth_value,
+        depth_camera_info,
+        depth_shape,
+        rgb_shape,
+        circle_ratio=0.0,
+    ):  
+        """生成危险源语义标签。"""
+
+        # 绿色球体属于干扰目标
+        if color_name == "green":
+            return "green_sphere"
+        try:
+            fx = float(depth_camera_info.K[0])
+            fy = float(depth_camera_info.K[4])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            fx = 0.0
+            fy = 0.0
+
+        if (
+            depth_value is not None
+            and math.isfinite(depth_value)
+            and depth_value > 0.0
+            and math.isfinite(fx)
+            and math.isfinite(fy)
+            and fx > 0.0
+            and fy > 0.0
+        ):
+            depth_width = float(depth_shape[1])
+            depth_height = float(depth_shape[0])
+            rgb_width = float(rgb_shape[1])
+            rgb_height = float(rgb_shape[0])
+
+            if rgb_width > 0 and rgb_height > 0:
+                width_depth = float(width) * depth_width / rgb_width
+                height_depth = float(height) * depth_height / rgb_height
+
+                diameter_x = float(width_depth)* depth_value / fx
+                diameter_y = float(height_depth)* depth_value / fy
+
+                diameter = 0.5 * (diameter_x + diameter_y)
+            else:
+                diameter = 0.0
+        else:
+            diameter = 0.0 
+
+        is_circle = (
+            (circularity >= 0.68 or circle_ratio >=0.72)
+            and 0.70 <= aspect_ratio <= 1.43
+        )
+        if diameter > 0.0:
+            sphere_shape = (
+                # 1. 深度有效：同时使用 2D 形状和 3D 物理直径判定
+                is_circle
+                and 0.20 <= diameter <= 0.42
+            )
+        else:
+            sphere_shape = is_circle
+
+        if sphere_shape:
+            return "red_sphere"
+        # 其他红色区域判为红色方块干扰源。
+        return "red_box"
+
+
+    # 置信度计算
+    def calculate_confidence(
+        self,
+        area,
+        circularity,
+        aspect_ratio,
+        position_valid,
+        label,
+    ):
+        """根据面积、形状和深度有效性计算 [0, 1] 置信度。"""
+
+        area_score = min(
+            1.0,
+            float(area) / 3000.0,
+        )
+        circularity_score = max(
+            0.0,
+            min(1.0, circularity),
+        )
+
+        # 宽高比越接近 1，aspect_score 越高。
+        aspect_score = max(
+            0.0,
+            1.0 - min(
+                1.0,
+                abs(1.0 - aspect_ratio),
+            ),
+        )
+
+        depth_score = 1.0 if position_valid else 0.25
+
+        if label in (
+            "red_sphere",
+            "green_sphere",
+        ):
+            # 球体更重视圆度和宽高比。
+            shape_score = (
+                0.45 * circularity_score
+                + 0.30 * aspect_score
+                + 0.25 * depth_score
+            )
+        else:
+            # 方块等非圆形目标。
+            shape_score = (
+                0.35 * (1.0 - circularity_score)
+                + 0.35 * aspect_score
+                + 0.30 * depth_score
+            )
+
+        confidence = (
+            0.20 * area_score
+            + 0.65 * shape_score
+            + 0.15 * depth_score
+        )
+        return self.clamp_confidence(confidence)  
+
+    # ROS 事件循环
+    def spin(self):
+        """进入 ROS 事件循环，等待订阅回调。"""
+
+        rospy.spin()
+
+if __name__ == "__main__":
+    node = PerceptionNode()
+    node.spin()

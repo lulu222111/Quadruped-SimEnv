@@ -438,7 +438,7 @@ class PerceptionNode(object):
                 )
                 return
 
-        # 由深度图像产生三维位置，� 此使用 Depth CameraInfo 的 frame。
+        # 由深度图像产生三维位置，此使用 Depth CameraInfo 的 frame。
         observation_frame = depth_info_msg.header.frame_id
 
         if not observation_frame:
@@ -523,7 +523,7 @@ class PerceptionNode(object):
             )
 
             self.publish_status(
-                ModuleStatus.ERROR,
+                ModuleStatus.FAILED,
                 False,
                 0.0,
                 "cv_bridge conversion failed",
@@ -532,7 +532,7 @@ class PerceptionNode(object):
 
         if bgr_image is None or depth_image is None:
             self.publish_status(
-                ModuleStatus.DEGRADED,
+                ModuleStatus.FAILED,
                 False,
                 0.0,
                 "RGB or depth image conversion returned empty data",
@@ -541,18 +541,28 @@ class PerceptionNode(object):
 
         if bgr_image.size == 0 or depth_image.size == 0:
             self.publish_status(
-                ModuleStatus.DEGRADED,
+                ModuleStatus.FAILED,
                 False,
                 0.0,
                 "RGB or depth image is empty",
             )
             return
 
+        if depth_image.ndim !=2:
             self.publish_status(
                 ModuleStatus.FAILED,
                 False,
                 0.0,
                 "depth image does not have two dimensions",
+            )
+            return
+
+        if bgr_image.ndim != 3 or bgr_image.shape[2] != 3:
+            self.publish_status(
+                ModuleStatus.FAILED,
+                False,
+                0.0,
+                "RGB image is not a 3-channel BGR image",
             )
             return
 
@@ -578,27 +588,6 @@ class PerceptionNode(object):
             )
 
         # 检查深度 CameraInfo 与深度图像尺寸是否一致
-        if (
-            depth_info_msg.width > 0
-            and depth_info_msg.height > 0
-            and (
-                depth_info_msg.width != depth_image.shape[1]
-                or depth_info_msg.height != depth_image.shape[0]
-            )
-        ):
-            rospy.logwarn_throttle(
-                5.0,
-                (
-                    "Depth CameraInfo size %dx%d differs from "
-                    "image size %dx%d"
-                ),
-                depth_info_msg.width,
-                depth_info_msg.height,
-                depth_image.shape[1],
-                depth_image.shape[0],
-            )
-
-        # 检查 Depth CameraInfo 与深度图像尺寸是否一致。
         if (
             depth_info_msg.width > 0
             and depth_info_msg.height > 0
@@ -723,9 +712,9 @@ class PerceptionNode(object):
 
         if not self.check_clock():
             return
+        now = rospy.Time.now()
         if self.start_time == rospy.Time(0) and now != rospy.Time(0):
             self.start_time = now
-        now = rospy.Time.now()
 
         if self.last_valid_receive_time is None:
             if (
@@ -1260,8 +1249,14 @@ class PerceptionNode(object):
             and fx > 0.0
             and fy > 0.0
         ):
-            scale_x = float(depth_shape[1]) / float(rgb_shape[1])
-            scale_y = float(depth_shape[0]) / float(rgb_shape[0])
+            depth_width = float(depth_shape[1])
+            depth_height = float(depth_shape[0])
+            rgb_width = float(rgb_shape[1])
+            rgb_height = float(rgb_shape[0])
+
+            width_depth = float(width) * depth_width / rgb_width
+            height_depth = float(height) * depth_height / rgb_height
+
             diameter_x = float(width)* depth_value / fx
             diameter_y = float(height)* depth_value / fy
 

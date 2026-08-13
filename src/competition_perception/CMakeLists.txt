@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.0.2)
+
 project(competition_perception)
 
 find_package(catkin REQUIRED COMPONENTS
@@ -6,6 +7,8 @@ find_package(catkin REQUIRED COMPONENTS
   sensor_msgs
   geometry_msgs
   tf2_ros
+  cv_bridge
+  message_filters
   competition_interfaces
 )
 
@@ -15,11 +18,13 @@ catkin_package(
   sensor_msgs
   geometry_msgs
   tf2_ros
+  cv_bridge
+  message_filters
   competition_interfaces
 )
 
-install(DIRECTORY scripts
-  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
-  PATTERN "__pycache__" EXCLUDE
-  PATTERN "*.pyc" EXCLUDE
+catkin_install_python(
+  PROGRAMS
+    scripts/perception_node
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
