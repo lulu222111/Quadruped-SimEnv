@@ -94,6 +94,7 @@ class MappingNode:
         # OccupancyGrid message was being constructed outside the lock.
         self._map_version = 0
         self._fault_active = False
+        self._fault_state = ModuleStatus.BLOCKED
         self._fault_detail = "waiting for inputs"
         self._healthy_inputs_since: Optional[rospy.Time] = None
         self._last_ros_time: Optional[rospy.Time] = None
@@ -236,17 +237,35 @@ class MappingNode:
             )
             self._last_status_received_at = now
             if not valid_stamp:
-                self._enter_fault_locked(detail, force_new_epoch=True)
+                self._enter_fault_locked(
+                    detail,
+                    force_new_epoch=True,
+                    fault_state=ModuleStatus.BLOCKED,
+                )
                 self._localization_detail = detail
                 return
             self._last_status_stamp = msg.header.stamp
-            if not bool(msg.valid):
-                detail = "localization invalid: " + (msg.detail or "no detail")
-                self._enter_fault_locked(detail, force_new_epoch=True)
+            if not bool(msg.valid) or msg.state != ModuleStatus.RUNNING:
+                detail = "localization unavailable: " + (
+                    msg.detail or "state={}, valid={}".format(msg.state, msg.valid)
+                )
+
+                if msg.state == ModuleStatus.TIMEOUT:
+                    fault_state = ModuleStatus.TIMEOUT
+                elif msg.state == ModuleStatus.FAILED:
+                    fault_state = ModuleStatus.FAILED
+                else:
+                    fault_state = ModuleStatus.BLOCKED
+
+                self._enter_fault_locked(
+                    detail,
+                    force_new_epoch=True,
+                    fault_state=fault_state,
+                )
                 self._last_status_stamp = msg.header.stamp
                 self._last_status_received_at = now
                 self._status_epoch = self._input_epoch
-                self._localization_detail = msg.detail or "localization invalid"
+                self._localization_detail = msg.detail or "localization unavailable"
                 return
             self._localization_valid = True
             self._localization_detail = msg.detail or "localization valid"
@@ -264,7 +283,11 @@ class MappingNode:
             )
             self._last_odom_received_at = now
             if not stamp_valid:
-                self._enter_fault_locked(stamp_detail, force_new_epoch=True)
+                self._enter_fault_locked(
+                    stamp_detail,
+                    force_new_epoch=True,
+                    fault_state=ModuleStatus.BLOCKED,
+                )
                 self._odom_failure_state = ModuleStatus.BLOCKED
                 self._odom_detail = stamp_detail
                 return
@@ -276,7 +299,11 @@ class MappingNode:
             self._last_odom_received_at = now
             self._last_odom_stamp = msg.header.stamp
             if not valid or pose is None:
-                self._enter_fault_locked(detail, force_new_epoch=True)
+                self._enter_fault_locked(
+                    detail,
+                    force_new_epoch=True,
+                    fault_state=state,
+                )
                 self._last_odom_received_at = now
                 self._last_odom_stamp = msg.header.stamp
                 self._odom_failure_state = state
@@ -288,9 +315,11 @@ class MappingNode:
                 if not self._jump_fault_active:
                     self._jump_fault_active = True
                     self._enter_fault_locked(
-                        detail, force_new_epoch=True,
+                        detail,
+                        force_new_epoch=True,
                         reset_map=self._reset_map_on_pose_jump,
                         reset_origin=self._origin_mode == "initial_pose",
+                        fault_state=state,
                     )
                     self._last_odom_received_at = now
                     self._last_odom_stamp = msg.header.stamp
@@ -436,7 +465,11 @@ class MappingNode:
                 tf2_ros.ExtrapolationException) as error:
             with self._lock:
                 detail = "point-cloud timestamp TF unavailable: {}".format(error)
-                self._enter_fault_locked(detail, force_new_epoch=True)
+                self._enter_fault_locked(
+                    detail,
+                    force_new_epoch=True,
+                    fault_state=ModuleStatus.BLOCKED,
+                )
                 self._pointcloud_failure_state = ModuleStatus.BLOCKED
                 self._pointcloud_detail = detail
                 self._cloud_metrics["clouds_rejected"] += 1
@@ -444,7 +477,11 @@ class MappingNode:
         except Exception as error:
             with self._lock:
                 detail = "point-cloud decode/transform failed: {}".format(error)
-                self._enter_fault_locked(detail, force_new_epoch=True)
+                self._enter_fault_locked(
+                    detail,
+                    force_new_epoch=True,
+                    fault_state=ModuleStatus.FAILED,
+                )
                 self._pointcloud_failure_state = ModuleStatus.FAILED
                 self._pointcloud_detail = detail
                 self._cloud_metrics["clouds_rejected"] += 1
@@ -465,7 +502,11 @@ class MappingNode:
                 stats = self._grid.integrate_scan(pose[0], pose[1], pose[2], points)
             except Exception as error:
                 detail = "map update failed: {}".format(error)
-                self._enter_fault_locked(detail, force_new_epoch=True)
+                self._enter_fault_locked(
+                    detail,
+                    force_new_epoch=True,
+                    fault_state=ModuleStatus.FAILED,
+                )
                 self._pointcloud_failure_state = ModuleStatus.FAILED
                 self._pointcloud_detail = detail
                 return
@@ -485,6 +526,7 @@ class MappingNode:
             self._pointcloud_failure_state = ModuleStatus.RUNNING
             self._pointcloud_detail = "point cloud integrated"
             self._fault_active = False
+            self._fault_state = ModuleStatus.BLOCKED
             self._fault_detail = ""
             if not self._map_initialized and (
                 stats["free_cells_updated"] > 0 or stats["occupied_endpoints"] > 0
@@ -554,8 +596,12 @@ class MappingNode:
         rospy.loginfo("map origin initialized at (%.3f, %.3f)", self._origin_x, self._origin_y)
 
     def _enter_fault_locked(
-        self, detail: str, force_new_epoch: bool = False,
-        reset_map: bool = False, reset_origin: bool = False,
+        self,
+        detail: str,
+        force_new_epoch: bool = False,
+        reset_map: bool = False,
+        reset_origin: bool = False,
+        fault_state: int = ModuleStatus.BLOCKED,
     ) -> None:
         if force_new_epoch or not self._fault_active:
             self._input_epoch += 1
@@ -568,6 +614,7 @@ class MappingNode:
             self._pending_cloud = None
             self._last_integrated_epoch = -1
         self._fault_active = True
+        self._fault_state = fault_state
         self._fault_detail = detail
         if reset_map:
             self._grid.reset()
@@ -581,6 +628,7 @@ class MappingNode:
     def _reset_for_time_rollback_locked(self, now: rospy.Time) -> None:
         self._input_epoch += 1
         self._fault_active = True
+        self._fault_state = ModuleStatus.TIMEOUT
         self._fault_detail = "ROS time moved backwards; waiting for a new input epoch"
         self._healthy_inputs_since = None
         self._last_status_received_at = None
@@ -688,9 +736,9 @@ class MappingNode:
             self._map_pub.publish(msg)
 
     def _evaluate_status_locked(self, now: rospy.Time):
-        if self._fault_active and self._fault_detail:
+        if self._fault_active:
             return (
-                ModuleStatus.BLOCKED,
+                self._fault_state,
                 False,
                 0.0,
                 self._fault_detail,
@@ -700,14 +748,22 @@ class MappingNode:
         if (self._last_status_received_at is not None and
                 self._age(now, self._last_status_received_at) > self._status_timeout):
             detail = "localization status timed out"
-            self._enter_fault_locked(detail, force_new_epoch=True)
+            self._enter_fault_locked(
+                detail,
+                force_new_epoch=True,
+                fault_state=ModuleStatus.TIMEOUT,
+            )
             self._last_status_received_at = None
             self._last_status_stamp = None
             return ModuleStatus.TIMEOUT, False, 0.0, detail
         if (self._last_odom_received_at is not None and
                 self._age(now, self._last_odom_received_at) > self._odom_timeout):
             detail = "odometry timed out"
-            self._enter_fault_locked(detail, force_new_epoch=True)
+            self._enter_fault_locked(
+                detail,
+                force_new_epoch=True,
+                fault_state=ModuleStatus.TIMEOUT,
+            )
             self._last_odom_received_at = None
             self._last_odom_stamp = None
             return ModuleStatus.TIMEOUT, False, 0.0, detail
@@ -722,7 +778,11 @@ class MappingNode:
             if (self._healthy_inputs_since is not None and
                     self._age(now, self._healthy_inputs_since) > self._pointcloud_timeout):
                 detail = "no point cloud was successfully integrated before timeout"
-                self._enter_fault_locked(detail, force_new_epoch=True)
+                self._enter_fault_locked(
+                    detail,
+                    force_new_epoch=True,
+                    fault_state=ModuleStatus.TIMEOUT,
+                )
                 return ModuleStatus.TIMEOUT, False, 0.0, detail
             return self._pointcloud_failure_state, False, 0.0, (
                 self._pointcloud_detail + "; new successful integration required"
@@ -731,7 +791,11 @@ class MappingNode:
             return ModuleStatus.STARTING, False, 0.0, "waiting for a successfully integrated point cloud"
         if self._age(now, self._last_cloud_integrated_at) > self._pointcloud_timeout:
             detail = "successfully integrated point cloud timed out"
-            self._enter_fault_locked(detail, force_new_epoch=True)
+            self._enter_fault_locked(
+                detail,
+                force_new_epoch=True,
+                fault_state=ModuleStatus.TIMEOUT,
+            )
             return ModuleStatus.TIMEOUT, False, 0.0, detail
         if not self._map_initialized:
             return ModuleStatus.STARTING, False, 0.0, "waiting for observed cells"
