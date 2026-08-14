@@ -141,6 +141,24 @@ class MappingFaultsTest(unittest.TestCase):
             "mapping did not reach RUNNING",
         )
 
+    def _wait_map(self, predicate, description, timeout=5.0):
+        """Bounded wait on the lock-protected _latest_map.
+
+        Status and map are asynchronous publish/subscribe paths: RUNNING may
+        be observed up to one map publish period before the map arrives.
+        Poll the predicate instead of asserting immediately.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline and not rospy.is_shutdown():
+            with self._lock:
+                current_map = self._latest_map
+                if current_map is not None and predicate(current_map):
+                    return current_map
+            time.sleep(0.02)
+        with self._lock:
+            received = self._latest_map is not None
+        self.fail("{}; map received={}".format(description, received))
+
     def _recover(self):
         self._publish_status = True
         self._publish_odom = True
@@ -160,9 +178,11 @@ class MappingFaultsTest(unittest.TestCase):
 
         self._send_sensor_tf = True
         self._recover()
-        with self._lock:
-            self.assertIsNotNone(self._latest_map)
-            self.assertIn(100, self._latest_map.data)
+        first_map = self._wait_map(
+            lambda m: 100 in m.data,
+            "first map with occupied cells was not published",
+        )
+        self.assertIn(100, first_map.data)
 
         self._status_valid = False
         invalid = self._wait_status(

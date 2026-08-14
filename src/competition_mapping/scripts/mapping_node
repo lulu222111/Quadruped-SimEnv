@@ -23,7 +23,7 @@ PendingCloud = Tuple[PointCloud2, int]
 
 
 class MappingNode:
-    """Latest-only mapper with timestamped TF lookup and epoch-based recovery."""
+    """Latest-only mapper with timestamped TF lookup and generation-based recovery."""
 
     def __init__(self) -> None:
         rospy.init_node("mapping_node", log_level=rospy.INFO)
@@ -239,13 +239,16 @@ class MappingNode:
             if not valid_stamp:
                 self._enter_fault_locked(
                     detail,
-                    force_new_epoch=True,
                     fault_state=ModuleStatus.BLOCKED,
                 )
+                self._localization_valid = False
                 self._localization_detail = detail
                 return
             self._last_status_stamp = msg.header.stamp
-            if not bool(msg.valid) or msg.state != ModuleStatus.RUNNING:
+            if not bool(msg.valid):
+                # ModuleStatus.valid is the authoritative usability gate.
+                # state only explains the reason; a non-RUNNING state alone
+                # must not invalidate a usable localization.
                 detail = "localization unavailable: " + (
                     msg.detail or "state={}, valid={}".format(msg.state, msg.valid)
                 )
@@ -257,11 +260,15 @@ class MappingNode:
                 else:
                     fault_state = ModuleStatus.BLOCKED
 
+                # Entering an already active fault generation must not open
+                # a new generation: continued invalid heartbeats only refresh
+                # fault state/detail and receive timestamps, and must not keep
+                # invalidating current-generation candidates.
                 self._enter_fault_locked(
                     detail,
-                    force_new_epoch=True,
                     fault_state=fault_state,
                 )
+                self._localization_valid = False
                 self._last_status_stamp = msg.header.stamp
                 self._last_status_received_at = now
                 self._status_epoch = self._input_epoch
@@ -283,6 +290,9 @@ class MappingNode:
             )
             self._last_odom_received_at = now
             if not stamp_valid:
+                # A new odometry fault must invalidate any odometry candidate
+                # cached earlier in the same fault generation: force a new
+                # generation so the stale candidate can never satisfy recovery.
                 self._enter_fault_locked(
                     stamp_detail,
                     force_new_epoch=True,
@@ -299,6 +309,9 @@ class MappingNode:
             self._last_odom_received_at = now
             self._last_odom_stamp = msg.header.stamp
             if not valid or pose is None:
+                # Invalid frame / quaternion / non-finite odometry is a new
+                # odometry fault: invalidate any candidate cached earlier in
+                # the same fault generation by forcing a new generation.
                 self._enter_fault_locked(
                     detail,
                     force_new_epoch=True,
@@ -314,6 +327,9 @@ class MappingNode:
             if not valid:
                 if not self._jump_fault_active:
                     self._jump_fault_active = True
+                    # A pose jump is a new odometry fault: invalidate any
+                    # odometry candidate cached earlier in the same fault
+                    # generation by forcing a new generation.
                     self._enter_fault_locked(
                         detail,
                         force_new_epoch=True,
@@ -431,6 +447,10 @@ class MappingNode:
                 return
             if self._pending_cloud is not None:
                 self._cloud_metrics["clouds_replaced"] += 1
+            # Tag the candidate with the current generation.  Clouds received
+            # while localization is invalid are cached as candidates of that
+            # generation but must not be consumed until recovery; the
+            # integration timer re-validates them right before fusing.
             self._pending_cloud = (msg, self._input_epoch)
             self._last_cloud_accepted_stamp = msg.header.stamp
             self._pointcloud_detail = "point cloud pending integration"
@@ -442,11 +462,20 @@ class MappingNode:
             if self._pending_cloud is None:
                 return
             msg, epoch = self._pending_cloud
-            self._pending_cloud = None
-            allowed, reason = self._integration_allowed_locked(now, epoch)
-            if not allowed:
+            usable, reason = self._pending_cloud_usable_locked(now, msg, epoch)
+            if not usable:
+                self._pending_cloud = None
                 self._reject_cloud_locked(reason)
                 return
+            allowed, reason = self._integration_allowed_locked(now, epoch)
+            if not allowed:
+                # The pending cloud is still a valid current-generation
+                # candidate; only localization/odometry usability is missing.
+                # Keep it (latest-only) instead of consuming and rejecting it,
+                # so recovery does not depend on a fresh cloud arriving after
+                # localization becomes valid again.
+                return
+            self._pending_cloud = None
 
         started = rospy.get_time()
         try:
@@ -467,19 +496,18 @@ class MappingNode:
                 detail = "point-cloud timestamp TF unavailable: {}".format(error)
                 self._enter_fault_locked(
                     detail,
-                    force_new_epoch=True,
                     fault_state=ModuleStatus.BLOCKED,
                 )
                 self._pointcloud_failure_state = ModuleStatus.BLOCKED
                 self._pointcloud_detail = detail
-                self._cloud_metrics["clouds_rejected"] += 1
+                if not self._requeue_pending_cloud_locked(msg, epoch):
+                    self._cloud_metrics["clouds_rejected"] += 1
             return
         except Exception as error:
             with self._lock:
                 detail = "point-cloud decode/transform failed: {}".format(error)
                 self._enter_fault_locked(
                     detail,
-                    force_new_epoch=True,
                     fault_state=ModuleStatus.FAILED,
                 )
                 self._pointcloud_failure_state = ModuleStatus.FAILED
@@ -490,9 +518,16 @@ class MappingNode:
         with self._lock:
             now = rospy.Time.now()
             self._check_ros_time_locked(now)
+            # Being fresh at receive time does not make a cached candidate
+            # usable forever: re-verify generation, frame and timestamp
+            # freshness immediately before fusing.
+            usable, reason = self._pending_cloud_usable_locked(now, msg, epoch)
+            if not usable:
+                self._reject_cloud_locked(reason)
+                return
             allowed, reason = self._integration_allowed_locked(now, epoch)
             if not allowed:
-                self._reject_cloud_locked(reason)
+                self._requeue_pending_cloud_locked(msg, epoch)
                 return
             self._initialize_origin_locked(pose)
             if not self._origin_ready:
@@ -504,7 +539,6 @@ class MappingNode:
                 detail = "map update failed: {}".format(error)
                 self._enter_fault_locked(
                     detail,
-                    force_new_epoch=True,
                     fault_state=ModuleStatus.FAILED,
                 )
                 self._pointcloud_failure_state = ModuleStatus.FAILED
@@ -548,6 +582,44 @@ class MappingNode:
         if self._age(now, self._last_odom_received_at) > self._odom_timeout:
             return False, "odometry timed out"
         return True, "inputs valid"
+
+    def _pending_cloud_usable_locked(self, now: rospy.Time, msg: PointCloud2, epoch: int):
+        """Re-validate a cached pending cloud right before integration.
+
+        Acceptance at receive time does not make a cloud usable forever.
+        Before it may be fused, re-verify the current generation, the frame
+        and that the timestamp is non-zero, not in the future and not stale
+        with respect to pointcloud_timeout.  TF availability is verified
+        separately during the timestamped lookup itself.
+        """
+        if epoch != self._input_epoch:
+            return False, "pending point cloud belongs to an old epoch"
+        cloud_frame = self._normalise_frame(msg.header.frame_id)
+        if cloud_frame != self._expected_cloud_frame:
+            return False, "pending point cloud frame '{}' != '{}'".format(
+                cloud_frame, self._expected_cloud_frame
+            )
+        if msg.header.stamp == rospy.Time():
+            return False, "pending point cloud timestamp is zero"
+        age = (now - msg.header.stamp).to_sec()
+        if age < -self._future_tolerance:
+            return False, "pending point cloud timestamp is {:.3f}s in the future".format(
+                -age
+            )
+        if age > self._pointcloud_timeout:
+            return False, "pending point cloud timestamp is {:.3f}s old".format(age)
+        return True, "pending point cloud fresh"
+
+    def _requeue_pending_cloud_locked(self, msg: PointCloud2, epoch: int) -> bool:
+        """Keep a consumed cloud as the latest pending candidate.
+
+        Only when it still belongs to the current generation and no newer
+        cloud has arrived meanwhile; otherwise the cloud is dropped.
+        """
+        if epoch == self._input_epoch and self._pending_cloud is None:
+            self._pending_cloud = (msg, epoch)
+            return True
+        return False
 
     def _extract_points(self, msg: PointCloud2) -> List[Point3D]:
         points: List[Point3D] = []
@@ -603,6 +675,23 @@ class MappingNode:
         reset_origin: bool = False,
         fault_state: int = ModuleStatus.BLOCKED,
     ) -> None:
+        """Enter or refresh the current fault generation.
+
+        A new local generation is opened on the healthy -> fault transition.
+        Faults that invalidate previously cached input candidates (a new
+        odometry fault: invalid timestamp, invalid frame/quaternion/non-finite
+        values, pose jump or odometry timeout) pass force_new_epoch=True and
+        open a new generation even while a fault generation is already active,
+        so the stale candidate can never satisfy recovery.  Fault reports
+        without force_new_epoch (e.g. continued localization valid=false
+        heartbeats) only update the fault state/detail pair and receive
+        timestamps; they must not keep creating generations nor keep
+        invalidating current-generation candidates.
+
+        fault state and detail always form a pair and describe the most
+        recent explicit fault report; without a new fault event both keep
+        their previous values.
+        """
         if force_new_epoch or not self._fault_active:
             self._input_epoch += 1
             self._healthy_inputs_since = None
@@ -613,8 +702,8 @@ class MappingNode:
             self._latest_pose = None
             self._pending_cloud = None
             self._last_integrated_epoch = -1
-        self._fault_active = True
         self._fault_state = fault_state
+        self._fault_active = True
         self._fault_detail = detail
         if reset_map:
             self._grid.reset()
@@ -750,7 +839,6 @@ class MappingNode:
             detail = "localization status timed out"
             self._enter_fault_locked(
                 detail,
-                force_new_epoch=True,
                 fault_state=ModuleStatus.TIMEOUT,
             )
             self._last_status_received_at = None
@@ -759,6 +847,9 @@ class MappingNode:
         if (self._last_odom_received_at is not None and
                 self._age(now, self._last_odom_received_at) > self._odom_timeout):
             detail = "odometry timed out"
+            # An odometry timeout is a new odometry fault: force a new
+            # generation so any cached odometry candidate is invalidated and
+            # cannot satisfy recovery afterwards.
             self._enter_fault_locked(
                 detail,
                 force_new_epoch=True,
@@ -780,7 +871,6 @@ class MappingNode:
                 detail = "no point cloud was successfully integrated before timeout"
                 self._enter_fault_locked(
                     detail,
-                    force_new_epoch=True,
                     fault_state=ModuleStatus.TIMEOUT,
                 )
                 return ModuleStatus.TIMEOUT, False, 0.0, detail
@@ -793,7 +883,6 @@ class MappingNode:
             detail = "successfully integrated point cloud timed out"
             self._enter_fault_locked(
                 detail,
-                force_new_epoch=True,
                 fault_state=ModuleStatus.TIMEOUT,
             )
             return ModuleStatus.TIMEOUT, False, 0.0, detail

@@ -130,17 +130,18 @@ class MappingIntegrationTest(unittest.TestCase):
         self._wait_for(lambda _m, s: s is not None and not s.valid)
         time.sleep(0.4)
         with self._lock:
+            # While localization is invalid the old latched map must not be
+            # wrongly fused into: its published cells stay unchanged.
             self.assertEqual(first_data, list(self._map.data))
 
-        # A valid localization alone cannot revalidate the old latched map.
+        # Data-first recovery (generation contract): current-generation
+        # odometry and clouds arriving while localization is invalid are
+        # cached as candidates but not consumed.  Stop the cloud publisher and
+        # let localization recover; no further cloud is sent, yet the mapping
+        # must recover valid=true by consuming the cached fresh
+        # current-generation candidate.
         self._publish_cloud = False
         self._status_valid = True
-        time.sleep(0.5)
-        with self._lock:
-            self.assertIsNotNone(self._status)
-            self.assertFalse(self._status.valid)
-
-        self._publish_cloud = True
         self._wait_for(lambda _m, s: s is not None and s.valid)
 
 
