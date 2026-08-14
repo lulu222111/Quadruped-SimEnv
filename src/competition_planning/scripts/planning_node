@@ -232,28 +232,74 @@ class PlanningNode:
                 "future_stamp_tolerance must not be negative"
             )
 
-    def _observe_ros_time(self, now):
-        """Return False after detecting a non-zero ROS time rollback."""
-        if now.is_zero():
-            return True
-
+    def _observe_ros_time(self):
+        """Atomically observe ROS time and return it, or None if unsafe."""
         with self.lock:
+            now = rospy.Time.now()
             previous = self.last_ros_time
             self.last_ros_time = now
 
-        if (
-            previous is not None
-            and not previous.is_zero()
-            and now < previous
-        ):
-            self._enter_new_generation("ros_time_rollback", force=True)
-            self.invalidate_plan(
+            rollback = (
+                previous is not None
+                and not previous.is_zero()
+                and (now.is_zero() or now < previous)
+            )
+            if rollback:
+                self._enter_new_generation(
+                    "ros_time_rollback",
+                    force=True,
+                )
+                self._invalidate_plan_locked(
+                    ModuleStatus.FAILED,
+                    0.0,
+                    "ROS time moved backwards; waiting for a new generation",
+                    stamp=now,
+                )
+                return None
+
+            if now.is_zero():
+                self._invalidate_plan_locked(
+                    ModuleStatus.STARTING,
+                    0.0,
+                    "waiting for non-zero ROS time",
+                    stamp=now,
+                )
+                return None
+
+            return now
+
+    def _accept_ingress_stamp_locked(
+        self,
+        name,
+        stamp,
+        now,
+        fault_name,
+    ):
+        """Reject zero/future messages before they enter the cache."""
+        try:
+            if stamp.is_zero():
+                raise ValueError(
+                    "{} timestamp must be non-zero".format(name)
+                )
+            future_offset = (stamp - now).to_sec()
+            if future_offset > self.future_stamp_tolerance:
+                raise ValueError(
+                    "{} timestamp is {:.3f}s in the future".format(
+                        name,
+                        future_offset,
+                    )
+                )
+        except (TypeError, ValueError, OverflowError) as error:
+            self._enter_new_generation(fault_name)
+            self._invalidate_plan_locked(
                 ModuleStatus.FAILED,
                 0.0,
-                "ROS time moved backwards; waiting for a new generation",
+                str(error),
+                stamp=now,
             )
             return False
 
+        self.active_faults.discard(fault_name)
         return True
 
     def _enter_new_generation(self, fault_name, force=False):
@@ -277,95 +323,129 @@ class PlanningNode:
             self.active_faults.discard(fault_name)
 
     def map_callback(self, msg):
-        now = rospy.Time.now()
-        if not self._observe_ros_time(now):
+        now = self._observe_ros_time()
+        if now is None:
             return
         with self.lock:
+            if not self._accept_ingress_stamp_locked(
+                "map",
+                msg.header.stamp,
+                now,
+                "map_stamp_invalid",
+            ):
+                return
             self.map_msg = msg
             self.map_received_at = now
             self.map_generation = self.generation
-        self._clear_fault("map_timeout")
+            self.active_faults.discard("map_timeout")
 
     def odom_callback(self, msg):
-        now = rospy.Time.now()
-        if not self._observe_ros_time(now):
+        now = self._observe_ros_time()
+        if now is None:
             return
         with self.lock:
+            if not self._accept_ingress_stamp_locked(
+                "localization",
+                msg.header.stamp,
+                now,
+                "localization_stamp_invalid",
+            ):
+                return
             self.odom_msg = msg
             self.odom_received_at = now
             self.odom_generation = self.generation
-        self._clear_fault("localization_timeout")
+            self.active_faults.discard("localization_timeout")
 
     def mapping_status_callback(self, msg):
-        now = rospy.Time.now()
-        if not self._observe_ros_time(now):
+        now = self._observe_ros_time()
+        if now is None:
             return
 
         with self.lock:
+            if not self._accept_ingress_stamp_locked(
+                "mapping status",
+                msg.header.stamp,
+                now,
+                "mapping_status_stamp_invalid",
+            ):
+                return
             previous_valid = (
                 self.mapping_status is not None
                 and self.mapping_status.valid
             )
             self.mapping_status = msg
             self.mapping_status_received_at = now
+            self.active_faults.discard("mapping_status_timeout")
 
-        self._clear_fault("mapping_status_timeout")
-
-        if not msg.valid:
-            self._enter_new_generation(
-                "mapping_invalid",
-                force=previous_valid,
-            )
-            self.invalidate_plan(
-                ModuleStatus.BLOCKED,
-                0.0,
-                "mapping status is invalid: {}".format(msg.detail),
-            )
-        else:
-            self._clear_fault("mapping_invalid")
+            if not msg.valid:
+                self._enter_new_generation(
+                    "mapping_invalid",
+                    force=previous_valid,
+                )
+                self._invalidate_plan_locked(
+                    ModuleStatus.BLOCKED,
+                    0.0,
+                    "mapping status is invalid: {}".format(msg.detail),
+                    stamp=now,
+                )
+            else:
+                self.active_faults.discard("mapping_invalid")
 
     def localization_status_callback(self, msg):
-        now = rospy.Time.now()
-        if not self._observe_ros_time(now):
+        now = self._observe_ros_time()
+        if now is None:
             return
 
         with self.lock:
+            if not self._accept_ingress_stamp_locked(
+                "localization status",
+                msg.header.stamp,
+                now,
+                "localization_status_stamp_invalid",
+            ):
+                return
             previous_valid = (
                 self.localization_status is not None
                 and self.localization_status.valid
             )
             self.localization_status = msg
             self.localization_status_received_at = now
+            self.active_faults.discard("localization_status_timeout")
 
-        self._clear_fault("localization_status_timeout")
-
-        if not msg.valid:
-            self._enter_new_generation(
-                "localization_invalid",
-                force=previous_valid,
-            )
-            self.invalidate_plan(
-                ModuleStatus.BLOCKED,
-                0.0,
-                "localization status is invalid: {}".format(msg.detail),
-            )
-        else:
-            self._clear_fault("localization_invalid")
+            if not msg.valid:
+                self._enter_new_generation(
+                    "localization_invalid",
+                    force=previous_valid,
+                )
+                self._invalidate_plan_locked(
+                    ModuleStatus.BLOCKED,
+                    0.0,
+                    "localization status is invalid: {}".format(msg.detail),
+                    stamp=now,
+                )
+            else:
+                self.active_faults.discard("localization_invalid")
 
     def publish_status(self, state, valid, confidence, detail):
         with self.lock:
             self.last_status = (state, valid, confidence, detail)
-        self._publish_status_message(state, valid, confidence, detail)
+            self._publish_status_message_locked(
+                state,
+                valid,
+                confidence,
+                detail,
+            )
 
-    def _publish_status_message(
+    def _publish_status_message_locked(
         self,
         state,
         valid,
         confidence,
         detail,
+        stamp=None,
     ):
         msg = ModuleStatus()
-        msg.header.stamp = rospy.Time.now()
+        msg.header.stamp = stamp if stamp is not None else rospy.Time.now()
         msg.state = state
         msg.valid = valid
         msg.confidence = confidence
@@ -373,20 +453,178 @@ class PlanningNode:
         self.status_pub.publish(msg)
 
     def heartbeat_callback(self, _event):
-        now = rospy.Time.now()
-        if not self._observe_ros_time(now):
+        now = self._observe_ros_time()
+        if now is None:
             return
         with self.lock:
+            failure = self._watchdog_failure_locked(now)
+            if failure is not None:
+                state, confidence, detail = failure
+                self._invalidate_plan_locked(
+                    state,
+                    confidence,
+                    detail,
+                    stamp=now,
+                )
+                return
             status = self.last_status
-        self._publish_status_message(*status)
+            self._publish_status_message_locked(*status, stamp=now)
 
     def invalidate_plan(self, state, confidence, detail):
         """Withdraw the latched path and publish an invalid status."""
+        with self.lock:
+            self._invalidate_plan_locked(state, confidence, detail)
+
+    def _invalidate_plan_locked(
+        self,
+        state,
+        confidence,
+        detail,
+        stamp=None,
+    ):
+        """Withdraw path and status while the caller owns self.lock."""
+        if stamp is None:
+            stamp = rospy.Time.now()
         empty_path = Path()
-        empty_path.header.stamp = rospy.Time.now()
+        empty_path.header.stamp = stamp
         empty_path.header.frame_id = WORLD_FRAME
         self.path_pub.publish(empty_path)
-        self.publish_status(state, False, confidence, detail)
+        self.last_status = (state, False, confidence, detail)
+        self._publish_status_message_locked(
+            state,
+            False,
+            confidence,
+            detail,
+            stamp=stamp,
+        )
+
+    def _watchdog_failure_locked(self, now):
+        """Return an invalid status tuple when cached inputs are unsafe."""
+        missing_statuses = []
+        if (
+            self.mapping_status is None
+            or self.mapping_status_received_at is None
+        ):
+            missing_statuses.append("mapping status")
+        if (
+            self.localization_status is None
+            or self.localization_status_received_at is None
+        ):
+            missing_statuses.append("localization status")
+        if missing_statuses:
+            return (
+                ModuleStatus.STARTING,
+                0.0,
+                "waiting for " + " and ".join(missing_statuses),
+            )
+
+        stale_statuses = []
+        if (
+            now - self.mapping_status_received_at
+        ).to_sec() > self.mapping_status_timeout:
+            stale_statuses.append("mapping status")
+        if (
+            now - self.localization_status_received_at
+        ).to_sec() > self.localization_status_timeout:
+            stale_statuses.append("localization status")
+        if stale_statuses:
+            for name in stale_statuses:
+                self._enter_new_generation(
+                    name.replace(" ", "_") + "_timeout"
+                )
+            return (
+                ModuleStatus.TIMEOUT,
+                0.0,
+                "stale upstream status timeout: "
+                + " and ".join(stale_statuses),
+            )
+
+        if (
+            not self.mapping_status.valid
+            or not self.localization_status.valid
+        ):
+            invalid_statuses = []
+            if not self.mapping_status.valid:
+                invalid_statuses.append("mapping")
+            if not self.localization_status.valid:
+                invalid_statuses.append("localization")
+            return (
+                ModuleStatus.BLOCKED,
+                0.0,
+                "invalid upstream status: "
+                + " and ".join(invalid_statuses),
+            )
+
+        map_missing = (
+            self.map_msg is None
+            or self.map_received_at is None
+            or self.map_generation != self.generation
+        )
+        odom_missing = (
+            self.odom_msg is None
+            or self.odom_received_at is None
+            or self.odom_generation != self.generation
+        )
+        if map_missing or odom_missing:
+            missing_inputs = []
+            if map_missing:
+                missing_inputs.append("current-generation map")
+            if odom_missing:
+                missing_inputs.append(
+                    "current-generation localization"
+                )
+            return (
+                ModuleStatus.STARTING,
+                0.0,
+                "waiting for " + " and ".join(missing_inputs),
+            )
+
+        stale_inputs = []
+        if (now - self.map_received_at).to_sec() > self.map_timeout:
+            stale_inputs.append("map")
+        if (
+            now - self.odom_received_at
+        ).to_sec() > self.localization_timeout:
+            stale_inputs.append("localization")
+        if stale_inputs:
+            for name in stale_inputs:
+                self._enter_new_generation(name + "_timeout")
+            return (
+                ModuleStatus.TIMEOUT,
+                0.0,
+                "stale input timeout: " + " and ".join(stale_inputs),
+            )
+
+        try:
+            self._validate_message_stamp(
+                "mapping status",
+                self.mapping_status.header.stamp,
+                now,
+                self.mapping_status_timeout,
+            )
+            self._validate_message_stamp(
+                "localization status",
+                self.localization_status.header.stamp,
+                now,
+                self.localization_status_timeout,
+            )
+            self._validate_message_stamp(
+                "map",
+                self.map_msg.header.stamp,
+                now,
+                self.map_timeout,
+            )
+            self._validate_message_stamp(
+                "localization",
+                self.odom_msg.header.stamp,
+                now,
+                self.localization_timeout,
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            self._enter_new_generation("message_timestamp_invalid")
+            return (ModuleStatus.FAILED, 0.0, str(error))
+
+        return None
 
     @staticmethod
     def _status_age(now, received_at):
@@ -422,8 +660,8 @@ class PlanningNode:
             )
 
     def plan_callback(self, _event):
-        now = rospy.Time.now()
-        if not self._observe_ros_time(now):
+        now = self._observe_ros_time()
+        if now is None:
             return
 
         with self.lock:
@@ -735,6 +973,15 @@ class PlanningNode:
             goal_yaw,
         )
 
+        detail = (
+            "planned path with {} poses to frontier {}; "
+            "{} frontier cells detected"
+        ).format(
+            len(result["path"]),
+            result["goal_cell"],
+            result["frontier_count"],
+        )
+
         with self.lock:
             result_is_current = (
                 self.generation == expected_generation
@@ -745,6 +992,39 @@ class PlanningNode:
                 and self.localization_status is not None
                 and self.localization_status.valid
             )
+            if result_is_current:
+                commit_now = rospy.Time.now()
+                watchdog_failure = self._watchdog_failure_locked(
+                    commit_now
+                )
+                if watchdog_failure is not None:
+                    state, confidence, failure_detail = watchdog_failure
+                    self._invalidate_plan_locked(
+                        state,
+                        confidence,
+                        failure_detail,
+                        stamp=commit_now,
+                    )
+                    return
+
+                # The final check and all three output publications are one
+                # lock-protected commit. An invalidating callback can only
+                # publish after this block, so an old path cannot revive.
+                self.goal_pub.publish(goal_msg)
+                self.path_pub.publish(path_msg)
+                self.last_status = (
+                    ModuleStatus.RUNNING,
+                    True,
+                    1.0,
+                    detail,
+                )
+                self._publish_status_message_locked(
+                    ModuleStatus.RUNNING,
+                    True,
+                    1.0,
+                    detail,
+                    stamp=stamp,
+                )
 
         if not result_is_current:
             rospy.logwarn(
@@ -753,23 +1033,6 @@ class PlanningNode:
             )
             return
 
-        self.goal_pub.publish(goal_msg)
-        self.path_pub.publish(path_msg)
-
-        detail = (
-            "planned path with {} poses to frontier {}; "
-            "{} frontier cells detected"
-        ).format(
-            len(result["path"]),
-            result["goal_cell"],
-            result["frontier_count"],
-        )
-        self.publish_status(
-            ModuleStatus.RUNNING,
-            True,
-            1.0,
-            detail,
-        )
         rospy.loginfo_throttle(5.0, detail)
 
     @staticmethod

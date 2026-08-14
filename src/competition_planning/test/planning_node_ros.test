@@ -13,10 +13,11 @@
     <param name="future_stamp_tolerance" value="0.2" />
     <param name="status_heartbeat_interval" value="0.1" />
   </node>
+
   <test
     test-name="planning_node_ros_test"
     pkg="competition_planning"
     type="planning_node_ros_test.py"
-    time-limit="40.0"
+    time-limit="60.0"
   />
 </launch>

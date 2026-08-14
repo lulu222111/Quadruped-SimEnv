@@ -15,6 +15,8 @@ class PlanningNodeContractRosTest(unittest.TestCase):
         self.lock = threading.Lock()
         self.last_status = None
         self.last_path = None
+        self.status_history = []
+        self.path_history = []
 
         self.map_pub = rospy.Publisher(
             "/competition/map",
@@ -63,15 +65,19 @@ class PlanningNodeContractRosTest(unittest.TestCase):
     def status_callback(self, msg):
         with self.lock:
             self.last_status = msg
+            self.status_history.append(msg)
 
     def path_callback(self, msg):
         with self.lock:
             self.last_path = msg
+            self.path_history.append(msg)
 
     def clear_received_outputs(self):
         with self.lock:
             self.last_status = None
             self.last_path = None
+            self.status_history = []
+            self.path_history = []
 
     def wait_for_input_connections(self, timeout=8.0):
         deadline = time.monotonic() + timeout
@@ -111,6 +117,23 @@ class PlanningNodeContractRosTest(unittest.TestCase):
                 )
             rospy.sleep(0.02)
 
+    def assert_no_valid_or_nonempty_output(self, duration=0.75):
+        """Ensure an invalidation cannot be followed by a stale revival."""
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            with self.lock:
+                statuses = list(self.status_history)
+                paths = list(self.path_history)
+            self.assertFalse(
+                any(status.valid for status in statuses),
+                "a valid status was published after invalidation",
+            )
+            self.assertFalse(
+                any(len(path.poses) > 0 for path in paths),
+                "a non-empty path was published after invalidation",
+            )
+            rospy.sleep(0.02)
+
     @staticmethod
     def make_status(valid, detail):
         msg = ModuleStatus()
@@ -141,6 +164,26 @@ class PlanningNodeContractRosTest(unittest.TestCase):
             -1,  0,  0,  0, -1,
             -1, -1, -1, -1, -1,
         ]
+        return msg
+
+    @staticmethod
+    def make_large_map(size=600):
+        """Create enough work to overlap planning and invalidation."""
+        msg = OccupancyGrid()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "world"
+        msg.info.resolution = 0.05
+        msg.info.width = size
+        msg.info.height = size
+        msg.info.origin.orientation.w = 1.0
+        data = [0] * (size * size)
+        for x in range(size):
+            data[x] = -1
+            data[(size - 1) * size + x] = -1
+        for y in range(size):
+            data[y * size] = -1
+            data[y * size + size - 1] = -1
+        msg.data = data
         return msg
 
     @staticmethod
@@ -284,6 +327,71 @@ class PlanningNodeContractRosTest(unittest.TestCase):
         )
         self.assertFalse(stale_status.valid)
         self.assertEqual(len(stale_path.poses), 0)
+
+        # A future-stamped message is rejected before entering the cache.
+        # Merely waiting for ROS time to catch up must not make it usable.
+        self.clear_received_outputs()
+        self.publish_valid_statuses()
+        future_map = self.make_map()
+        future_map.header.stamp = (
+            rospy.Time.now() + rospy.Duration(1.0)
+        )
+        self.map_pub.publish(future_map)
+        self.odom_pub.publish(self.make_odom())
+        future_status, future_path = self.wait_for(
+            lambda status, path: (
+                status is not None
+                and status.state == ModuleStatus.FAILED
+                and not status.valid
+                and "map timestamp is" in status.detail
+                and "in the future" in status.detail
+                and path is not None
+                and len(path.poses) == 0
+            ),
+            "future map rejection before cache insertion",
+        )
+        self.assertFalse(future_status.valid)
+        self.assertEqual(len(future_path.poses), 0)
+
+        self.clear_received_outputs()
+        rospy.sleep(1.1)
+        self.publish_valid_statuses()
+        self.assert_no_valid_status(duration=0.35)
+
+        # Recovery requires a newly received legal Map and Odometry.
+        self.clear_received_outputs()
+        self.map_pub.publish(self.make_map())
+        self.odom_pub.publish(self.make_odom())
+        self.wait_for(
+            self.is_valid_path,
+            "recovery after a new legal message",
+        )
+
+        # Invalidate while a large-map calculation may be running. Once the
+        # empty path is observed, no stale non-empty path or valid status may
+        # be published afterwards.
+        self.clear_received_outputs()
+        self.publish_valid_statuses()
+        self.map_pub.publish(self.make_large_map())
+        large_odom = self.make_odom()
+        large_odom.pose.pose.position.x = 15.0
+        large_odom.pose.pose.position.y = 15.0
+        self.odom_pub.publish(large_odom)
+        rospy.sleep(0.08)
+        self.mapping_status_pub.publish(
+            self.make_status(False, "mapping invalid during planning")
+        )
+        self.wait_for(
+            lambda status, path: (
+                status is not None
+                and not status.valid
+                and path is not None
+                and len(path.poses) == 0
+            ),
+            "invalidation during planning",
+        )
+        self.clear_received_outputs()
+        self.assert_no_valid_or_nonempty_output()
 
         # Recover once more, then stop status heartbeats. Status timeout
         # must happen before the longer Map/Odometry timeout.
