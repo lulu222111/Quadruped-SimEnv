@@ -1,0 +1,17 @@
+<launch>
+  <arg name="config_file" default="$(find competition_mapping)/config/mapping.yaml"/>
+  <arg name="pointcloud_topic" default="/livox/Pointcloud2"/>
+  <arg name="odom_topic" default="/competition/localization/odom"/>
+  <arg name="localization_status_topic" default="/competition/localization/status"/>
+
+  <node pkg="competition_mapping"
+        type="mapping_node"
+        name="mapping_node"
+        output="screen"
+        required="true">
+    <rosparam command="load" file="$(arg config_file)"/>
+    <param name="pointcloud_topic" value="$(arg pointcloud_topic)"/>
+    <param name="odom_topic" value="$(arg odom_topic)"/>
+    <param name="localization_status_topic" value="$(arg localization_status_topic)"/>
+  </node>
+</launch>
