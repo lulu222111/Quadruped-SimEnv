@@ -2,10 +2,8 @@
 <package format="2">
   <name>competition_perception</name>
   <version>0.1.0</version>
-  <description>
-    Hazard source detection using RealSense RGB-D data.
-    Distinguishes red spheres (danger) from red boxes and green spheres (distractors).
-  </description>
+  <description>Hazard source detection using RealSense RGB-D data.
+  Distinguishes red spheres (danger) from red boxes and green spheres (distractors).</description>
 
   <maintainer email="baoyufei@example.com">baoyufei</maintainer>
   <license>Apache-2.0</license>
@@ -27,4 +25,8 @@
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>message_filters</exec_depend>
   <exec_depend>competition_interfaces</exec_depend>
+
+  <!-- Test dependencies for catkin_add_nosetests and rostest -->
+  <test_depend>rosunit</test_depend>
+  <test_depend>rostest</test_depend>
 </package>

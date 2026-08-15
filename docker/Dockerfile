@@ -50,27 +50,14 @@ RUN curl -fsSL \
 # ROS Noetic, Gazebo Classic and common project dependencies.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        ros-noetic-desktop-full \
         python3-catkin-tools \
         python3-numpy \
-        python3-dev\
         python3-opencv \
         python3-pip \
         python3-rosdep \
         python3-vcstool \
         python3-yaml \
-        ros-noetic-rospy \
-        ros-noetic-roscpp \
-        ros-noetic-std-msgs \
-        ros-noetic-sensor-msgs \
-        ros-noetic-geometry-msgs \
-        ros-noetic-desktop-full \
-        ros-noetic-cv-bridge \
-        ros-noetic-message-filters \
-        ros-noetic-message-generation \
-        ros-noetic-message-runtime \
-        ros-noetic-tf2 \
-        ros-noetic-tf2-ros \
-        ros-noetic-tf2-geometry-msgs \
         libarmadillo-dev \
         libeigen3-dev \
         liblcm-dev \

@@ -47,11 +47,6 @@
     <param name="max_angular_z" value="1.0" />
   </node>
 
-  <!-- 只针对本节点将系统 path 提到最前，防止 cv_bridge 报错 -->
-  <node pkg="competition_perception" type="perception_node" name="perception" output="screen">
-      <env name="PYTHONPATH" value="/usr/lib/python3/dist-packages:$(env PYTHONPATH)" />
-  </node>
-
   <!-- === Mock subsystem (test mode only) === -->
   <group if="$(arg use_mocks)">
     <include file="$(find competition_testing)/launch/mock_system.launch" />
