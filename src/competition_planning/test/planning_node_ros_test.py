@@ -106,6 +106,24 @@ class PlanningNodeContractRosTest(unittest.TestCase):
             rospy.sleep(0.02)
         self.fail("timed out waiting for " + description)
 
+    def wait_for_status_history(self, predicate, description, timeout=6.0):
+        """Wait until any status received in this phase matches.
+
+        Ingress/stamp rejections are transient: the node reports the
+        fault and then falls back to waiting for current-generation
+        data, so the fault status may already be overwritten by the
+        time the latest status is polled. The full history makes the
+        rejection observable deterministically.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self.lock:
+                statuses = list(self.status_history)
+            if predicate(statuses):
+                return
+            rospy.sleep(0.02)
+        self.fail("timed out waiting for " + description)
+
     def assert_no_valid_status(self, duration=0.25):
         deadline = time.monotonic() + duration
         while time.monotonic() < deadline:
@@ -304,29 +322,49 @@ class PlanningNodeContractRosTest(unittest.TestCase):
         self.assertEqual(len(frame_path.poses), 0)
 
         # A freshly received message with an old header timestamp must
-        # still be rejected by message-level freshness protection.
+        # still be rejected by message-level freshness protection. Keep
+        # the current generation alive first so the last generation
+        # boundary is comfortably older than the deliberately aged
+        # stamp below; otherwise the pre-generation admission check
+        # would drop the message before freshness protection sees it.
+        self.clear_received_outputs()
+        keepalive_end = time.monotonic() + 2.8
+        while time.monotonic() < keepalive_end:
+            self.publish_valid_generation()
+            rospy.sleep(0.2)
         self.clear_received_outputs()
         self.publish_valid_statuses()
         stale_map = self.make_map()
         stale_map.header.stamp = (
-            rospy.Time.now() - rospy.Duration(3.0)
+            rospy.Time.now() - rospy.Duration(2.5)
         )
         self.map_pub.publish(stale_map)
         self.odom_pub.publish(self.make_odom())
-        stale_status, stale_path = self.wait_for(
-            lambda status, path: (
-                status is not None
-                and status.state == ModuleStatus.FAILED
+        # The rejection report is transient: after invalidating the
+        # stale data the node falls back to waiting for
+        # current-generation inputs, so scan the full history.
+        self.wait_for_status_history(
+            lambda statuses: any(
+                status.state == ModuleStatus.FAILED
                 and not status.valid
                 and "map timestamp is" in status.detail
                 and "old; limit" in status.detail
-                and path is not None
-                and len(path.poses) == 0
+                for status in statuses
             ),
             "old map header timestamp rejection",
         )
+        stale_status, stale_path = self.wait_for(
+            lambda status, path: (
+                status is not None
+                and not status.valid
+                and path is not None
+                and len(path.poses) == 0
+            ),
+            "invalid status and empty path after stale map",
+        )
         self.assertFalse(stale_status.valid)
         self.assertEqual(len(stale_path.poses), 0)
+        self.assert_no_valid_or_nonempty_output(duration=0.4)
 
         # A future-stamped message is rejected before entering the cache.
         # Merely waiting for ROS time to catch up must not make it usable.
@@ -338,17 +376,26 @@ class PlanningNodeContractRosTest(unittest.TestCase):
         )
         self.map_pub.publish(future_map)
         self.odom_pub.publish(self.make_odom())
-        future_status, future_path = self.wait_for(
-            lambda status, path: (
-                status is not None
-                and status.state == ModuleStatus.FAILED
+        # The ingress rejection is reported transiently before the node
+        # falls back to waiting for current-generation data.
+        self.wait_for_status_history(
+            lambda statuses: any(
+                status.state == ModuleStatus.FAILED
                 and not status.valid
                 and "map timestamp is" in status.detail
                 and "in the future" in status.detail
+                for status in statuses
+            ),
+            "future map rejection before cache insertion",
+        )
+        future_status, future_path = self.wait_for(
+            lambda status, path: (
+                status is not None
+                and not status.valid
                 and path is not None
                 and len(path.poses) == 0
             ),
-            "future map rejection before cache insertion",
+            "invalid status and empty path after future map",
         )
         self.assertFalse(future_status.valid)
         self.assertEqual(len(future_path.poses), 0)

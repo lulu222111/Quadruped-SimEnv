@@ -44,6 +44,12 @@ class PlanningNode:
         self.lock = threading.RLock()
 
         self.generation = 0
+        # ROS-time boundary of the current generation. Data whose header
+        # stamp is at or before this boundary was produced before the
+        # current generation began and must never enter its cache.
+        # Generation 0 starts at time zero so any legal non-zero stamp
+        # is admitted during startup.
+        self.generation_start_stamp = rospy.Time(0)
         self.map_msg = None
         self.odom_msg = None
         self.map_generation = None
@@ -55,6 +61,15 @@ class PlanningNode:
         self.localization_status = None
         self.mapping_status_received_at = None
         self.localization_status_received_at = None
+
+        # Per-stream monotonic baselines: a status whose header stamp is
+        # not strictly after the last accepted one is a delayed duplicate
+        # or out-of-order old message and is dropped without touching any
+        # state, so it can neither clear a fault, revive the plan, nor
+        # open a new generation. Reset on ROS clock rollback (new
+        # timeline).
+        self.last_mapping_status_stamp = None
+        self.last_localization_status_stamp = None
 
         self.last_ros_time = None
         self.active_faults = set()
@@ -247,8 +262,14 @@ class PlanningNode:
             if rollback:
                 self._enter_new_generation(
                     "ros_time_rollback",
+                    now,
                     force=True,
                 )
+                # New timeline: restart the per-stream status baselines so
+                # the first status of the new timeline is accepted instead
+                # of being dropped as older than pre-rollback statuses.
+                self.last_mapping_status_stamp = None
+                self.last_localization_status_stamp = None
                 self._invalidate_plan_locked(
                     ModuleStatus.FAILED,
                     0.0,
@@ -290,7 +311,7 @@ class PlanningNode:
                     )
                 )
         except (TypeError, ValueError, OverflowError) as error:
-            self._enter_new_generation(fault_name)
+            self._enter_new_generation(fault_name, now)
             self._invalidate_plan_locked(
                 ModuleStatus.FAILED,
                 0.0,
@@ -302,14 +323,23 @@ class PlanningNode:
         self.active_faults.discard(fault_name)
         return True
 
-    def _enter_new_generation(self, fault_name, force=False):
-        """Invalidate cached data once per active fault or forced event."""
+    def _enter_new_generation(self, fault_name, now, force=False):
+        """Invalidate cached data once per active fault or forced event.
+
+        ``now`` must be the ROS time already observed atomically by the
+        caller via :meth:`_observe_ros_time`; it becomes the timestamp
+        boundary of the new generation. The boundary only moves when the
+        generation counter actually advances, so repeated heartbeats of
+        one active fault neither bump the generation nor move the
+        boundary.
+        """
         with self.lock:
             if not force and fault_name in self.active_faults:
                 return False
 
             self.active_faults.add(fault_name)
             self.generation += 1
+            self.generation_start_stamp = now
             self.map_msg = None
             self.odom_msg = None
             self.map_generation = None
@@ -334,6 +364,19 @@ class PlanningNode:
                 "map_stamp_invalid",
             ):
                 return
+            # Strict boundary: a Map produced before the current
+            # generation began must be dropped, not cached and not
+            # allowed to open yet another generation. Delayed old
+            # messages must not revive pre-generation data.
+            if msg.header.stamp <= self.generation_start_stamp:
+                rospy.logwarn_throttle(
+                    5.0,
+                    "dropping pre-generation map: header stamp %s is "
+                    "not after generation boundary %s",
+                    msg.header.stamp,
+                    self.generation_start_stamp,
+                )
+                return
             self.map_msg = msg
             self.map_received_at = now
             self.map_generation = self.generation
@@ -350,6 +393,18 @@ class PlanningNode:
                 now,
                 "localization_stamp_invalid",
             ):
+                return
+            # Strict boundary, symmetric with the Map admission rule:
+            # pre-generation Odometry is dropped without touching the
+            # current generation or its boundary.
+            if msg.header.stamp <= self.generation_start_stamp:
+                rospy.logwarn_throttle(
+                    5.0,
+                    "dropping pre-generation localization: header "
+                    "stamp %s is not after generation boundary %s",
+                    msg.header.stamp,
+                    self.generation_start_stamp,
+                )
                 return
             self.odom_msg = msg
             self.odom_received_at = now
@@ -369,6 +424,24 @@ class PlanningNode:
                 "mapping_status_stamp_invalid",
             ):
                 return
+            # Per-stream ordering: a status not strictly after the last
+            # accepted one is delayed/duplicate. Dropping it must not
+            # change the stored status, clear any fault, or open a
+            # generation; in particular an old valid=true status must
+            # never mask a newer invalid one.
+            if (
+                self.last_mapping_status_stamp is not None
+                and msg.header.stamp <= self.last_mapping_status_stamp
+            ):
+                rospy.logwarn_throttle(
+                    5.0,
+                    "dropping out-of-order mapping status: stamp %s is "
+                    "not after last accepted stamp %s",
+                    msg.header.stamp,
+                    self.last_mapping_status_stamp,
+                )
+                return
+            self.last_mapping_status_stamp = msg.header.stamp
             previous_valid = (
                 self.mapping_status is not None
                 and self.mapping_status.valid
@@ -380,6 +453,7 @@ class PlanningNode:
             if not msg.valid:
                 self._enter_new_generation(
                     "mapping_invalid",
+                    now,
                     force=previous_valid,
                 )
                 self._invalidate_plan_locked(
@@ -404,6 +478,20 @@ class PlanningNode:
                 "localization_status_stamp_invalid",
             ):
                 return
+            # Per-stream ordering, symmetric with mapping status.
+            if (
+                self.last_localization_status_stamp is not None
+                and msg.header.stamp <= self.last_localization_status_stamp
+            ):
+                rospy.logwarn_throttle(
+                    5.0,
+                    "dropping out-of-order localization status: stamp %s "
+                    "is not after last accepted stamp %s",
+                    msg.header.stamp,
+                    self.last_localization_status_stamp,
+                )
+                return
+            self.last_localization_status_stamp = msg.header.stamp
             previous_valid = (
                 self.localization_status is not None
                 and self.localization_status.valid
@@ -415,6 +503,7 @@ class PlanningNode:
             if not msg.valid:
                 self._enter_new_generation(
                     "localization_invalid",
+                    now,
                     force=previous_valid,
                 )
                 self._invalidate_plan_locked(
@@ -530,7 +619,8 @@ class PlanningNode:
         if stale_statuses:
             for name in stale_statuses:
                 self._enter_new_generation(
-                    name.replace(" ", "_") + "_timeout"
+                    name.replace(" ", "_") + "_timeout",
+                    now,
                 )
             return (
                 ModuleStatus.TIMEOUT,
@@ -588,7 +678,7 @@ class PlanningNode:
             stale_inputs.append("localization")
         if stale_inputs:
             for name in stale_inputs:
-                self._enter_new_generation(name + "_timeout")
+                self._enter_new_generation(name + "_timeout", now)
             return (
                 ModuleStatus.TIMEOUT,
                 0.0,
@@ -621,8 +711,17 @@ class PlanningNode:
                 self.localization_timeout,
             )
         except (TypeError, ValueError, OverflowError) as error:
-            self._enter_new_generation("message_timestamp_invalid")
+            self._enter_new_generation(
+                "message_timestamp_invalid",
+                now,
+            )
             return (ModuleStatus.FAILED, 0.0, str(error))
+
+        # All four current-generation timestamps validated: this counts
+        # as a full recovery, so a later independent stale message can
+        # open a fresh generation again instead of being absorbed by
+        # the still-active fault.
+        self.active_faults.discard("message_timestamp_invalid")
 
         return None
 
@@ -658,6 +757,70 @@ class PlanningNode:
                     max_age,
                 )
             )
+
+    def _commit_invalid_result_if_current(
+        self,
+        state,
+        confidence,
+        detail,
+        expected_generation,
+        map_msg,
+        odom_msg,
+    ):
+        """Commit a negative planning result only for its own snapshot.
+
+        Negative results (``PLAN_NO_FRONTIER``, ``PLAN_UNREACHABLE``
+        and computation exceptions) are published only when the
+        generation, cached inputs and upstream statuses are still the
+        ones the computation ran on, and the watchdog still passes.
+        A stale snapshot is discarded so it cannot overwrite the
+        current generation's state with an old SUCCEEDED, BLOCKED or
+        FAILED result.
+
+        Returns True when the result was committed.
+        """
+        with self.lock:
+            snapshot_is_current = (
+                self.generation == expected_generation
+                and self.map_msg is map_msg
+                and self.odom_msg is odom_msg
+                and self.map_generation == expected_generation
+                and self.odom_generation == expected_generation
+                and self.mapping_status is not None
+                and self.mapping_status.valid
+                and self.localization_status is not None
+                and self.localization_status.valid
+            )
+            if not snapshot_is_current:
+                rospy.logwarn(
+                    "discarding negative planning result because its "
+                    "generation or inputs changed during planning"
+                )
+                return False
+
+            commit_now = rospy.Time.now()
+            watchdog_failure = self._watchdog_failure_locked(
+                commit_now
+            )
+            if watchdog_failure is not None:
+                failure_state, failure_confidence, failure_detail = (
+                    watchdog_failure
+                )
+                self._invalidate_plan_locked(
+                    failure_state,
+                    failure_confidence,
+                    failure_detail,
+                    stamp=commit_now,
+                )
+                return True
+
+            self._invalidate_plan_locked(
+                state,
+                confidence,
+                detail,
+                stamp=commit_now,
+            )
+            return True
 
     def plan_callback(self, _event):
         now = self._observe_ros_time()
@@ -718,7 +881,8 @@ class PlanningNode:
         if stale_statuses:
             for stale_status in stale_statuses:
                 self._enter_new_generation(
-                    stale_status.replace(" ", "_") + "_timeout"
+                    stale_status.replace(" ", "_") + "_timeout",
+                    now,
                 )
             self.invalidate_plan(
                 ModuleStatus.TIMEOUT,
@@ -780,7 +944,10 @@ class PlanningNode:
 
         if stale_inputs:
             for stale_input in stale_inputs:
-                self._enter_new_generation(stale_input + "_timeout")
+                self._enter_new_generation(
+                    stale_input + "_timeout",
+                    now,
+                )
             detail = "stale input timeout: " + " and ".join(
                 stale_inputs
             )
@@ -853,10 +1020,16 @@ class PlanningNode:
                 "planning failed: %s",
                 str(error),
             )
-            self.invalidate_plan(
+            # The failure may come from a computation that started in
+            # an older generation, so its result is committed only if
+            # the snapshot is still the current one.
+            self._commit_invalid_result_if_current(
                 ModuleStatus.FAILED,
                 0.0,
                 str(error),
+                generation,
+                map_msg,
+                odom_msg,
             )
 
     def plan_and_publish(
@@ -916,24 +1089,32 @@ class PlanningNode:
 
         if result["status"] == PLAN_NO_FRONTIER:
             detail = "exploration complete: no usable frontier"
-            rospy.loginfo_throttle(5.0, detail)
-            self.invalidate_plan(
+            committed = self._commit_invalid_result_if_current(
                 ModuleStatus.SUCCEEDED,
                 1.0,
                 detail,
+                expected_generation,
+                map_msg,
+                odom_msg,
             )
+            if committed:
+                rospy.loginfo_throttle(5.0, detail)
             return
 
         if result["status"] == PLAN_UNREACHABLE:
             detail = (
                 "frontiers detected but none is currently reachable"
             )
-            rospy.logwarn_throttle(5.0, detail)
-            self.invalidate_plan(
+            committed = self._commit_invalid_result_if_current(
                 ModuleStatus.BLOCKED,
                 0.0,
                 detail,
+                expected_generation,
+                map_msg,
+                odom_msg,
             )
+            if committed:
+                rospy.logwarn_throttle(5.0, detail)
             return
 
         if result["status"] != PLAN_SUCCESS:

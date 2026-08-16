@@ -57,15 +57,37 @@ Mapping/Localization invalid、status timeout、输入 timeout 或 ROS 时间回
 
 四项全部满足后才允许恢复，失效前的数据不能自动复活。
 
+每次 `generation += 1` 时记录 generation 起始时间边界
+`generation_start_stamp`；只有 generation 真正增加时才更新边界，同一
+active fault 的重复心跳不会移动边界。
+
+Map / Odometry 写入当前 generation 缓存前必须满足
+`header.stamp > generation_start_stamp`（严格大于，等于边界同样拒绝）。
+`stamp <= generation_start_stamp` 的消息视为上一 generation 延迟到达的
+旧数据，只丢弃：不更新缓存、不触发新的 generation。该判断与上游
+status 当前是否 valid 无关——新 generation 中 Mapping 仍 invalid 时，
+fresh 数据可以先行缓存为候选，待上游恢复 valid 后才能消费。
+
+ModuleStatus 按流单调准入：每个 status 流的 `header.stamp` 必须严格
+大于该流上一次已接受的时间戳，否则视为延迟/重复旧消息直接丢弃——
+不更新存储的 status、不清除 fault、不开启 generation。因此延迟到达的
+旧 `valid=true` status 不会覆盖更新的 invalid status，也不会触发恢复
+或导致后续真实 invalid 心跳强制额外 generation。ROS 时间回退（新
+时间线）会重置两个 status 流的基线。
+
 ## 时间保护
 
 Planning 分别检查：
 
 - `received_at`：本地接收 watchdog；
 - `header.stamp`：零时间戳、明显过旧和明显未来时间戳；
+- `generation_start_stamp`：上一 generation 延迟到达的数据不得进入
+  当前 generation 缓存；
 - `last_ros_time`：ROS `/clock` 回退。
 
-时间异常时发布空 Path 和 `planning/status.valid=false`。ROS 时间回退后旧 Map、Odometry 和 Path 均不得继续使用。
+时间异常时发布空 Path 和 `planning/status.valid=false`。ROS 时间回退后旧 Map、Odometry 和 Path 均不得继续使用。重复出现的独立 stale
+消息在完全恢复后可以再次开启新 generation；message 级时间戳校验在
+当前 generation 全部恢复正常后清除通用 fault。
 
 ## ROS 参数
 
@@ -92,6 +114,9 @@ Planning 分别检查：
 - [x] 上游 `ModuleStatus.valid` 门控
 - [x] status、Map 和 Odometry 接收超时保护
 - [x] 消息时间戳零值、过旧及未来值保护
+- [x] generation 起始时间边界与延迟旧数据丢弃
+- [x] 重复独立 stale 消息的 fault 生命周期
+- [x] negative 规划结果（NO_FRONTIER / UNREACHABLE / 异常）跨 generation 提交保护
 - [x] ROS 时间回退处理
 - [x] 新 generation 数据隔离与恢复门控
 - [x] 固定 `world/base` 契约检查
@@ -121,7 +146,7 @@ Planning 分别检查：
 ### 无 ROS 单元测试
 
 ```text
-Ran 62 tests
+Ran 68 tests
 OK
 ```
 
