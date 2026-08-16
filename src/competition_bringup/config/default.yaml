@@ -27,9 +27,19 @@ mapping:
 
 # --- Planning ---
 planning:
-  frontier_min_size: 5       # Minimum frontier cluster size (cells)
-  replan_interval: 2.0       # Replanning interval (seconds)
-  goal_tolerance: 0.5        # Goal arrival tolerance (m)
+  frontier_min_size: 5
+  replan_interval: 2.0
+  goal_tolerance: 0.5
+  inflation_radius: 0.25
+  size_weight: 1.0
+  distance_weight: 1.0
+  obstacle_threshold: 50
+  map_timeout: 5.0
+  localization_timeout: 5.0
+  mapping_status_timeout: 3.0
+  localization_status_timeout: 3.0
+  future_stamp_tolerance: 0.5
+  status_heartbeat_interval: 1.0
 
 # --- Localization ---
 localization:
