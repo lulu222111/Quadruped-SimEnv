@@ -14,11 +14,19 @@
   <build_depend>sensor_msgs</build_depend>
   <build_depend>geometry_msgs</build_depend>
   <build_depend>tf2_ros</build_depend>
+  <build_depend>cv_bridge</build_depend>
+  <build_depend>message_filters</build_depend>
   <build_depend>competition_interfaces</build_depend>
 
   <exec_depend>rospy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>message_filters</exec_depend>
   <exec_depend>competition_interfaces</exec_depend>
+
+  <!-- Test dependencies for catkin_add_nosetests and rostest -->
+  <test_depend>rosunit</test_depend>
+  <test_depend>rostest</test_depend>
 </package>

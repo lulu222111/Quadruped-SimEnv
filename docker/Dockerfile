@@ -53,6 +53,7 @@ RUN apt-get update \
         ros-noetic-desktop-full \
         python3-catkin-tools \
         python3-numpy \
+        python3-opencv \
         python3-pip \
         python3-rosdep \
         python3-vcstool \
