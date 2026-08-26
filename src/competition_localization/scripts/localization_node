@@ -101,6 +101,27 @@ def _quat_from_euler_rpy(roll: float, pitch: float, yaw: float
     )
 
 
+def _euler_rpy_from_quat(q: Tuple[float, float, float, float]
+                         ) -> Tuple[float, float, float]:
+    """Convert quaternion (x, y, z, w) to intrinsic XYZ roll/pitch/yaw."""
+    x, y, z, w = _normalize_quat(q)
+    roll = math.atan2(
+        2.0 * (w * x + y * z),
+        1.0 - 2.0 * (x * x + y * y),
+    )
+    sin_pitch = max(-1.0, min(1.0, 2.0 * (w * y - z * x)))
+    pitch = math.asin(sin_pitch)
+    yaw = math.atan2(
+        2.0 * (w * z + x * y),
+        1.0 - 2.0 * (y * y + z * z),
+    )
+    return roll, pitch, yaw
+
+
+def _wrap_angle(value: float) -> float:
+    return (value + math.pi) % (2.0 * math.pi) - math.pi
+
+
 def _normalize_quat(q: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
     """Normalize a quaternion; return identity if degenerate."""
     norm = math.sqrt(sum(c * c for c in q))
@@ -306,6 +327,26 @@ class LocalizationAdapter:
         self.input_frame_id = rospy.get_param("~input_frame_id", "camera_init")
         self.input_child_frame_id = rospy.get_param("~input_child_frame_id", "body")
         self.watchdog_timeout = rospy.get_param("~watchdog_timeout", 1.0)
+        self.correction_enabled = bool(
+            rospy.get_param("~correction_enabled", False)
+        )
+        self.correction_odom_topic = rospy.get_param(
+            "~correction_odom_topic",
+            "/c2r28/proprio_fastlio_shadow/odom",
+        )
+        self.correction_mode = rospy.get_param(
+            "~correction_mode", "full_pose"
+        )
+        if self.correction_mode not in ("full_pose", "yaw_only", "planar_relative"):
+            raise ValueError(
+                "~correction_mode must be 'full_pose', 'yaw_only', or 'planar_relative'"
+            )
+        self.correction_frame_id = rospy.get_param(
+            "~correction_frame_id", "c2r28_fastlio_local"
+        )
+        self.correction_child_frame_id = rospy.get_param(
+            "~correction_child_frame_id", "c2r28_base"
+        )
         # Future-timestamp tolerance: stamps ahead of now() by more than this
         # are rejected (clock skew / simulator glitch guard).
         self._max_future_stamp_skew = rospy.get_param("~max_future_stamp_skew", 1.0)
@@ -329,6 +370,13 @@ class LocalizationAdapter:
         self._aligned = False
         self._T_world_to_camera_init: Optional[Transform] = None
         self._T_base_to_imu: Optional[Transform] = None
+        self._latest_raw_world_to_base: Optional[Transform] = None
+        self._T_world_to_correction: Optional[Transform] = None
+        self._world_correction_yaw_offset: Optional[float] = None
+        self._latest_correction_world_yaw: Optional[float] = None
+        self._world_correction_xy_offset: Optional[Tuple[float, float]] = None
+        self._latest_correction_world_xy: Optional[Tuple[float, float]] = None
+        self._last_correction_stamp: Optional[rospy.Time] = None
         self._state = ModuleStatus.STARTING
         self._valid = False
         self._detail = "waiting for first FAST-LIO odometry"
@@ -351,6 +399,14 @@ class LocalizationAdapter:
         self._odom_sub = rospy.Subscriber(
             self.odom_input_topic, Odometry, self._odom_callback, queue_size=10
         )
+        self._correction_sub = None
+        if self.correction_enabled:
+            self._correction_sub = rospy.Subscriber(
+                self.correction_odom_topic,
+                Odometry,
+                self._correction_callback,
+                queue_size=20,
+            )
 
         # Watchdog timer: auto-TIMEOUT when no valid input arrives.
         self._watchdog_timer = rospy.Timer(
@@ -364,8 +420,9 @@ class LocalizationAdapter:
         self._load_base_to_imu_extrinsic()
 
         rospy.loginfo(
-            "localization_node: adapter ready. input=%s, publish_tf=%s, timeout=%.2f s",
+            "localization_node: adapter ready. input=%s, publish_tf=%s, timeout=%.2f s, correction=%s",
             self.odom_input_topic, self.publish_tf_enabled, self.input_timeout,
+            self.correction_enabled,
         )
 
     # --- initialization ---------------------------------------------------------
@@ -672,9 +729,37 @@ class LocalizationAdapter:
                     else _identity_transform()
                 )
                 T_world_to_base = compose_world_to_base(T_world_to_body, T_base_to_imu)
-                out = odom_from_transform(
-                    T_world_to_base, msg.header.stamp, "world", "base"
-                )
+                self._latest_raw_world_to_base = T_world_to_base
+                if (
+                    getattr(self, "correction_enabled", False)
+                    and self.correction_mode == "full_pose"
+                ):
+                    if self._T_world_to_correction is None:
+                        self._state = ModuleStatus.STARTING
+                        self._valid = False
+                        self._detail = "waiting for proprio-FastLIO correction alignment"
+                    return
+                if (
+                    getattr(self, "correction_enabled", False)
+                    and getattr(self, "correction_mode", "full_pose")
+                    in ("yaw_only", "planar_relative")
+                    and getattr(self, "_latest_correction_world_yaw", None) is not None
+                ):
+                    if (
+                        self.correction_mode == "planar_relative"
+                        and self._latest_correction_world_xy is not None
+                    ):
+                        T_world_to_base = self._replace_transform_planar(
+                            T_world_to_base,
+                            self._latest_correction_world_xy,
+                            self._latest_correction_world_yaw,
+                        )
+                    else:
+                        T_world_to_base = self._replace_transform_yaw(
+                            T_world_to_base,
+                            self._latest_correction_world_yaw,
+                        )
+                out = odom_from_transform(T_world_to_base, msg.header.stamp, "world", "base")
                 # Covariance: marked UNKNOWN (all zeros).
                 # The incoming covariance from FAST-LIO is expressed in the
                 # IMU/body frame.  Without a proper frame transformation
@@ -685,7 +770,19 @@ class LocalizationAdapter:
                 self._odom_msg = out
                 self._state = ModuleStatus.RUNNING
                 self._valid = True
-                self._detail = "FAST-LIO odometry valid"
+                if (
+                    getattr(self, "correction_enabled", False)
+                    and getattr(self, "correction_mode", "full_pose")
+                    in ("yaw_only", "planar_relative")
+                    and getattr(self, "_latest_correction_world_yaw", None) is not None
+                ):
+                    self._detail = (
+                        "FAST-LIO z/attitude + proprio planar correction active"
+                        if self.correction_mode == "planar_relative"
+                        else "FAST-LIO translation + proprio yaw correction active"
+                    )
+                else:
+                    self._detail = "FAST-LIO odometry valid"
                 self._odom_pub.publish(out)
 
                 if self.publish_tf_enabled and self._br is not None:
@@ -694,6 +791,156 @@ class LocalizationAdapter:
                 self._state = ModuleStatus.STARTING
                 self._valid = False
                 self._detail = "aligning FAST-LIO frame to world (t0 pose latched)"
+
+    def _correction_callback(self, msg: Odometry) -> None:
+        """Apply an optional relative correction trajectory.
+
+        The correction source remains in its isolated frame and never
+        publishes TF.  This adapter latches one world alignment against the
+        already validated FAST-LIO start alignment, then remains the sole
+        publisher of the competition odometry and world->base TF contracts.
+        The feature is disabled by default.
+        """
+        if not self.correction_enabled:
+            return
+        with self._lock:
+            if not self._start_pose_valid:
+                return
+            if not is_finite_pose(msg.pose.pose) or not is_valid_quaternion(msg.pose.pose):
+                self._state = ModuleStatus.FAILED
+                self._valid = False
+                self._detail = "received invalid correction odometry pose"
+                return
+            if (
+                msg.header.frame_id != self.correction_frame_id
+                or msg.child_frame_id != self.correction_child_frame_id
+            ):
+                self._state = ModuleStatus.BLOCKED
+                self._valid = False
+                self._detail = (
+                    "unexpected correction frames {}/{} (expected {}/{})".format(
+                        msg.header.frame_id,
+                        msg.child_frame_id,
+                        self.correction_frame_id,
+                        self.correction_child_frame_id,
+                    )
+                )
+                return
+            stamp = msg.header.stamp
+            if stamp is None or stamp.to_sec() <= 0.0:
+                self._state = ModuleStatus.FAILED
+                self._valid = False
+                self._detail = "correction odometry has invalid timestamp"
+                return
+            if (
+                self._last_correction_stamp is not None
+                and stamp.to_sec() < self._last_correction_stamp.to_sec()
+            ):
+                self._state = ModuleStatus.FAILED
+                self._valid = False
+                self._detail = "correction odometry timestamp jumped backwards"
+                return
+            self._last_correction_stamp = stamp
+            if not self._aligned or self._latest_raw_world_to_base is None:
+                self._state = ModuleStatus.STARTING
+                self._valid = False
+                self._detail = "waiting for FAST-LIO world alignment before correction"
+                return
+
+            T_correction_to_base = transform_from_odom(msg)
+            if self.correction_mode in ("yaw_only", "planar_relative"):
+                raw_translation, raw_quaternion = _transform_to_translation_quat(
+                    self._latest_raw_world_to_base
+                )
+                _, _, raw_yaw = _euler_rpy_from_quat(raw_quaternion)
+                _, correction_quaternion = _transform_to_translation_quat(
+                    T_correction_to_base
+                )
+                _, _, correction_yaw = _euler_rpy_from_quat(
+                    correction_quaternion
+                )
+                if self._world_correction_yaw_offset is None:
+                    self._world_correction_yaw_offset = _wrap_angle(
+                        raw_yaw - correction_yaw
+                    )
+                    rospy.loginfo(
+                        "localization_node: latched proprio yaw-only alignment"
+                    )
+                corrected_yaw = _wrap_angle(
+                    self._world_correction_yaw_offset + correction_yaw
+                )
+                self._latest_correction_world_yaw = corrected_yaw
+                if self.correction_mode == "planar_relative":
+                    correction_translation, _ = _transform_to_translation_quat(
+                        T_correction_to_base
+                    )
+                    if self._world_correction_xy_offset is None:
+                        self._world_correction_xy_offset = (
+                            raw_translation[0] - correction_translation[0],
+                            raw_translation[1] - correction_translation[1],
+                        )
+                        rospy.loginfo(
+                            "localization_node: latched proprio planar-axis alignment"
+                        )
+                    self._latest_correction_world_xy = (
+                        self._world_correction_xy_offset[0] + correction_translation[0],
+                        self._world_correction_xy_offset[1] + correction_translation[1],
+                    )
+                # Do not publish from the 50 Hz correction callback.  The
+                # canonical FAST-LIO callback remains the single 10 Hz odom/
+                # TF publisher and applies this cached yaw to its own stamp;
+                # this guarantees monotonic timestamps for mapping/planning.
+                return
+            else:
+                if self._T_world_to_correction is None:
+                    self._T_world_to_correction = _transform_multiply(
+                        self._latest_raw_world_to_base,
+                        _transform_inverse(T_correction_to_base),
+                    )
+                    rospy.loginfo(
+                        "localization_node: latched proprio-FastLIO correction alignment"
+                    )
+
+                T_world_to_base = _transform_multiply(
+                    self._T_world_to_correction, T_correction_to_base
+                )
+                detail = "proprio-FastLIO correction active"
+            out = odom_from_transform(
+                T_world_to_base, stamp, "world", "base"
+            )
+            out.pose.covariance = [0.0] * 36
+            self._last_odom_time = rospy.Time.now()
+            self._odom_msg = out
+            self._state = ModuleStatus.RUNNING
+            self._valid = True
+            self._detail = detail
+            self._odom_pub.publish(out)
+            if self.publish_tf_enabled and self._br is not None:
+                self._publish_tf(out)
+
+    @staticmethod
+    def _replace_transform_yaw(transform: Transform, yaw: float) -> Transform:
+        """Keep translation and raw roll/pitch while replacing only yaw."""
+        translation, quaternion = _transform_to_translation_quat(transform)
+        roll, pitch, _ = _euler_rpy_from_quat(quaternion)
+        return _transform_from_translation_quat(
+            translation,
+            _quat_from_euler_rpy(roll, pitch, yaw),
+        )
+
+    @staticmethod
+    def _replace_transform_planar(
+        transform: Transform,
+        xy: Tuple[float, float],
+        yaw: float,
+    ) -> Transform:
+        """Use proprio x/y/yaw while retaining FAST-LIO z/roll/pitch."""
+        translation, quaternion = _transform_to_translation_quat(transform)
+        roll, pitch, _ = _euler_rpy_from_quat(quaternion)
+        return _transform_from_translation_quat(
+            (xy[0], xy[1], translation[2]),
+            _quat_from_euler_rpy(roll, pitch, yaw),
+        )
 
     def _compute_alignment(self, first_pose: Transform) -> None:
         """Compute world -> camera_init using ONLY the latched first pose P0.

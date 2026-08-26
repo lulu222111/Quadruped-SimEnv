@@ -11,7 +11,9 @@ directory next to this file.
 
 import importlib.machinery
 import importlib.util
+import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -226,6 +228,19 @@ class FakeModuleStatus:
         self.detail = ""
 
 
+class FakeCompetitionState:
+    WAITING = 0
+    RUNNING = 1
+    RETURNING = 2
+    FINISHED = 3
+    ERROR = 4
+
+    def __init__(self):
+        self.header = FakeHeader()
+        self.state = self.WAITING
+        self.detail = ""
+
+
 def _make_package(name, attributes):
     package = types.ModuleType(name)
     package.__path__ = []
@@ -236,7 +251,10 @@ def _make_package(name, attributes):
 
 _CI_MSG = _make_package(
     "competition_interfaces.msg",
-    {"ModuleStatus": FakeModuleStatus},
+    {
+        "ModuleStatus": FakeModuleStatus,
+        "CompetitionState": FakeCompetitionState,
+    },
 )
 _CI = _make_package("competition_interfaces", {"msg": _CI_MSG})
 
@@ -254,6 +272,15 @@ _GEO_MSG = _make_package("geometry_msgs.msg", {"PoseStamped": FakePoseStamped})
 _GEO = _make_package("geometry_msgs", {"msg": _GEO_MSG})
 
 
+class FakeBool:
+    def __init__(self, data=False):
+        self.data = data
+
+
+_STD_MSG = _make_package("std_msgs.msg", {"Bool": FakeBool})
+_STD = _make_package("std_msgs", {"msg": _STD_MSG})
+
+
 def _install_fake_modules():
     # Deliberately shadow any real ROS python modules so this test file
     # stays deterministic with or without a ROS installation.
@@ -264,6 +291,8 @@ def _install_fake_modules():
     sys.modules["nav_msgs.msg"] = _NAV_MSG
     sys.modules["geometry_msgs"] = _GEO
     sys.modules["geometry_msgs.msg"] = _GEO_MSG
+    sys.modules["std_msgs"] = _STD
+    sys.modules["std_msgs.msg"] = _STD_MSG
 
 
 _install_fake_modules()
@@ -369,6 +398,363 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
         self.node.odom_callback(self._make_odom(base_time + 0.1))
         set_clock(base_time + 0.2)
         self.node.plan_callback(None)
+
+    def test_start_recovery_parameter_defaults_disabled(self):
+        self.assertEqual(self.node.start_recovery_radius_cells, 0)
+
+    def test_returning_state_loads_public_start_and_uses_goal_planner(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scene_path = Path(temp_dir) / "team_scene_info.json"
+            scene_path.write_text(
+                json.dumps(
+                    {
+                        "coordinate_frame": "world",
+                        "robot_start": {
+                            "x": 2.5,
+                            "y": 2.5,
+                            "z": 0.0,
+                            "yaw": 0.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _reset_fake_ros(clock=100.0)
+            _STATE["params"]["team_scene_info_path"] = str(scene_path)
+            node = PLANNING_NODE.PlanningNode()
+            self.node = node
+            state = FakeCompetitionState()
+            state.state = FakeCompetitionState.RETURNING
+            node.competition_state_callback(state)
+            self.assertTrue(node.returning)
+            self.assertEqual(node.return_start_pose["x"], 2.5)
+
+            calls = []
+            original = PLANNING_NODE.plan_to_goal_region_with_status
+
+            def capture_goal(*args, **kwargs):
+                calls.append(kwargs)
+                return {
+                    "status": PLANNING_NODE.PLAN_SUCCESS,
+                    "goal_cell": (2, 2),
+                    "path": [(2, 2)],
+                    "frontier_count": 0,
+                    "start_recovery_used": False,
+                    "start_recovery_cell": None,
+                    "robot_cell_raw_value": 0,
+                    "robot_cell_inflated_value": 0,
+                }
+
+            PLANNING_NODE.plan_to_goal_region_with_status = capture_goal
+            try:
+                self._publish_healthy_generation(100.0)
+            finally:
+                PLANNING_NODE.plan_to_goal_region_with_status = original
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["goal_cell"], (2, 2))
+            self.assertEqual(calls[0]["goal_search_radius_cells"], 2)
+
+    def test_return_path_commit_republishes_planner_geometry_without_replanning(self):
+        """A committed route survives map churn only while inputs stay valid."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scene_path = Path(temp_dir) / "team_scene_info.json"
+            scene_path.write_text(
+                json.dumps(
+                    {
+                        "coordinate_frame": "world",
+                        "robot_start": {
+                            "x": 1.5,
+                            "y": 1.5,
+                            "z": 0.0,
+                            "yaw": 0.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _reset_fake_ros(clock=100.0)
+            _STATE["params"].update(
+                {
+                    "team_scene_info_path": str(scene_path),
+                    "return_path_commit_enabled": True,
+                    "map_timeout": 1.0,
+                    "localization_timeout": 2.0,
+                    "mapping_status_timeout": 3.0,
+                    "localization_status_timeout": 3.0,
+                    "future_stamp_tolerance": 0.2,
+                    "status_heartbeat_interval": 0.1,
+                }
+            )
+            self.node = PLANNING_NODE.PlanningNode()
+            state = FakeCompetitionState()
+            state.state = FakeCompetitionState.RETURNING
+            self.node.competition_state_callback(state)
+            self._publish_healthy_generation(100.0)
+
+            initial_path = self._last_path()
+            self.assertIsNotNone(initial_path)
+            self.assertIsNotNone(self.node.return_committed_path)
+            self.assertIn("RETURNING path", self._last_status_msg().detail)
+
+            original = PLANNING_NODE.plan_to_goal_region_with_status
+
+            def should_not_replan(*args, **kwargs):
+                raise AssertionError("committed return route was replanned")
+
+            PLANNING_NODE.plan_to_goal_region_with_status = should_not_replan
+            try:
+                self._publish_healthy_generation(101.0)
+            finally:
+                PLANNING_NODE.plan_to_goal_region_with_status = original
+
+            committed_path = self._last_path()
+            self.assertEqual(
+                len(committed_path.poses), len(initial_path.poses)
+            )
+            self.assertIn(
+                "RETURNING committed planner path",
+                self._last_status_msg().detail,
+            )
+
+            # A committed route is not a way around upstream safety gates.
+            # Invalid localization must still block the follower path.
+            set_clock(102.0)
+            self.node.localization_status_callback(
+                self._make_status(False, 102.0)
+            )
+            self.node.plan_callback(None)
+            self.assertEqual(len(self._last_path().poses), 0)
+            self.assertFalse(self._last_status_msg().valid)
+
+    def test_stuck_report_drops_commit_once_then_recommits(self):
+        """A stuck notice clears the committed route once; the next healthy
+        generation re-commits and a repeat stuck report is ignored (budget)."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scene_path = Path(temp_dir) / "team_scene_info.json"
+            scene_path.write_text(
+                json.dumps(
+                    {
+                        "coordinate_frame": "world",
+                        "robot_start": {
+                            "x": 1.5,
+                            "y": 1.5,
+                            "z": 0.0,
+                            "yaw": 0.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _reset_fake_ros(clock=100.0)
+            _STATE["params"].update(
+                {
+                    "team_scene_info_path": str(scene_path),
+                    "return_path_commit_enabled": True,
+                    "return_recommit_on_stuck_enabled": True,
+                    "map_timeout": 1.0,
+                    "localization_timeout": 2.0,
+                    "mapping_status_timeout": 3.0,
+                    "localization_status_timeout": 3.0,
+                    "future_stamp_tolerance": 0.2,
+                    "status_heartbeat_interval": 0.1,
+                }
+            )
+            self.node = PLANNING_NODE.PlanningNode()
+            state = FakeCompetitionState()
+            state.state = FakeCompetitionState.RETURNING
+            self.node.competition_state_callback(state)
+            self._publish_healthy_generation(100.0)
+            self.assertIsNotNone(self.node.return_committed_path)
+
+            # Stuck True -> committed route cleared, plan invalidated.
+            stuck = FakeBool(data=True)
+            self.node.stuck_callback(stuck)
+            self.assertIsNone(self.node.return_committed_path)
+            self.assertFalse(self._last_status_msg().valid)
+
+            # Healthy generation replans and re-commits (full A* ran).
+            self._publish_healthy_generation(101.0)
+            self.assertIsNotNone(self.node.return_committed_path)
+            # A following generation republishes the committed route.
+            self._publish_healthy_generation(102.0)
+            self.assertIn(
+                "RETURNING committed planner path",
+                self._last_status_msg().detail,
+            )
+
+            # Repeat stuck in the same epoch is ignored (budget used).
+            self.node.stuck_callback(stuck)
+            self.assertIsNotNone(self.node.return_committed_path)
+
+    def test_stuck_report_ignored_when_disabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scene_path = Path(temp_dir) / "team_scene_info.json"
+            scene_path.write_text(
+                json.dumps(
+                    {
+                        "coordinate_frame": "world",
+                        "robot_start": {
+                            "x": 1.5,
+                            "y": 1.5,
+                            "z": 0.0,
+                            "yaw": 0.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _reset_fake_ros(clock=100.0)
+            _STATE["params"].update(
+                {
+                    "team_scene_info_path": str(scene_path),
+                    "return_path_commit_enabled": True,
+                    "return_recommit_on_stuck_enabled": False,
+                    "map_timeout": 1.0,
+                    "localization_timeout": 2.0,
+                    "mapping_status_timeout": 3.0,
+                    "localization_status_timeout": 3.0,
+                    "future_stamp_tolerance": 0.2,
+                    "status_heartbeat_interval": 0.1,
+                }
+            )
+            self.node = PLANNING_NODE.PlanningNode()
+            state = FakeCompetitionState()
+            state.state = FakeCompetitionState.RETURNING
+            self.node.competition_state_callback(state)
+            self._publish_healthy_generation(100.0)
+            self.assertIsNotNone(self.node.return_committed_path)
+            self.node.stuck_callback(FakeBool(data=True))
+            self.assertIsNotNone(self.node.return_committed_path)
+
+    def test_exploration_blocked_nudge_publishes_short_blind_path(self):
+        """PLAN_UNREACHABLE in exploration publishes a bounded nudge path."""
+        _reset_fake_ros(clock=100.0)
+        _STATE["params"].update(
+            {
+                "exploration_blocked_nudge_enabled": True,
+                "exploration_blocked_nudge_distance": 2.0,
+                "map_timeout": 1.0,
+                "localization_timeout": 2.0,
+                "mapping_status_timeout": 3.0,
+                "localization_status_timeout": 3.0,
+                "future_stamp_tolerance": 0.2,
+                "status_heartbeat_interval": 0.1,
+            }
+        )
+        self.node = PLANNING_NODE.PlanningNode()
+
+        # Robot (2,2) in a small free pocket fully enclosed by known occupied
+        # cells (no reachable frontier).  A separate free region (bottom-right)
+        # has an unknown frontier boundary but is unreachable -> PLAN_UNREACHABLE.
+        enclosed = FakeOccupancyGrid()
+        enclosed.header.stamp = FakeTime(100.1)
+        enclosed.header.frame_id = "world"
+        enclosed.info.resolution = 1.0
+        enclosed.info.width = 9
+        enclosed.info.height = 9
+        enclosed.data = [
+            100,100,100,100,100,100,100,100,100,
+            100,  0,  0,100,100,100,100,100,100,
+            100,  0,  0,100,100,100,100,100,100,
+            100,100,100,100,100,100,100,100,100,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+             -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        ]
+        set_clock(100.0)
+        self.node.mapping_status_callback(self._make_status(True, 100.0))
+        self.node.localization_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.map_callback(enclosed)
+        self.node.odom_callback(self._make_odom(100.1))
+        set_clock(100.2)
+        self.node.plan_callback(None)
+
+        nudge_path = self._last_path()
+        self.assertIsNotNone(nudge_path)
+        self.assertGreaterEqual(len(nudge_path.poses), 2)
+        detail = self._last_status_msg().detail
+        self.assertIn("nudging toward nearest frontier", detail)
+
+    def test_exploration_blocked_nudge_disabled_falls_back_to_blocked(self):
+        _reset_fake_ros(clock=100.0)
+        _STATE["params"].update(
+            {
+                "exploration_blocked_nudge_enabled": False,
+                "map_timeout": 1.0,
+                "localization_timeout": 2.0,
+                "mapping_status_timeout": 3.0,
+                "localization_status_timeout": 3.0,
+                "future_stamp_tolerance": 0.2,
+                "status_heartbeat_interval": 0.1,
+            }
+        )
+        self.node = PLANNING_NODE.PlanningNode()
+        enclosed = FakeOccupancyGrid()
+        enclosed.header.stamp = FakeTime(100.1)
+        enclosed.header.frame_id = "world"
+        enclosed.info.resolution = 1.0
+        enclosed.info.width = 9
+        enclosed.info.height = 9
+        enclosed.data = [
+            100,100,100,100,100,100,100,100,100,
+            100,  0,  0,100,100,100,100,100,100,
+            100,  0,  0,100,100,100,100,100,100,
+            100,100,100,100,100,100,100,100,100,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+             -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        ]
+        set_clock(100.0)
+        self.node.mapping_status_callback(self._make_status(True, 100.0))
+        self.node.localization_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.map_callback(enclosed)
+        self.node.odom_callback(self._make_odom(100.1))
+        set_clock(100.2)
+        self.node.plan_callback(None)
+        self.assertIn(
+            "none is currently reachable", self._last_status_msg().detail
+        )
+        self.assertFalse(self._last_status_msg().valid)
+
+    def test_start_recovery_parameter_is_forwarded_to_core(self):
+        _reset_fake_ros(clock=100.0)
+        _STATE["params"]["start_recovery_radius_cells"] = 1
+        self.node = PLANNING_NODE.PlanningNode()
+        calls = []
+        original = PLANNING_NODE.plan_to_frontier_with_status
+
+        def capture_start_recovery_radius(*args, **kwargs):
+            calls.append(kwargs)
+            return original(*args, **kwargs)
+
+        PLANNING_NODE.plan_to_frontier_with_status = (
+            capture_start_recovery_radius
+        )
+        try:
+            self._publish_healthy_generation(100.0)
+        finally:
+            PLANNING_NODE.plan_to_frontier_with_status = original
+
+        self.assertEqual(self.node.start_recovery_radius_cells, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["start_recovery_radius_cells"], 1)
+
+    def test_negative_start_recovery_parameter_is_rejected(self):
+        _reset_fake_ros(clock=100.0)
+        _STATE["params"]["start_recovery_radius_cells"] = -1
+        with self.assertRaisesRegex(
+            ValueError,
+            "start_recovery_radius_cells must not be negative",
+        ):
+            PLANNING_NODE.PlanningNode()
 
     def test_delayed_pre_generation_map_is_dropped(self):
         node = self.node
@@ -879,6 +1265,57 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
         node.plan_callback(None)
         self.assertTrue(node.last_status[1])
         self.assertGreater(len(self._last_path().poses), 0)
+
+    def test_same_generation_input_update_still_commits(self):
+        """Regression for the C2R2 live-integration starvation.
+
+        A completed planning result must still commit when fresh map/odom
+        objects arrive DURING planning while the generation is unchanged
+        (no rollback, no invalid upstream status, no timeout).
+
+        Pre-fix, ``plan_and_publish`` required ``self.map_msg is map_msg``
+        and ``self.odom_msg is odom_msg`` (object identity), so under live
+        odom streaming (~9 Hz) every plan was discarded and
+        /competition/path never advanced past its first commit (fix-C2R2
+        evidence: zero fresh paths, zero raw/guarded cmd_vel, no motion).
+        Post-fix the commit check uses map_generation / odom_generation.
+        """
+        node = self.node
+
+        self._publish_healthy_generation(100.0)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 0)
+        self.assertIsNotNone(self._last_path())
+        paths_before = len(self._published("/competition/path"))
+
+        original = PLANNING_NODE.plan_to_frontier_with_status
+
+        def commit_with_mid_plan_input_update(*args, **kwargs):
+            # Compute the real plan from the captured snapshot, then
+            # simulate a live robot: fresh odom + map objects arrive
+            # while the result is still in flight.
+            result = original(*args, **kwargs)
+            set_clock(100.4)
+            node.odom_callback(self._make_odom(100.4))
+            node.map_callback(self._make_map(100.4))
+            return result
+
+        PLANNING_NODE.plan_to_frontier_with_status = (
+            commit_with_mid_plan_input_update
+        )
+        try:
+            set_clock(100.3)
+            node.plan_callback(None)
+        finally:
+            PLANNING_NODE.plan_to_frontier_with_status = original
+
+        # Same-generation instance updates must not starve the commit.
+        self.assertEqual(
+            len(self._published("/competition/path")),
+            paths_before + 1,
+        )
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 0)
 
 
 if __name__ == "__main__":

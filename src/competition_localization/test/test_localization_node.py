@@ -776,7 +776,9 @@ class TestLocalizationNode(unittest.TestCase):
                     "subprocess", "os.system", "import numpy", "import scipy"):
             self.assertNotIn(tok, source, f"forbidden token {tok!r} in node source")
         # The only input subscriber uses the legitimate /Odometry topic.
-        self.assertEqual(source.count("rospy.Subscriber("), 1)
+        self.assertEqual(source.count("rospy.Subscriber("), 2)
+        self.assertIn("correction_enabled", source)
+        self.assertIn("/c2r28/proprio_fastlio_shadow/odom", source)
         self.assertIn("self.odom_input_topic", source)
         self.assertIn('"/Odometry"', source)
         # Output frames are hard-wired to world/base (never odom).

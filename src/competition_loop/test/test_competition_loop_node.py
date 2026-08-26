@@ -95,11 +95,22 @@ class _MockPub:
     def __init__(self, *a, **kw): self.msgs = []
     def publish(self, m): self.msgs.append(m)
 
+class _MockSub:
+    def __init__(self, *a, **kw): self.args = a; self.kwargs = kw
+    def unregister(self): pass
+
+class _MockTfBuffer:
+    def __init__(self, *a, **kw): pass
+
+class _MockTfListener:
+    def __init__(self, *a, **kw): pass
+
 class _MockRospy:
     ROSException = type("ROSException", (Exception,), {})
     Time = _MockTime
     Duration = _MockDuration
     Publisher = _MockPub
+    Subscriber = _MockSub
     Service = type("Svc", (), {"__init__": lambda s, *a, **kw: None})
     Timer = type("Timer", (), {"__init__": lambda s, *a, **kw: None})
     INFO = 1
@@ -110,7 +121,7 @@ class _MockRospy:
     def get_published_topics(self): return [["/rosout", "rosgraph_msgs/Log"]]
     def spin(self): pass
     def __getattr__(self, n):
-        if n in ("ROSException","Time","Duration","Publisher","Service","Timer",
+        if n in ("ROSException","Time","Duration","Publisher","Subscriber","Service","Timer",
                   "INFO","_params","get_param","init_node","get_published_topics","spin"):
             return object.__getattribute__(self, n)
         return getattr(_MockLog, n, _MockLog.info)
@@ -145,7 +156,24 @@ _CSM.__init__ = _csm_init
 _ci_msg.CompetitionState = _CSM
 _ci_msg.HazardCandidate = type("HC",(),{"__init__":lambda s,**kw:[setattr(s,k,v) for k,v in kw.items()]})
 _ci_msg.HazardCandidateArray = type("HCA",(),{"__init__":lambda s,**kw:[setattr(s,k,v) for k,v in kw.items()]})
-_ci_msg.ModuleStatus = type("MS",(),{"RUNNING":1})
+class _ModuleStatus:
+    STARTING = 1
+    RUNNING = 2
+    SUCCEEDED = 3
+    BLOCKED = 4
+    TIMEOUT = 5
+    FAILED = 6
+
+    def __init__(self, **kw):
+        self.header = type("Hdr", (), {"stamp": None})()
+        self.state = self.STARTING
+        self.valid = False
+        self.confidence = 0.0
+        self.detail = ""
+        for key, value in kw.items():
+            setattr(self, key, value)
+
+_ci_msg.ModuleStatus = _ModuleStatus
 sys.modules["competition_interfaces"] = _ci
 sys.modules["competition_interfaces.msg"] = _ci_msg
 _bgi = type("m",(),{})()
@@ -157,6 +185,17 @@ sys.modules["building_generator_interfaces.srv"] = _bgi_srv
 _nav = type("m",(),{})()
 _nav_msg = type("m",(),{})()
 _nav.msg = _nav_msg
+class _Odometry:
+    def __init__(self):
+        self.header = type("Hdr", (), {"stamp": _MockTime(0.0)})()
+        self.pose = type(
+            "PoseWithCovariance",
+            (),
+            {"pose": type("Pose", (), {
+                "position": type("Point", (), {"x": 0.0, "y": 0.0, "z": 0.0})(),
+            })()},
+        )()
+_nav_msg.Odometry = _Odometry
 sys.modules["nav_msgs"] = _nav
 sys.modules["nav_msgs.msg"] = _nav_msg
 
@@ -165,6 +204,14 @@ _geo_msg = type("m",(),{})()
 _geo.msg = _geo_msg
 sys.modules["geometry_msgs"] = _geo
 sys.modules["geometry_msgs.msg"] = _geo_msg
+
+_tf2 = type("m", (), {})()
+_tf2.Buffer = _MockTfBuffer
+_tf2.TransformListener = _MockTfListener
+_tf2.LookupException = type("LookupException", (Exception,), {})
+_tf2.ConnectivityException = type("ConnectivityException", (Exception,), {})
+_tf2.ExtrapolationException = type("ExtrapolationException", (Exception,), {})
+sys.modules["tf2_ros"] = _tf2
 
 # Import the module
 _cn_path = str(Path(__file__).resolve().parents[1] / "scripts" / "competition_loop_node")
@@ -344,6 +391,185 @@ class TestResultPathResolution(unittest.TestCase):
     def test_result_path_nonexistent_parent(self):
         node = self._make_node(**{"~result_path": "deep/nested/dir/out.json", "~workspace_root": "/tmp/ghost"})
         self.assertEqual(str(node._result_path), "/tmp/ghost/deep/nested/dir/out.json")
+
+
+class _MissionRouterStub:
+    def __init__(self, accepted_counts):
+        self._accepted_counts = list(accepted_counts)
+
+    def process(self, candidates, transform_fn):
+        del candidates, transform_fn
+        return self._accepted_counts.pop(0) if self._accepted_counts else 0
+
+
+class _MissionTimerStub:
+    elapsed_seconds = 4.0
+
+    def __init__(self, events):
+        self._events = events
+
+    def stop(self):
+        self._events.append("timer_stop")
+
+
+class _MissionWriterStub:
+    candidate_count = 1
+
+    def __init__(self, events):
+        self._events = events
+
+    def set_exploration_time(self, seconds):
+        self._events.append(("set_time", seconds))
+
+    def write(self):
+        self._events.append("write")
+
+
+class TestMissionFoundDanger(unittest.TestCase):
+    """Mission-level found event and first-detection finish policy."""
+
+    def _make_node(
+        self,
+        accepted_counts,
+        finish_on_first_detection=False,
+        return_on_first_detection=False,
+    ):
+        node = object.__new__(CompetitionLoopNode)
+        node._fsm = _cn_mod.CompetitionStateMachine()
+        node._fsm.transition_to(CompetitionPhase.RUNNING, "exploring")
+        node._candidate_router = _MissionRouterStub(accepted_counts)
+        node._result_writer = type("Writer", (), {"candidate_count": 1})()
+        node._finish_on_first_detection = finish_on_first_detection
+        node._return_on_first_detection = return_on_first_detection
+        node._return_start_pose = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0}
+        node._return_arrival_count = 0
+        node._return_arrival_samples = 3
+        node._return_arrival_tolerance = 0.25
+        node._return_input_timeout = 1.0
+        node._return_odom = None
+        node._return_localization_status = None
+        node._return_follower_status = None
+        node._found_danger = False
+        node._published_states = []
+        node._safety_events = []
+        node._publish_state = lambda: node._published_states.append(node._fsm.detail)
+        node._publish_safety_signals = lambda **kwargs: node._safety_events.append(kwargs)
+        node._transform_candidate_to_world = lambda candidate: candidate
+        node._end_competition = lambda reason: node._published_states.append(
+            "END:" + reason
+        )
+        return node
+
+    def test_first_candidate_triggers_found_danger(self):
+        node = self._make_node([1])
+        node._hazard_candidates_callback(type("Msg", (), {"candidates": []})())
+        self.assertTrue(node._found_danger)
+        self.assertIn("FOUND_DANGER", node._published_states)
+
+    def test_duplicate_does_not_retrigger_found_danger(self):
+        node = self._make_node([1, 0])
+        msg = type("Msg", (), {"candidates": []})()
+        node._hazard_candidates_callback(msg)
+        first_publication_count = len(node._published_states)
+        node._hazard_candidates_callback(msg)
+        self.assertEqual(len(node._published_states), first_publication_count)
+
+    def test_first_detection_finish_policy_calls_finish_after_event(self):
+        node = self._make_node([1], finish_on_first_detection=True)
+        node._hazard_candidates_callback(type("Msg", (), {"candidates": []})())
+        self.assertEqual(node._published_states, ["FOUND_DANGER", "END:FOUND_DANGER: finish_on_first_detection"])
+
+    def test_first_candidate_enters_returning_once(self):
+        node = self._make_node([1, 1], return_on_first_detection=True)
+        msg = type("Msg", (), {"candidates": []})()
+        node._hazard_candidates_callback(msg)
+        self.assertEqual(node._fsm.phase, CompetitionPhase.RETURNING)
+        self.assertIn("RETURNING", node._published_states)
+        first_event_count = len(node._published_states)
+        node._hazard_candidates_callback(msg)
+        self.assertEqual(len(node._published_states), first_event_count)
+
+    def test_no_candidate_keeps_running_without_event(self):
+        node = self._make_node([0])
+        node._hazard_candidates_callback(type("Msg", (), {"candidates": []})())
+        self.assertFalse(node._found_danger)
+        self.assertEqual(node._fsm.phase, CompetitionPhase.RUNNING)
+        self.assertEqual(node._published_states, [])
+
+    def test_finish_stops_before_result_write(self):
+        events = []
+        node = object.__new__(CompetitionLoopNode)
+        node._fsm = _cn_mod.CompetitionStateMachine()
+        node._fsm.transition_to(CompetitionPhase.RUNNING, "exploring")
+        node._timer = _MissionTimerStub(events)
+        node._result_writer = _MissionWriterStub(events)
+        node._publish_safety_signals = lambda **kwargs: events.append("safety_stop")
+        node._publish_state = lambda: events.append("state")
+        node._end_competition("FOUND_DANGER")
+        self.assertLess(events.index("safety_stop"), events.index("write"))
+
+    def test_return_arrival_requires_persistent_valid_inputs(self):
+        ros_time = _cn_mod.rospy.Time
+        ros_time.set_now(100.0)
+        node = self._make_node([], return_on_first_detection=True)
+        node._fsm.transition_to(CompetitionPhase.RETURNING, "return")
+        node._detect_time_regression = lambda: False
+        node._timer = type("Timer", (), {"is_expired": False})()
+        node._end_competition = lambda reason: node._published_states.append(
+            "END:" + reason
+        )
+        odom = _Odometry()
+        odom.header.stamp = ros_time(100.0)
+        odom.pose.pose.position.x = 0.1
+        odom.pose.pose.position.y = 0.1
+        localization = _ModuleStatus()
+        localization.header.stamp = ros_time(100.0)
+        localization.valid = True
+        follower = _ModuleStatus()
+        follower.header.stamp = ros_time(100.0)
+        follower.valid = True
+        follower.state = _ModuleStatus.SUCCEEDED
+        node._return_odom = odom
+        node._return_localization_status = localization
+        node._return_follower_status = follower
+
+        node._tick_returning()
+        node._tick_returning()
+        self.assertEqual(node._fsm.phase, CompetitionPhase.RETURNING)
+        self.assertNotIn("END:ARRIVED_START", node._published_states)
+        node._tick_returning()
+        self.assertIn("ARRIVED_START", node._published_states)
+        self.assertIn("END:ARRIVED_START", node._published_states)
+
+    def test_stale_localization_resets_arrival_persistence(self):
+        ros_time = _cn_mod.rospy.Time
+        ros_time.set_now(100.0)
+        node = self._make_node([], return_on_first_detection=True)
+        node._fsm.transition_to(CompetitionPhase.RETURNING, "return")
+        node._detect_time_regression = lambda: False
+        node._timer = type("Timer", (), {"is_expired": False})()
+        node._end_competition = lambda reason: node._published_states.append(
+            "END:" + reason
+        )
+        odom = _Odometry()
+        odom.pose.pose.position.x = 0.0
+        odom.pose.pose.position.y = 0.0
+        odom.header.stamp = ros_time(100.0)
+        localization = _ModuleStatus()
+        localization.valid = True
+        localization.header.stamp = ros_time(100.0)
+        follower = _ModuleStatus()
+        follower.valid = True
+        follower.state = _ModuleStatus.SUCCEEDED
+        follower.header.stamp = ros_time(100.0)
+        node._return_odom = odom
+        node._return_localization_status = localization
+        node._return_follower_status = follower
+        node._tick_returning()
+        self.assertEqual(node._return_arrival_count, 1)
+        localization.header.stamp = ros_time(98.0)
+        node._tick_returning()
+        self.assertEqual(node._return_arrival_count, 0)
 
 
 if __name__ == "__main__":

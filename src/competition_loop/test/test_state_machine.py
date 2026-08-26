@@ -151,6 +151,12 @@ class TestStateMachineInitial(unittest.TestCase):
         fsm = CompetitionStateMachine()
         self.assertTrue(fsm.should_emergency_stop())
 
+    def test_detail_can_change_without_phase_change(self):
+        fsm = CompetitionStateMachine()
+        fsm.set_detail("FOUND_DANGER")
+        self.assertEqual(fsm.phase, CompetitionPhase.WAITING)
+        self.assertEqual(fsm.detail, "FOUND_DANGER")
+
 
 class TestStateMachineTransitions(unittest.TestCase):
     """Valid and invalid transitions."""
@@ -173,6 +179,15 @@ class TestStateMachineTransitions(unittest.TestCase):
         self.assertTrue(fsm.is_terminal)
         self.assertFalse(fsm.should_control_be_enabled())
         self.assertTrue(fsm.should_emergency_stop())
+
+    def test_running_returning_finished_valid(self):
+        fsm = CompetitionStateMachine()
+        fsm.transition_to(CompetitionPhase.RUNNING)
+        self.assertTrue(fsm.transition_to(CompetitionPhase.RETURNING, "return"))
+        self.assertTrue(fsm.should_control_be_enabled())
+        self.assertFalse(fsm.should_emergency_stop())
+        self.assertTrue(fsm.transition_to(CompetitionPhase.FINISHED, "arrived"))
+        self.assertTrue(fsm.is_terminal)
 
     def test_running_to_error_valid(self):
         fsm = CompetitionStateMachine()

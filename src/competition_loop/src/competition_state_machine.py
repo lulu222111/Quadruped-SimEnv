@@ -4,7 +4,7 @@
 States:
   WAITING   — environment validation, waiting for dependencies
   RUNNING   — exploration active, timer counting
-  RETURNING — (reserved for future use)
+  RETURNING — return path is active
   FINISHED  — max_time reached or finish service called
   ERROR     — unrecoverable fault (e.g. forbidden topic detected in comp mode)
 """
@@ -71,14 +71,20 @@ class CompetitionStateMachine:
             return self._phase == CompetitionPhase.RUNNING
 
     def should_control_be_enabled(self) -> bool:
-        """Only enable motion control in RUNNING."""
+        """Enable motion control while exploring or returning."""
         with self._lock:
-            return self._phase == CompetitionPhase.RUNNING
+            return self._phase in (
+                CompetitionPhase.RUNNING,
+                CompetitionPhase.RETURNING,
+            )
 
     def should_emergency_stop(self) -> bool:
-        """Emergency stop is active in all states except RUNNING."""
+        """Emergency stop is active outside active motion phases."""
         with self._lock:
-            return self._phase != CompetitionPhase.RUNNING
+            return self._phase not in (
+                CompetitionPhase.RUNNING,
+                CompetitionPhase.RETURNING,
+            )
 
     # ------------------------------------------------------------------
     # Transitions
@@ -92,7 +98,7 @@ class CompetitionStateMachine:
           WAITING  -> ERROR
           RUNNING  -> FINISHED
           RUNNING  -> ERROR
-          RUNNING  -> RETURNING   (reserved)
+          RUNNING  -> RETURNING
           RETURNING -> FINISHED
           Any      -> ERROR       (force)
         """
@@ -119,6 +125,12 @@ class CompetitionStateMachine:
             self._phase = CompetitionPhase.ERROR
             self._detail = detail or "Forced to ERROR"
             rospy.logerr("FSM forced to ERROR: %s", self._detail)
+
+    def set_detail(self, detail: str) -> None:
+        """Update the mission detail without changing the public phase enum."""
+        with self._lock:
+            self._detail = str(detail)
+            rospy.loginfo("FSM detail: %s", self._detail)
 
     # ------------------------------------------------------------------
     # ROS message

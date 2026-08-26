@@ -24,6 +24,10 @@ mapping:
   map_height: 400            # Map height in cells
   update_rate: 2.0           # Map publish rate (Hz)
   sensor_max_range: 20.0     # Max sensor range (m)
+  # Base-frame ground returns are around -0.31..-0.18 m in MARSIM.  The
+  # occupancy mapper has no ground classifier, so keep only obstacles at
+  # least about 0.16 m above the floor instead of marking the floor occupied.
+  min_height: -0.15
 
 # --- Planning ---
 planning:

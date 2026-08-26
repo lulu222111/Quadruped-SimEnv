@@ -183,6 +183,19 @@ if(NOT CATKIN_MAKE)
     set(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/bin)
 endif()
 
+if(CATKIN_ENABLE_TESTING)
+    catkin_add_gtest(test_rl_handoff_transition
+        test/test_rl_handoff_transition.cpp)
+    if(TARGET test_rl_handoff_transition)
+        target_include_directories(test_rl_handoff_transition PRIVATE include)
+    endif()
+    catkin_add_gtest(test_rl_balance_observation
+        test/test_rl_balance_observation.cpp)
+    if(TARGET test_rl_balance_observation)
+        target_include_directories(test_rl_balance_observation PRIVATE include)
+    endif()
+endif()
+
 
 catkin_install_python(PROGRAMS
   scripts/virtual_joy.py

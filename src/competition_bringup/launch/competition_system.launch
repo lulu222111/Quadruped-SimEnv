@@ -20,6 +20,55 @@
   <arg name="competition_mode" default="true" />
   <arg name="use_mocks" default="false" />
   <arg name="auto_start" default="true" />
+  <arg name="finish_on_first_detection" default="false" />
+  <arg name="return_on_first_detection" default="false" />
+  <arg name="return_arrival_tolerance" default="0.25" />
+  <arg name="return_arrival_samples" default="3" />
+  <arg name="return_input_timeout" default="1.0" />
+  <arg name="planning_inflation_radius" default="0.25" />
+  <arg name="planning_start_recovery_radius_cells" default="0" />
+  <arg name="planning_frontier_min_size" default="5" />
+  <arg name="planning_frontier_goal_search_radius_cells" default="0" />
+  <arg name="planning_return_goal_search_radius_cells" default="2" />
+  <arg name="planning_return_path_commit_enabled" default="false" />
+  <arg name="planning_frontier_size_weight" default="1.0" />
+  <arg name="planning_heading_weight_cells" default="0.0" />
+  <arg name="planning_initial_forward_distance" default="0.0" />
+  <arg name="planning_initial_forward_lookahead" default="2.0" />
+  <arg name="planning_path_compression_enabled" default="false" />
+  <arg name="planning_enabled" default="true" />
+  <arg name="planning_path_topic" default="/competition/path" />
+  <arg name="path_follower_max_angular" default="0.8" />
+  <!-- Minimum forward speed while driving to a waypoint. The RL locomotion
+       policy stands still below ~0.2 m/s, which deadlocks the proportional
+       slowdown just outside goal_tolerance (R24 RETURNING stall). Floor the
+       drive command at the verified walking speed. -->
+  <arg name="path_follower_min_linear" default="0.25" />
+  <!-- Physical stuck detection (R25 wall-wedge): follower reports on
+       /competition/planning/stuck after this many seconds of commanded
+       driving with less than stuck_progress_epsilon measured displacement;
+       planner then drops the committed RETURNING route once and replans. -->
+  <arg name="path_follower_stuck_duration_sec" default="8.0" />
+  <arg name="path_follower_stuck_progress_epsilon" default="0.05" />
+  <!-- On stuck, briefly drive backward to break the wedge (R27 exploration
+       had no recovery; works in every phase). Bounded per path. -->
+  <arg name="path_follower_stuck_backoff_linear" default="0.15" />
+  <arg name="path_follower_stuck_backoff_duration" default="3.0" />
+  <arg name="path_follower_stuck_backoff_max" default="3" />
+  <arg name="planning_return_recommit_on_stuck_enabled" default="true" />
+  <!-- Exploration blocked recovery (R29 planner-BLOCKED deadlock): blind
+       nudge toward the nearest frontier when none is reachable, so the map
+       can re-observe and correct a drift-enclosed pocket. -->
+  <arg name="planning_exploration_blocked_nudge_enabled" default="true" />
+  <arg name="planning_exploration_blocked_nudge_distance" default="2.0" />
+  <arg name="path_follower_path_timeout" default="5.0" />
+  <!-- Forwarded to the canonical FAST-LIO launch. Defaults preserve the
+       retained production configuration; benchmark runs override explicitly. -->
+  <arg name="filter_size_surf" default="0.2" />
+  <arg name="filter_size_map" default="0.3" />
+  <arg name="localization_correction_enabled" default="false" />
+  <arg name="localization_correction_odom_topic" default="/c2r28/proprio_fastlio_shadow/odom" />
+  <arg name="localization_correction_mode" default="full_pose" />
 
   <rosparam command="load" file="$(find competition_bringup)/config/default.yaml" />
 
@@ -33,6 +82,11 @@
     <param name="max_time" value="600.0" />
     <param name="start_delay" value="5.0" />
     <param name="auto_start" value="$(arg auto_start)" />
+    <param name="finish_on_first_detection" value="$(arg finish_on_first_detection)" />
+    <param name="return_on_first_detection" value="$(arg return_on_first_detection)" />
+    <param name="return_arrival_tolerance" value="$(arg return_arrival_tolerance)" />
+    <param name="return_arrival_samples" value="$(arg return_arrival_samples)" />
+    <param name="return_input_timeout" value="$(arg return_input_timeout)" />
     <param name="competition_mode" value="$(arg competition_mode)" />
     <param name="workspace_root" value="/workspace/SimEnv" />
     <param name="result_path" value="results/detected_danger.json" />
@@ -57,6 +111,11 @@
     <!-- Localization (FAST-LIO + adapter, single canonical bringup) -->
     <include file="$(find competition_localization)/launch/localization_bringup.launch">
       <arg name="rviz" value="false"/>
+      <arg name="filter_size_surf" value="$(arg filter_size_surf)"/>
+      <arg name="filter_size_map" value="$(arg filter_size_map)"/>
+      <arg name="correction_enabled" value="$(arg localization_correction_enabled)"/>
+      <arg name="correction_odom_topic" value="$(arg localization_correction_odom_topic)"/>
+      <arg name="correction_mode" value="$(arg localization_correction_mode)"/>
     </include>
 
     <!-- Perception -->
@@ -68,12 +127,49 @@
           output="screen" respawn="true" />
 
     <!-- Planning -->
-    <node pkg="competition_planning" type="planning_node" name="planning"
-          output="screen" respawn="true" />
+    <group if="$(arg planning_enabled)">
+      <node pkg="competition_planning" type="planning_node" name="planning"
+            output="screen" respawn="true">
+        <remap from="/competition/path" to="$(arg planning_path_topic)" />
+        <param name="inflation_radius" value="$(arg planning_inflation_radius)" />
+        <param name="frontier_min_size" value="$(arg planning_frontier_min_size)" />
+        <param name="frontier_goal_search_radius_cells"
+               value="$(arg planning_frontier_goal_search_radius_cells)" />
+        <param name="return_goal_search_radius_cells"
+               value="$(arg planning_return_goal_search_radius_cells)" />
+        <param name="return_path_commit_enabled"
+               value="$(arg planning_return_path_commit_enabled)" />
+        <param name="return_recommit_on_stuck_enabled"
+               value="$(arg planning_return_recommit_on_stuck_enabled)" />
+        <param name="exploration_blocked_nudge_enabled"
+               value="$(arg planning_exploration_blocked_nudge_enabled)" />
+        <param name="exploration_blocked_nudge_distance"
+               value="$(arg planning_exploration_blocked_nudge_distance)" />
+        <param name="size_weight" value="$(arg planning_frontier_size_weight)" />
+        <param name="heading_weight" value="$(arg planning_heading_weight_cells)" />
+        <param name="initial_forward_distance"
+               value="$(arg planning_initial_forward_distance)" />
+        <param name="initial_forward_lookahead"
+               value="$(arg planning_initial_forward_lookahead)" />
+        <param name="path_compression_enabled"
+               value="$(arg planning_path_compression_enabled)" />
+        <param name="start_recovery_radius_cells"
+               value="$(arg planning_start_recovery_radius_cells)" />
+      </node>
+    </group>
 
     <!-- Path follower -->
     <node pkg="competition_control" type="path_follower_node" name="path_follower"
-          output="screen" respawn="true" />
+          output="screen" respawn="true">
+      <param name="max_angular" value="$(arg path_follower_max_angular)" />
+      <param name="min_linear" value="$(arg path_follower_min_linear)" />
+      <param name="stuck_duration_sec" value="$(arg path_follower_stuck_duration_sec)" />
+      <param name="stuck_progress_epsilon" value="$(arg path_follower_stuck_progress_epsilon)" />
+      <param name="stuck_backoff_linear" value="$(arg path_follower_stuck_backoff_linear)" />
+      <param name="stuck_backoff_duration" value="$(arg path_follower_stuck_backoff_duration)" />
+      <param name="stuck_backoff_max" value="$(arg path_follower_stuck_backoff_max)" />
+      <param name="path_timeout" value="$(arg path_follower_path_timeout)" />
+    </node>
   </group>
 
 </launch>
