@@ -5,6 +5,7 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   nav_msgs
   geometry_msgs
+  std_msgs
   competition_interfaces
 )
 
@@ -13,12 +14,14 @@ catkin_package(
   rospy
   nav_msgs
   geometry_msgs
+  std_msgs
   competition_interfaces
 )
 
 if(CATKIN_ENABLE_TESTING)
   find_package(rostest REQUIRED)
 
+  catkin_add_nosetests(test/test_visual_coverage.py)
   add_rostest(
     test/planning_node_ros.test
   )

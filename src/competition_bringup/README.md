@@ -34,6 +34,10 @@ roslaunch competition_bringup competition_system.launch \
 ## 参数
 
 见 [config/default.yaml](config/default.yaml)。所有参数可通过 ROS parameter server 覆写。
+Planning 的 `visual_scan_*` 参数控制 bounded active visual coverage；Control 的
+`path_follower_orientation_tolerance` 将同位置、不同朝向的 Planning waypoint
+映射为原地转向容差。正式默认开启 visual scan；可在诊断 launch 中显式设置
+`planning_visual_scan_enabled:=false` 做兼容性 A/B 对照。
 
 ## 模式隔离
 

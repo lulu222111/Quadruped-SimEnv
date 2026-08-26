@@ -12,6 +12,7 @@ directory next to this file.
 import importlib.machinery
 import importlib.util
 import json
+import math
 import sys
 import tempfile
 import types
@@ -362,6 +363,23 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
         return msg
 
     @staticmethod
+    def _make_fully_known_map(stamp):
+        msg = FakeOccupancyGrid()
+        msg.header.stamp = FakeTime(stamp)
+        msg.header.frame_id = "world"
+        msg.info.resolution = 1.0
+        msg.info.width = 5
+        msg.info.height = 5
+        msg.data = [0] * 25
+        return msg
+
+    @staticmethod
+    def _set_odom_yaw(msg, yaw):
+        msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        return msg
+
+    @staticmethod
     def _make_status(valid, stamp, detail="test"):
         msg = FakeModuleStatus()
         msg.header.stamp = FakeTime(stamp)
@@ -401,6 +419,181 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
 
     def test_start_recovery_parameter_defaults_disabled(self):
         self.assertEqual(self.node.start_recovery_radius_cells, 0)
+
+    def test_new_reached_target_starts_stationary_visual_scan(self):
+        self.node.active_exploration_target = (2.5, 2.5)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+
+        self.assertTrue(self.node._handle_reached_exploration_target(odom))
+        self.assertTrue(self.node.visual_coverage.active)
+        path = self._last_path()
+        self.assertEqual(len(path.poses), 2)
+        self.assertAlmostEqual(path.poses[0].pose.position.x, 2.5)
+        self.assertAlmostEqual(path.poses[1].pose.position.x, 2.5)
+        self.assertAlmostEqual(path.poses[0].pose.position.y, 2.5)
+        self.assertAlmostEqual(path.poses[1].pose.position.y, 2.5)
+        self.assertEqual(self._last_status_msg().state, FakeModuleStatus.RUNNING)
+        self.assertTrue(self._last_status_msg().valid)
+
+    def test_planner_target_reached_via_callback_starts_scan(self):
+        """The real plan callback, rather than a helper call, owns the trigger."""
+        self._publish_healthy_generation(100.0)
+        initial_path = self._last_path()
+        self.assertIsNotNone(initial_path)
+        self.assertGreater(len(initial_path.poses), 0)
+
+        goal = initial_path.poses[-1].pose.position
+        odom = self._make_odom(100.3)
+        odom.pose.pose.position.x = goal.x
+        odom.pose.pose.position.y = goal.y
+        set_clock(100.4)
+        self.node.odom_callback(odom)
+        self.node.plan_callback(None)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        scan_path = self._last_path()
+        self.assertEqual(len(scan_path.poses), 2)
+        self.assertAlmostEqual(
+            scan_path.poses[0].pose.position.x,
+            scan_path.poses[1].pose.position.x,
+        )
+        self.assertAlmostEqual(
+            scan_path.poses[0].pose.position.y,
+            scan_path.poses[1].pose.position.y,
+        )
+
+
+    def test_target_not_reached_does_not_start_scan(self):
+        self.node.active_exploration_target = (10.0, 10.0)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+
+        self.assertFalse(self.node._handle_reached_exploration_target(odom))
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertEqual(self.node.active_exploration_target, (10.0, 10.0))
+
+    def test_nearby_scanned_target_is_deduplicated(self):
+        self.node.visual_coverage.scanned_positions = [(2.5, 2.5)]
+        self.node.active_exploration_target = (2.6, 2.5)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+
+        self.assertFalse(self.node._handle_reached_exploration_target(odom))
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertIsNone(self.node.active_exploration_target)
+
+    def test_visual_scan_disabled_preserves_normal_planner_path(self):
+        self.node.visual_coverage.enabled = False
+        self.node.active_exploration_target = (2.5, 2.5)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+
+        self.assertFalse(self.node._handle_reached_exploration_target(odom))
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertIsNone(self.node.active_exploration_target)
+
+    def test_no_frontier_waits_for_final_scan_before_completion(self):
+        self.node.visual_coverage = PLANNING_NODE.VisualCoverageTracker(
+            enabled=True,
+            yaw_step=math.pi / 2.0,
+            yaw_tolerance=0.1,
+            dwell=0.0,
+            heading_timeout=2.0,
+            scan_timeout=20.0,
+            position_dedup_radius=1.0,
+            max_heading_retries=0,
+        )
+        self.node.visual_scan_dwell = 0.0
+        set_clock(100.0)
+        self.node.mapping_status_callback(self._make_status(True, 100.0))
+        self.node.localization_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.map_callback(self._make_fully_known_map(100.1))
+        self.node.odom_callback(self._make_odom(100.1))
+        set_clock(100.2)
+        self.node.plan_callback(None)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertFalse(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+        self.assertTrue(self._last_status_msg().valid)
+        self.assertIn("visual scan heading", self._last_status_msg().detail)
+
+        now = 100.3
+        while self.node.visual_coverage.active:
+            target_yaw = self.node.visual_coverage.current_heading
+            set_clock(now)
+            odom = self._set_odom_yaw(self._make_odom(now), target_yaw)
+            self.node.odom_callback(odom)
+            self.node.visual_scan_callback(None)
+            now += 0.01
+
+            if self.node.visual_coverage.active:
+                set_clock(now)
+                odom = self._set_odom_yaw(
+                    self._make_odom(now),
+                    self.node.visual_coverage.current_heading,
+                )
+                self.node.odom_callback(odom)
+                self.node.visual_scan_callback(None)
+                now += 0.01
+
+        self.assertEqual(
+            len(self.node.visual_coverage.scanned_positions),
+            1,
+        )
+        self.assertFalse(self.node.visual_scan_final_pending)
+
+        # Completion debounce starts only after the final scan ended.
+        for _ in range(3):
+            now += 0.05
+            set_clock(now)
+            self.node.plan_callback(None)
+        self.assertTrue(self.node._exploration_complete_active)
+        self.assertTrue(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+        true_messages = [
+            message.data
+            for message in self._published(
+                "/competition/planning/exploration_complete"
+            )
+            if message.data
+        ]
+        self.assertEqual(len(true_messages), 1)
+
+    def test_generation_reset_clears_visual_coverage(self):
+        self.node.active_exploration_target = (2.5, 2.5)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+        self.assertTrue(self.node._handle_reached_exploration_target(odom))
+        self.node.visual_coverage.scanned_positions.append((4.0, 4.0))
+
+        self.node._enter_new_generation("test_reset", FakeTime(101.0))
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertEqual(self.node.visual_coverage.scanned_positions, [])
+        self.assertIsNone(self.node.active_exploration_target)
+        self.assertFalse(self.node.visual_scan_final_pending)
+
+    def test_planning_status_stays_running_during_scan_progress(self):
+        self.node.active_exploration_target = (2.5, 2.5)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+        self.node._handle_reached_exploration_target(odom)
+        self.node.visual_scan_callback(None)
+
+        status = self._last_status_msg()
+        self.assertEqual(status.state, FakeModuleStatus.RUNNING)
+        self.assertTrue(status.valid)
 
     def test_returning_state_loads_public_start_and_uses_goal_planner(self):
         with tempfile.TemporaryDirectory() as temp_dir:
