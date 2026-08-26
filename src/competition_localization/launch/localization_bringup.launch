@@ -33,6 +33,13 @@
   <arg name="imu_topic" default="/livox/imu" />
   <arg name="odom_input_topic" default="/Odometry" />
   <arg name="team_scene_info_path" default="generated_building/team_scene_info.json" />
+  <!-- Exposed only to make repeatable FAST-LIO configuration benchmarks possible.
+       Production defaults remain the retained MARSIM values. -->
+  <arg name="filter_size_surf" default="0.2" />
+  <arg name="filter_size_map" default="0.3" />
+  <arg name="correction_enabled" default="false" />
+  <arg name="correction_odom_topic" default="/c2r28/proprio_fastlio_shadow/odom" />
+  <arg name="correction_mode" default="full_pose" />
 
   <!-- === FAST-LIO (SimEnv-tuned) === -->
 
@@ -68,8 +75,12 @@
   <param name="feature_extract_enable" type="bool" value="0"/>
   <param name="point_filter_num" type="int" value="3"/>
   <param name="max_iteration" type="int" value="3" />
-  <param name="filter_size_surf" type="double" value="0.5" />
-  <param name="filter_size_map" type="double" value="0.5" />
+  <!-- Keep MARSIM's proven spatial detail: the simulator emits 10 Hz
+       instantaneous PointCloud2 batches, so the 0.5 m production override
+       discarded useful local planar constraints.  These match the package's
+       mapping_marsim.launch defaults and do not alter FAST-LIO logic. -->
+  <param name="filter_size_surf" type="double" value="$(arg filter_size_surf)" />
+  <param name="filter_size_map" type="double" value="$(arg filter_size_map)" />
   <param name="cube_side_length" type="double" value="1000" />
   <param name="runtime_pos_log_enable" type="bool" value="0" />
   <param name="pcd_save/pcd_save_en" type="bool" value="false" />
@@ -89,6 +100,9 @@
     <param name="odom_input_topic" value="$(arg odom_input_topic)" />
     <param name="team_scene_info_path" value="$(arg team_scene_info_path)" />
     <param name="publish_tf" value="true" />
+    <param name="correction_enabled" value="$(arg correction_enabled)" />
+    <param name="correction_odom_topic" value="$(arg correction_odom_topic)" />
+    <param name="correction_mode" value="$(arg correction_mode)" />
     <!-- Fixed extrinsic base -> livox_imu_link (a1_description URDF chain).
          Computed: T_base_lidar = [0.2, 0, 0.08], Ry(45°)
                    T_lidar_imu  = [-0.011, -0.02329, 0.04412]

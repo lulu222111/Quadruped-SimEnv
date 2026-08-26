@@ -247,6 +247,28 @@ class SelectBestFrontierClusterTest(unittest.TestCase):
                 distance_weight=-1.0,
             )
 
+        with self.assertRaises(ValueError):
+            select_best_frontier_cluster(
+                [[(1, 1)]],
+                robot_cell=(0, 0),
+                heading_weight=-1.0,
+            )
+
+    def test_optional_heading_prefers_forward_cluster(self):
+        rear_near = [(-1, 0)]
+        forward_farther = [(4, 0)]
+
+        selected = select_best_frontier_cluster(
+            [rear_near, forward_farther],
+            robot_cell=(0, 0),
+            size_weight=0.0,
+            distance_weight=1.0,
+            heading_yaw=0.0,
+            heading_weight=4.0,
+        )
+
+        self.assertEqual(selected, forward_farther)
+
 class WorldToGridCellTest(unittest.TestCase):
     def test_converts_world_position_to_cell(self):
         cell = world_to_grid_cell(

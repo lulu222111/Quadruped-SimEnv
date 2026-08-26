@@ -5,6 +5,8 @@
 #define STATE_RL_TEST_H
 
 #include "FSM/FSMState.h"
+#include "FSM/RLBalanceObservation.h"
+#include "FSM/RLHandoffTransition.h"
 #include <atomic>
 #include <fstream>  // 包含文件流的头文件
 #include <thread>
@@ -35,6 +37,10 @@ public:
     std::ofstream outfile;
 private:
     void updateCommandTensor();
+    RLHandoffTransition::JointTargets policyJointTargets() const;
+    RLHandoffTransition::JointTargets nominalJointTargets() const;
+    void updatePreviousAppliedActions(
+        const RLHandoffTransition::JointTargets &commandedTargets);
 
     int debug = false;
     at::string model_path;
@@ -84,6 +90,7 @@ private:
     torch::Tensor dof_vel_tensor = torch::zeros({12});  // 自由度速度
     torch::Tensor actions_tensor = torch::zeros({12});  // 动作
     torch::Tensor actions_tensor_scaled = torch::zeros({12});  // 缩放后的动作
+    torch::Tensor previous_applied_actions_tensor = torch::zeros({12});
     torch::Tensor obs_scales_lin_vel = torch::tensor({2.0f, 2.0f, 2.0f});  // 线性速度缩放
     torch::Tensor obs_scales_ang_vel = torch::tensor({0.25f, 0.25f, 0.25f});  // 角速度缩放
     torch::Tensor obs_scales_dof_pos = torch::ones({12});  // 自由度位置缩放
@@ -102,7 +109,15 @@ private:
     uint8_t infer_thread_runnning = State_RL::STOP;
     uint8_t ampthreadRunning = State_RL::STOP;
     float infer_duration = 0.02;
+    static constexpr float ACTION_SCALE = 0.25f;
     float amp_duration = 0.005;
+    RLHandoffTransition _handoffTransition;
+    float _handoffDuration = RLHandoffTransition::DEFAULT_DURATION_SECONDS;
+    float _handoffMaxTargetStep = RLHandoffTransition::DEFAULT_MAX_TARGET_STEP_RAD;
+    bool _handoffCompletionLogged = false;
+    long long _lastHandoffDiagnosticTime = 0;
+    unsigned long _imuObsFallbackCount = 0;
+    long long _lastImuObsWarningTime = 0;
 };
 
 #endif

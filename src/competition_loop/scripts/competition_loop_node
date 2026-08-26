@@ -11,13 +11,21 @@ from __future__ import annotations
 import math
 import os
 import sys
+import copy
+import json
 from pathlib import Path
 from typing import Optional
 
 import rospy
 import std_msgs.msg
 import std_srvs.srv
-from competition_interfaces.msg import CompetitionState as CompetitionStateMsg
+from competition_interfaces.msg import (
+    CompetitionState as CompetitionStateMsg,
+    HazardCandidateArray,
+    HazardCandidate,
+    ModuleStatus,
+)
+from nav_msgs.msg import Odometry
 
 # Ensure the src/ directory is on sys.path so we can import our modules.
 _PKG_DIR = Path(__file__).resolve().parents[1]
@@ -29,6 +37,7 @@ from competition_state_machine import CompetitionStateMachine, CompetitionPhase
 from interface_validator import InterfaceValidator
 from time_keeper import TimeKeeper
 from result_writer import ResultWriter
+from hazard_candidate_router import HazardCandidateRouter
 
 
 def _is_valid_finite_positive_number(value: object) -> bool:
@@ -77,9 +86,31 @@ class CompetitionLoopNode:
         self._max_time = rospy.get_param("~max_time", 600.0)
         self._start_delay = rospy.get_param("~start_delay", 5.0)
         self._auto_start = rospy.get_param("~auto_start", True)
+        self._finish_on_first_detection = rospy.get_param(
+            "~finish_on_first_detection", False
+        )
+        self._return_on_first_detection = rospy.get_param(
+            "~return_on_first_detection", False
+        )
+        self._return_arrival_tolerance = rospy.get_param(
+            "~return_arrival_tolerance", 0.25
+        )
+        self._return_arrival_samples = rospy.get_param(
+            "~return_arrival_samples", 3
+        )
+        self._return_input_timeout = rospy.get_param(
+            "~return_input_timeout", 1.0
+        )
         self._competition_mode = rospy.get_param("~competition_mode", True)
         self._result_path_raw = rospy.get_param("~result_path", None)
         self._workspace_root = rospy.get_param("~workspace_root", "/workspace/SimEnv")
+        self._candidate_max_age = rospy.get_param("~hazard_candidate_max_age", 5.0)
+        self._candidate_future_tolerance = rospy.get_param(
+            "~hazard_candidate_future_tolerance", 0.5
+        )
+        self._candidate_dedup_distance = rospy.get_param(
+            "~hazard_candidate_dedup_distance", 0.30
+        )
 
         # --- ALWAYS initialise ALL members before any early return ---
         # This guarantees run() will never encounter AttributeError.
@@ -104,6 +135,34 @@ class CompetitionLoopNode:
         self._result_path = self._resolve_result_path()
 
         self._result_writer = ResultWriter(output_path=str(self._result_path))
+        self._candidate_router = HazardCandidateRouter(
+            self._result_writer,
+            dedup_distance=(
+                float(self._candidate_dedup_distance)
+                if _is_valid_finite_positive_number(self._candidate_dedup_distance)
+                else 0.30
+            ),
+            max_age=(
+                float(self._candidate_max_age)
+                if _is_valid_finite_positive_number(self._candidate_max_age)
+                else 5.0
+            ),
+            future_tolerance=(
+                float(self._candidate_future_tolerance)
+                if _is_valid_finite_non_negative_number(self._candidate_future_tolerance)
+                else 0.50
+            ),
+            now_fn=lambda: rospy.Time.now().to_sec(),
+        )
+        self._tf_buffer = None
+        self._tf_listener = None
+        self._candidate_sub = None
+        self._found_danger = False
+        self._return_start_pose = None
+        self._return_odom = None
+        self._return_localization_status = None
+        self._return_follower_status = None
+        self._return_arrival_count = 0
 
         # Clock and delay tracking — initialised BEFORE Timer
         self._clock_ready: bool = False
@@ -121,11 +180,15 @@ class CompetitionLoopNode:
         if not param_ok:
             rospy.logerr(
                 "competition_loop: invalid parameters — entering ERROR state. "
-                "max_time=%s start_delay=%s competition_mode=%s auto_start=%s workspace_root=%s",
+                "max_time=%s start_delay=%s competition_mode=%s auto_start=%s "
+                "finish_on_first_detection=%s return_on_first_detection=%s "
+                "workspace_root=%s",
                 _safe_repr(self._max_time),
                 _safe_repr(self._start_delay),
                 _safe_repr(self._competition_mode),
                 _safe_repr(self._auto_start),
+                _safe_repr(self._finish_on_first_detection),
+                _safe_repr(self._return_on_first_detection),
                 _safe_repr(self._workspace_root),
             )
             self._fsm.force_error("Invalid parameters — check max_time, start_delay.")
@@ -140,16 +203,24 @@ class CompetitionLoopNode:
         rospy.loginfo("competition_loop starting (mode=%s)",
                       "competition" if self._competition_mode else "test")
         rospy.loginfo(
-            "  max_time=%s  start_delay=%s  auto_start=%s  workspace_root=%s  result_path=%s",
+            "  max_time=%s  start_delay=%s  auto_start=%s  "
+            "finish_on_first_detection=%s  return_on_first_detection=%s  "
+            "workspace_root=%s  result_path=%s",
             _safe_repr(self._max_time),
             _safe_repr(self._start_delay),
             _safe_repr(self._auto_start),
+            _safe_repr(self._finish_on_first_detection),
+            _safe_repr(self._return_on_first_detection),
             _safe_repr(self._workspace_root),
             str(self._result_path),
         )
 
         # Load scene info (the only allowed file)
         self._validator.load_scene_info(self._workspace_root)
+        if self._return_on_first_detection:
+            self._return_start_pose = self._load_return_start_pose()
+            if self._return_start_pose is None:
+                self._fsm.force_error("return start pose unavailable")
 
         # Services — created AFTER members, BEFORE Timer
         self._start_srv = rospy.Service(
@@ -158,6 +229,10 @@ class CompetitionLoopNode:
         self._finish_srv = rospy.Service(
             "/competition/finish", std_srvs.srv.Trigger, self._handle_finish
         )
+
+        self._setup_candidate_router()
+        if self._return_on_first_detection:
+            self._setup_return_subscribers()
 
         # Timer — created LAST so it cannot fire before all members exist
         self._tick_timer = rospy.Timer(rospy.Duration(0.1), self._tick_callback)
@@ -203,9 +278,73 @@ class CompetitionLoopNode:
                          _safe_repr(self._auto_start))
             ok = False
 
+        if not isinstance(self._finish_on_first_detection, bool):
+            rospy.logerr(
+                "Invalid ~finish_on_first_detection=%s: must be a boolean",
+                _safe_repr(self._finish_on_first_detection),
+            )
+            ok = False
+
+        if not isinstance(self._return_on_first_detection, bool):
+            rospy.logerr(
+                "Invalid ~return_on_first_detection=%s: must be a boolean",
+                _safe_repr(self._return_on_first_detection),
+            )
+            ok = False
+        if (
+            self._finish_on_first_detection
+            and self._return_on_first_detection
+        ):
+            rospy.logerr(
+                "~finish_on_first_detection and ~return_on_first_detection "
+                "cannot both be true"
+            )
+            ok = False
+        if not _is_valid_finite_positive_number(self._return_arrival_tolerance):
+            rospy.logerr(
+                "Invalid ~return_arrival_tolerance=%s: must be finite and > 0",
+                _safe_repr(self._return_arrival_tolerance),
+            )
+            ok = False
+        if (
+            isinstance(self._return_arrival_samples, bool)
+            or not isinstance(self._return_arrival_samples, int)
+            or self._return_arrival_samples < 1
+        ):
+            rospy.logerr(
+                "Invalid ~return_arrival_samples=%s: must be an integer >= 1",
+                _safe_repr(self._return_arrival_samples),
+            )
+            ok = False
+        if not _is_valid_finite_positive_number(self._return_input_timeout):
+            rospy.logerr(
+                "Invalid ~return_input_timeout=%s: must be finite and > 0",
+                _safe_repr(self._return_input_timeout),
+            )
+            ok = False
+
         if not isinstance(self._workspace_root, str) or not self._workspace_root.strip():
             rospy.logerr("Invalid ~workspace_root=%s: must be a non-empty string",
                          _safe_repr(self._workspace_root))
+            ok = False
+
+        if not _is_valid_finite_positive_number(self._candidate_max_age):
+            rospy.logerr(
+                "Invalid ~hazard_candidate_max_age=%s: must be finite and > 0",
+                _safe_repr(self._candidate_max_age),
+            )
+            ok = False
+        if not _is_valid_finite_positive_number(self._candidate_dedup_distance):
+            rospy.logerr(
+                "Invalid ~hazard_candidate_dedup_distance=%s: must be finite and > 0",
+                _safe_repr(self._candidate_dedup_distance),
+            )
+            ok = False
+        if not _is_valid_finite_non_negative_number(self._candidate_future_tolerance):
+            rospy.logerr(
+                "Invalid ~hazard_candidate_future_tolerance=%s: must be finite and >= 0",
+                _safe_repr(self._candidate_future_tolerance),
+            )
             ok = False
 
         return ok
@@ -239,6 +378,175 @@ class CompetitionLoopNode:
     # ------------------------------------------------------------------
     # Publisher setup
     # ------------------------------------------------------------------
+
+    def _setup_candidate_router(self):
+        """Subscribe to perception candidates and prepare timestamped TF."""
+        import tf2_ros
+
+        self._tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer)
+        self._candidate_sub = rospy.Subscriber(
+            "/competition/hazard_candidates",
+            HazardCandidateArray,
+            self._hazard_candidates_callback,
+            queue_size=10,
+        )
+
+    def _setup_return_subscribers(self):
+        """Subscribe to legal return pose/status inputs only in return mode."""
+        self._return_odom_sub = rospy.Subscriber(
+            "/competition/localization/odom",
+            Odometry,
+            self._return_odom_callback,
+            queue_size=1,
+        )
+        self._return_localization_status_sub = rospy.Subscriber(
+            "/competition/localization/status",
+            ModuleStatus,
+            self._return_localization_status_callback,
+            queue_size=1,
+        )
+        self._return_follower_status_sub = rospy.Subscriber(
+            "/competition/control/path_follower_status",
+            ModuleStatus,
+            self._return_follower_status_callback,
+            queue_size=1,
+        )
+
+    def _load_return_start_pose(self):
+        """Load the public world-frame start pose for return qualification."""
+        path = Path(self._workspace_root) / "generated_building" / "team_scene_info.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("coordinate_frame") != "world":
+                raise ValueError("coordinate_frame must be 'world'")
+            start = data.get("robot_start")
+            if not isinstance(start, dict):
+                raise ValueError("robot_start is missing")
+            values = tuple(float(start[key]) for key in ("x", "y", "z", "yaw"))
+            if not all(math.isfinite(value) for value in values):
+                raise ValueError("robot_start contains non-finite values")
+            return {
+                "x": values[0],
+                "y": values[1],
+                "z": values[2],
+                "yaw": values[3],
+            }
+        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            rospy.logerr("Return start pose unavailable: %s", exc)
+            return None
+
+    def _return_odom_callback(self, msg):
+        self._return_odom = msg
+
+    def _return_localization_status_callback(self, msg):
+        self._return_localization_status = msg
+
+    def _return_follower_status_callback(self, msg):
+        self._return_follower_status = msg
+
+    @staticmethod
+    def _message_is_fresh(msg, now, timeout):
+        if msg is None or not getattr(msg, "header", None):
+            return False
+        try:
+            stamp = msg.header.stamp
+            age = (now - stamp).to_sec()
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return math.isfinite(age) and age >= 0.0 and age <= timeout
+
+    def _transform_candidate_to_world(self, candidate):
+        """Transform one candidate at its observation timestamp."""
+        import tf2_geometry_msgs
+        import tf2_ros
+        from geometry_msgs.msg import PointStamped
+
+        source_frame = candidate.header.frame_id
+        if not source_frame:
+            raise ValueError("candidate frame_id is empty")
+        point = PointStamped()
+        point.header = candidate.header
+        point.point = candidate.position
+        if source_frame == "world":
+            transformed_point = point
+        else:
+            transform = self._tf_buffer.lookup_transform(
+                "world",
+                source_frame,
+                candidate.header.stamp,
+                rospy.Duration(0.1),
+            )
+            transformed_point = tf2_geometry_msgs.do_transform_point(point, transform)
+
+        world_candidate = HazardCandidate()
+        world_candidate.header = copy.deepcopy(candidate.header)
+        world_candidate.header.frame_id = "world"
+        world_candidate.position = transformed_point.point
+        world_candidate.label = candidate.label
+        world_candidate.confidence = candidate.confidence
+        world_candidate.position_valid = candidate.position_valid
+        return world_candidate
+
+    def _hazard_candidates_callback(self, msg):
+        """Convert valid perception candidates and retain unique world points."""
+        if not self._fsm.is_running:
+            rospy.logdebug(
+                "Ignoring hazard candidates while phase=%s",
+                CompetitionPhase.label(self._fsm.phase),
+            )
+            return
+        accepted = self._candidate_router.process(
+            msg.candidates,
+            self._transform_candidate_to_world,
+        )
+        if accepted:
+            rospy.loginfo(
+                "Accepted %d new hazard candidate(s); total=%d",
+                accepted,
+                self._result_writer.candidate_count,
+            )
+            self._on_first_new_danger()
+
+    def _on_first_new_danger(self):
+        """Publish the mission-level FOUND_DANGER event once per run."""
+        if self._found_danger:
+            return False
+        self._found_danger = True
+        self._fsm.set_detail("FOUND_DANGER")
+        rospy.loginfo(
+            "Mission event: FOUND_DANGER (accepted_count=%d)",
+            self._result_writer.candidate_count,
+        )
+        self._publish_state()
+        if getattr(self, "_return_on_first_detection", False) and self._fsm.is_running:
+            self._begin_returning()
+            return True
+        if self._finish_on_first_detection and self._fsm.is_running:
+            self._end_competition("FOUND_DANGER: finish_on_first_detection")
+        return True
+
+    def _begin_returning(self):
+        """Enter RETURNING while keeping the existing path control chain active."""
+        if self._return_start_pose is None:
+            self._fsm.force_error("RETURNING start pose unavailable")
+            self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+            self._publish_state()
+            return False
+        self._return_arrival_count = 0
+        if not self._fsm.transition_to(
+            CompetitionPhase.RETURNING,
+            "RETURNING",
+        ):
+            return False
+        self._publish_safety_signals(control_enabled=True, emergency_stop=False)
+        self._publish_state()
+        rospy.loginfo(
+            "Mission event: RETURNING to start [%.3f, %.3f]",
+            self._return_start_pose["x"],
+            self._return_start_pose["y"],
+        )
+        return True
 
     def _setup_publishers(self):
         self._state_pub = rospy.Publisher(
@@ -320,6 +628,9 @@ class CompetitionLoopNode:
         elif phase == CompetitionPhase.RUNNING:
             self._tick_running()
 
+        elif phase == CompetitionPhase.RETURNING:
+            self._tick_returning()
+
         elif phase == CompetitionPhase.FINISHED:
             self._publish_safety_signals(control_enabled=False, emergency_stop=True)
 
@@ -392,6 +703,79 @@ class CompetitionLoopNode:
 
         # 3. Normal operation
         self._publish_safety_signals(control_enabled=True, emergency_stop=False)
+
+    def _tick_returning(self):
+        """Gate ARRIVED_START on fresh legal pose and follower completion."""
+        if self._detect_time_regression():
+            rospy.logerr("ROS time regression in RETURNING — forcing ERROR.")
+            self._fsm.force_error("Time regression detected during RETURNING")
+            self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+            return
+
+        if self._timer.is_expired:
+            self._fsm.force_error("RETURNING timeout before ARRIVED_START")
+            self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+            self._publish_state()
+            return
+
+        now = rospy.Time.now()
+        localization_valid = (
+            self._return_localization_status is not None
+            and self._return_localization_status.valid
+            and self._message_is_fresh(
+                self._return_localization_status,
+                now,
+                self._return_input_timeout,
+            )
+        )
+        odom_fresh = self._message_is_fresh(
+            self._return_odom,
+            now,
+            self._return_input_timeout,
+        )
+        follower_succeeded = (
+            self._return_follower_status is not None
+            and self._return_follower_status.valid
+            and self._return_follower_status.state == ModuleStatus.SUCCEEDED
+            and self._message_is_fresh(
+                self._return_follower_status,
+                now,
+                self._return_input_timeout,
+            )
+        )
+
+        if not (localization_valid and odom_fresh and follower_succeeded):
+            self._return_arrival_count = 0
+            self._publish_safety_signals(control_enabled=True, emergency_stop=False)
+            return
+
+        try:
+            position = self._return_odom.pose.pose.position
+            distance = math.hypot(
+                float(position.x) - self._return_start_pose["x"],
+                float(position.y) - self._return_start_pose["y"],
+            )
+        except (AttributeError, TypeError, ValueError):
+            distance = float("inf")
+
+        if not math.isfinite(distance) or distance > self._return_arrival_tolerance:
+            self._return_arrival_count = 0
+            self._publish_safety_signals(control_enabled=True, emergency_stop=False)
+            return
+
+        self._return_arrival_count += 1
+        if self._return_arrival_count < self._return_arrival_samples:
+            self._publish_safety_signals(control_enabled=True, emergency_stop=False)
+            return
+
+        self._fsm.set_detail("ARRIVED_START")
+        self._publish_state()
+        rospy.loginfo(
+            "Mission event: ARRIVED_START (distance=%.3f m, samples=%d)",
+            distance,
+            self._return_arrival_count,
+        )
+        self._end_competition("ARRIVED_START")
 
     # ------------------------------------------------------------------
     # Start / Finish
@@ -482,7 +866,7 @@ class CompetitionLoopNode:
         return std_srvs.srv.TriggerResponse(success=True, message="Competition started")
 
     def _handle_finish(self, req):
-        if self._fsm.is_running:
+        if self._fsm.phase == CompetitionPhase.RUNNING:
             self._end_competition("finish service called")
             return std_srvs.srv.TriggerResponse(success=True, message="Competition finished")
         return std_srvs.srv.TriggerResponse(

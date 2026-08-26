@@ -126,7 +126,7 @@
 |---|---:|---:|
 | WAITING | false | true |
 | RUNNING | true | false |
-| RETURNING | （未实现，保持安全） | （未实现，保持安全） |
+| RETURNING | Return-mode planning is enabled only with `~return_on_first_detection=true`; path remains on `/competition/path` | Fresh valid localization + follower `SUCCEEDED` + persistent start-distance gate |
 | FINISHED | false | true |
 | ERROR | false | true |
 

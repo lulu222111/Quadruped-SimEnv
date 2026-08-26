@@ -4,21 +4,37 @@
 
 from __future__ import annotations
 
-from math import atan2, ceil, cos, isfinite, sin
+import threading
+import copy
+import json
+import os
+from math import atan2, ceil, cos, hypot, isfinite, sin
 
 import rospy
-from competition_interfaces.msg import ModuleStatus
+from competition_interfaces.msg import (
+    CompetitionState as CompetitionStateMsg,
+    ModuleStatus,
+)
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from std_msgs.msg import Bool
 
 from frontier import grid_cell_to_world, world_to_grid_cell
 from planning_core import (
     PLAN_NO_FRONTIER,
     PLAN_SUCCESS,
     PLAN_UNREACHABLE,
+    compress_collinear_path,
     path_cell_yaws,
+    plan_to_goal_with_status,
+    plan_to_goal_region_with_status,
+    plan_to_heading_goal_with_status,
     plan_to_frontier_with_status,
 )
+
+
+WORLD_FRAME = "world"
+BASE_FRAME = "base"
 
 
 def quaternion_to_yaw(quaternion):
@@ -36,136 +52,65 @@ def quaternion_to_yaw(quaternion):
 
 class PlanningNode:
     def __init__(self):
+        self.lock = threading.RLock()
+
+        self.generation = 0
+        # ROS-time boundary of the current generation. Data whose header
+        # stamp is at or before this boundary was produced before the
+        # current generation began and must never enter its cache.
+        # Generation 0 starts at time zero so any legal non-zero stamp
+        # is admitted during startup.
+        self.generation_start_stamp = rospy.Time(0)
         self.map_msg = None
         self.odom_msg = None
+        self.map_generation = None
+        self.odom_generation = None
         self.map_received_at = None
         self.odom_received_at = None
 
-        try:
-            self.frontier_min_size = int(
-                rospy.get_param(
-                    "~frontier_min_size",
-                    5,
-                )
-            )
-            self.replan_interval = float(
-                rospy.get_param(
-                    "~replan_interval",
-                    2.0,
-                )
-            )
-            self.inflation_radius = float(
-                rospy.get_param(
-                    "~inflation_radius",
-                    0.25,
-                )
-            )
-            self.size_weight = float(
-                rospy.get_param(
-                    "~size_weight",
-                    1.0,
-                )
-            )
-            self.distance_weight = float(
-                rospy.get_param(
-                    "~distance_weight",
-                    1.0,
-                )
-            )
-            self.obstacle_threshold = int(
-                rospy.get_param(
-                    "~obstacle_threshold",
-                    50,
-                )
-            )
-            self.map_timeout = float(
-                rospy.get_param(
-                    "~map_timeout",
-                    5.0,
-                )
-            )
-            self.localization_timeout = float(
-                rospy.get_param(
-                    "~localization_timeout",
-                    5.0,
-                )
-            )
-        except (
-            TypeError,
-            ValueError,
-            OverflowError,
-        ) as error:
-            raise ValueError(
-                "invalid planning parameter: {}".format(
-                    error
-                )
-            ) from error
+        self.mapping_status = None
+        self.localization_status = None
+        self.mapping_status_received_at = None
+        self.localization_status_received_at = None
 
-        finite_parameters = (
-            (
-                "replan_interval",
-                self.replan_interval,
-            ),
-            (
-                "inflation_radius",
-                self.inflation_radius,
-            ),
-            (
-                "size_weight",
-                self.size_weight,
-            ),
-            (
-                "distance_weight",
-                self.distance_weight,
-            ),
-            (
-                "map_timeout",
-                self.map_timeout,
-            ),
-            (
-                "localization_timeout",
-                self.localization_timeout,
-            ),
+        # Per-stream monotonic baselines: a status whose header stamp is
+        # not strictly after the last accepted one is a delayed duplicate
+        # or out-of-order old message and is dropped without touching any
+        # state, so it can neither clear a fault, revive the plan, nor
+        # open a new generation. Reset on ROS clock rollback (new
+        # timeline).
+        self.last_mapping_status_stamp = None
+        self.last_localization_status_stamp = None
+
+        self.last_ros_time = None
+        self.active_faults = set()
+        self.last_status = (
+            ModuleStatus.STARTING,
+            False,
+            0.0,
+            "waiting for upstream status and current-generation data",
         )
+        self.mission_state = CompetitionStateMsg.WAITING
+        self.mission_epoch = 0
+        self.returning = False
+        self.return_start_pose = None
+        self.return_start_pose_error = None
+        # A return route is generated by the existing grid planner.  When
+        # enabled, preserve its geometry for the remainder of this return
+        # epoch instead of allowing noisy incremental map updates to replace
+        # it with a contradictory detour.  The cached route is never
+        # generated outside the planner and upstream freshness/validity gates
+        # still run before it can be republished.
+        self.return_committed_path = None
+        self.return_committed_goal = None
+        self.return_committed_detail = None
+        # Bounded re-commit bookkeeping: at most one drop per RETURNING epoch.
+        self._return_recommit_pending = False
+        self._return_recommit_used_epoch = -1
+        self.initial_forward_anchor = None
+        self.initial_forward_complete = False
 
-        for name, value in finite_parameters:
-            if not isfinite(value):
-                raise ValueError(
-                    "{} must be finite".format(name)
-                )
-
-        if self.frontier_min_size < 1:
-            raise ValueError(
-                "frontier_min_size must be at least 1"
-            )
-        if self.replan_interval <= 0.0:
-            raise ValueError(
-                "replan_interval must be positive"
-            )
-        if self.inflation_radius < 0.0:
-            raise ValueError(
-                "inflation_radius must not be negative"
-            )
-        if self.size_weight < 0.0:
-            raise ValueError(
-                "size_weight must not be negative"
-            )
-        if self.distance_weight < 0.0:
-            raise ValueError(
-                "distance_weight must not be negative"
-            )
-        if not 1 <= self.obstacle_threshold <= 100:
-            raise ValueError(
-                "obstacle_threshold must be in [1, 100]"
-            )
-        if self.map_timeout <= 0.0:
-            raise ValueError(
-                "map_timeout must be positive"
-            )
-        if self.localization_timeout <= 0.0:
-            raise ValueError(
-                "localization_timeout must be positive"
-            )
+        self._load_parameters()
 
         self.status_pub = rospy.Publisher(
             "/competition/planning/status",
@@ -192,140 +137,1066 @@ class PlanningNode:
             self.map_callback,
             queue_size=1,
         )
+        self.mapping_status_sub = rospy.Subscriber(
+            "/competition/mapping/status",
+            ModuleStatus,
+            self.mapping_status_callback,
+            queue_size=10,
+        )
         self.odom_sub = rospy.Subscriber(
             "/competition/localization/odom",
             Odometry,
             self.odom_callback,
             queue_size=1,
         )
+        self.localization_status_sub = rospy.Subscriber(
+            "/competition/localization/status",
+            ModuleStatus,
+            self.localization_status_callback,
+            queue_size=10,
+        )
+        self.competition_state_sub = rospy.Subscriber(
+            "/competition/state",
+            CompetitionStateMsg,
+            self.competition_state_callback,
+            queue_size=1,
+        )
+        self.stuck_sub = rospy.Subscriber(
+            "/competition/planning/stuck",
+            Bool,
+            self.stuck_callback,
+            queue_size=1,
+        )
 
-        self.timer = rospy.Timer(
+        self.plan_timer = rospy.Timer(
             rospy.Duration(self.replan_interval),
             self.plan_callback,
+        )
+        self.heartbeat_timer = rospy.Timer(
+            rospy.Duration(self.status_heartbeat_interval),
+            self.heartbeat_callback,
         )
 
         self.invalidate_plan(
             ModuleStatus.STARTING,
             0.0,
-            "waiting for map and localization",
+            "waiting for upstream status and current-generation data",
         )
 
         rospy.loginfo(
-            "planning_node started: waiting for "
-            "/competition/map and "
-            "/competition/localization/odom"
+            "planning_node started: waiting for mapping/localization "
+            "status plus current-generation map and odometry"
         )
 
+    def _load_parameters(self):
+        try:
+            self.frontier_min_size = int(
+                rospy.get_param("~frontier_min_size", 5)
+            )
+            self.replan_interval = float(
+                rospy.get_param("~replan_interval", 2.0)
+            )
+            self.inflation_radius = float(
+                rospy.get_param("~inflation_radius", 0.25)
+            )
+            self.start_recovery_radius_cells = int(
+                rospy.get_param("~start_recovery_radius_cells", 0)
+            )
+            self.frontier_goal_search_radius_cells = int(
+                rospy.get_param("~frontier_goal_search_radius_cells", 0)
+            )
+            self.return_goal_search_radius_cells = int(
+                rospy.get_param("~return_goal_search_radius_cells", 2)
+            )
+            self.return_path_commit_enabled = bool(
+                rospy.get_param("~return_path_commit_enabled", False)
+            )
+            # Bounded re-commit on physical stuck (R25): when the follower
+            # reports it is wedged (no measured progress while driving), drop
+            # the committed RETURNING route exactly once per RETURNING epoch
+            # so the next plan_and_publish runs the full A* against the
+            # current map with all normal safety gates.  Re-planned paths are
+            # re-committed (so map-noise oscillation stays suppressed); only
+            # another stuck event clears again.  Default off.
+            self.return_recommit_on_stuck_enabled = bool(
+                rospy.get_param("~return_recommit_on_stuck_enabled", False)
+            )
+            # Exploration blocked recovery (R29 planner-BLOCKED deadlock):
+            # when no frontier is reachable in the current map (typically a
+            # localization-drift-induced enclosure), command a short blind
+            # drive toward the nearest frontier cell so the robot re-observes
+            # and the map can correct.  Bounded to nudge_distance_m; re-planned
+            # every cycle so it terminates naturally once a frontier is
+            # reachable again.  Disabled by default.
+            self.exploration_blocked_nudge_enabled = bool(
+                rospy.get_param(
+                    "~exploration_blocked_nudge_enabled", False
+                )
+            )
+            self.exploration_blocked_nudge_distance = float(
+                rospy.get_param(
+                    "~exploration_blocked_nudge_distance", 2.0
+                )
+            )
+            self.size_weight = float(
+                rospy.get_param("~size_weight", 1.0)
+            )
+            self.distance_weight = float(
+                rospy.get_param("~distance_weight", 1.0)
+            )
+            self.heading_weight = float(
+                rospy.get_param("~heading_weight", 0.0)
+            )
+            self.initial_forward_distance = float(
+                rospy.get_param("~initial_forward_distance", 0.0)
+            )
+            self.initial_forward_lookahead = float(
+                rospy.get_param("~initial_forward_lookahead", 2.0)
+            )
+            self.path_compression_enabled = bool(
+                rospy.get_param("~path_compression_enabled", False)
+            )
+            self.obstacle_threshold = int(
+                rospy.get_param("~obstacle_threshold", 50)
+            )
+            self.map_timeout = float(
+                rospy.get_param("~map_timeout", 5.0)
+            )
+            self.localization_timeout = float(
+                rospy.get_param("~localization_timeout", 5.0)
+            )
+            self.mapping_status_timeout = float(
+                rospy.get_param("~mapping_status_timeout", 3.0)
+            )
+            self.localization_status_timeout = float(
+                rospy.get_param("~localization_status_timeout", 3.0)
+            )
+            self.team_scene_info_path = rospy.get_param(
+                "~team_scene_info_path",
+                "generated_building/team_scene_info.json",
+            )
+            self.future_stamp_tolerance = float(
+                rospy.get_param("~future_stamp_tolerance", 0.5)
+            )
+            self.status_heartbeat_interval = float(
+                rospy.get_param("~status_heartbeat_interval", 1.0)
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                "invalid planning parameter: {}".format(error)
+            ) from error
+
+        finite_parameters = (
+            ("replan_interval", self.replan_interval),
+            ("inflation_radius", self.inflation_radius),
+            ("size_weight", self.size_weight),
+            ("distance_weight", self.distance_weight),
+            ("heading_weight", self.heading_weight),
+            ("initial_forward_distance", self.initial_forward_distance),
+            ("initial_forward_lookahead", self.initial_forward_lookahead),
+            ("map_timeout", self.map_timeout),
+            ("localization_timeout", self.localization_timeout),
+            ("mapping_status_timeout", self.mapping_status_timeout),
+            (
+                "localization_status_timeout",
+                self.localization_status_timeout,
+            ),
+            ("future_stamp_tolerance", self.future_stamp_tolerance),
+            (
+                "status_heartbeat_interval",
+                self.status_heartbeat_interval,
+            ),
+        )
+
+        for name, value in finite_parameters:
+            if not isfinite(value):
+                raise ValueError("{} must be finite".format(name))
+
+        if self.exploration_blocked_nudge_distance < 0.0:
+            raise ValueError(
+                "exploration_blocked_nudge_distance must not be negative"
+            )
+        if self.frontier_min_size < 1:
+            raise ValueError("frontier_min_size must be at least 1")
+        if self.replan_interval <= 0.0:
+            raise ValueError("replan_interval must be positive")
+        if self.inflation_radius < 0.0:
+            raise ValueError("inflation_radius must not be negative")
+        if self.start_recovery_radius_cells < 0:
+            raise ValueError(
+                "start_recovery_radius_cells must not be negative"
+            )
+        if self.frontier_goal_search_radius_cells < 0:
+            raise ValueError(
+                "frontier_goal_search_radius_cells must not be negative"
+            )
+        if self.return_goal_search_radius_cells < 0:
+            raise ValueError(
+                "return_goal_search_radius_cells must not be negative"
+            )
+        if self.size_weight < 0.0:
+            raise ValueError("size_weight must not be negative")
+        if self.distance_weight < 0.0:
+            raise ValueError("distance_weight must not be negative")
+        if self.heading_weight < 0.0:
+            raise ValueError("heading_weight must not be negative")
+        if self.initial_forward_distance < 0.0:
+            raise ValueError("initial_forward_distance must not be negative")
+        if self.initial_forward_lookahead <= 0.0:
+            raise ValueError("initial_forward_lookahead must be positive")
+        if not 1 <= self.obstacle_threshold <= 100:
+            raise ValueError("obstacle_threshold must be in [1, 100]")
+
+        positive_parameters = (
+            ("map_timeout", self.map_timeout),
+            ("localization_timeout", self.localization_timeout),
+            ("mapping_status_timeout", self.mapping_status_timeout),
+            (
+                "localization_status_timeout",
+                self.localization_status_timeout,
+            ),
+            (
+                "status_heartbeat_interval",
+                self.status_heartbeat_interval,
+            ),
+        )
+        for name, value in positive_parameters:
+            if value <= 0.0:
+                raise ValueError("{} must be positive".format(name))
+
+        if self.future_stamp_tolerance < 0.0:
+            raise ValueError(
+                "future_stamp_tolerance must not be negative"
+            )
+
+    def _observe_ros_time(self):
+        """Atomically observe ROS time and return it, or None if unsafe."""
+        with self.lock:
+            now = rospy.Time.now()
+            previous = self.last_ros_time
+            self.last_ros_time = now
+
+            rollback = (
+                previous is not None
+                and not previous.is_zero()
+                and (now.is_zero() or now < previous)
+            )
+            if rollback:
+                self._enter_new_generation(
+                    "ros_time_rollback",
+                    now,
+                    force=True,
+                )
+                # New timeline: restart the per-stream status baselines so
+                # the first status of the new timeline is accepted instead
+                # of being dropped as older than pre-rollback statuses.
+                self.last_mapping_status_stamp = None
+                self.last_localization_status_stamp = None
+                self._invalidate_plan_locked(
+                    ModuleStatus.FAILED,
+                    0.0,
+                    "ROS time moved backwards; waiting for a new generation",
+                    stamp=now,
+                )
+                return None
+
+            if now.is_zero():
+                self._invalidate_plan_locked(
+                    ModuleStatus.STARTING,
+                    0.0,
+                    "waiting for non-zero ROS time",
+                    stamp=now,
+                )
+                return None
+
+            return now
+
+    def _accept_ingress_stamp_locked(
+        self,
+        name,
+        stamp,
+        now,
+        fault_name,
+    ):
+        """Reject zero/future messages before they enter the cache."""
+        try:
+            if stamp.is_zero():
+                raise ValueError(
+                    "{} timestamp must be non-zero".format(name)
+                )
+            future_offset = (stamp - now).to_sec()
+            if future_offset > self.future_stamp_tolerance:
+                raise ValueError(
+                    "{} timestamp is {:.3f}s in the future".format(
+                        name,
+                        future_offset,
+                    )
+                )
+        except (TypeError, ValueError, OverflowError) as error:
+            self._enter_new_generation(fault_name, now)
+            self._invalidate_plan_locked(
+                ModuleStatus.FAILED,
+                0.0,
+                str(error),
+                stamp=now,
+            )
+            return False
+
+        self.active_faults.discard(fault_name)
+        return True
+
+    def _enter_new_generation(self, fault_name, now, force=False):
+        """Invalidate cached data once per active fault or forced event.
+
+        ``now`` must be the ROS time already observed atomically by the
+        caller via :meth:`_observe_ros_time`; it becomes the timestamp
+        boundary of the new generation. The boundary only moves when the
+        generation counter actually advances, so repeated heartbeats of
+        one active fault neither bump the generation nor move the
+        boundary.
+        """
+        with self.lock:
+            if not force and fault_name in self.active_faults:
+                return False
+
+            self.active_faults.add(fault_name)
+            self.generation += 1
+            self.generation_start_stamp = now
+            self.map_msg = None
+            self.odom_msg = None
+            self.map_generation = None
+            self.odom_generation = None
+            self.map_received_at = None
+            self.odom_received_at = None
+            return True
+
+    def _clear_fault(self, fault_name):
+        with self.lock:
+            self.active_faults.discard(fault_name)
+
+    def competition_state_callback(self, msg):
+        """Switch planner mode using the existing competition state topic."""
+        target_returning = msg.state == CompetitionStateMsg.RETURNING
+        with self.lock:
+            if target_returning == self.returning:
+                return
+            self.returning = target_returning
+            self.mission_state = msg.state
+            self.mission_epoch += 1
+            if target_returning:
+                self._load_return_start_pose_locked()
+                self.return_committed_path = None
+                self.return_committed_goal = None
+                self.return_committed_detail = None
+                self._invalidate_plan_locked(
+                    ModuleStatus.STARTING,
+                    0.0,
+                    "RETURNING: waiting for return goal path",
+                )
+            else:
+                self.return_start_pose = None
+                self.return_start_pose_error = None
+                self.return_committed_path = None
+                self.return_committed_goal = None
+                self.return_committed_detail = None
+                self._invalidate_plan_locked(
+                    ModuleStatus.STARTING,
+                    0.0,
+                    "mission state changed; waiting for exploration plan",
+                )
+
+    def stuck_callback(self, msg):
+        """Drop the committed RETURNING route once when the follower is wedged.
+
+        The follower reports "commanded motion but no measured progress" on
+        /competition/planning/stuck.  On a True edge while RETURNING with a
+        committed route, clear the commit exactly once per RETURNING epoch so
+        the next plan_and_publish runs the full planner against the current
+        map (all freshness/validity gates unchanged).  A successful replan is
+        re-committed by the normal commit path, so map-noise oscillation stays
+        suppressed; only another physical stuck event can clear again.  A False
+        edge only re-arms nothing — the per-epoch budget is consumed on drop.
+        """
+        if not msg.data:
+            return
+        with self.lock:
+            if not self.returning:
+                return
+            if not self.return_recommit_on_stuck_enabled:
+                return
+            if self.return_committed_path is None:
+                return
+            if self._return_recommit_used_epoch == self.mission_epoch:
+                rospy.logwarn(
+                    "planning_node: stuck reported again in this RETURNING "
+                    "epoch; re-commit budget already used, ignoring"
+                )
+                return
+            self._return_recommit_used_epoch = self.mission_epoch
+            self.return_committed_path = None
+            self.return_committed_goal = None
+            self.return_committed_detail = None
+            self._invalidate_plan_locked(
+                ModuleStatus.STARTING,
+                0.0,
+                "RETURNING: follower reported stuck; replanning return route",
+            )
+            rospy.logwarn(
+                "planning_node: dropped committed return path after stuck "
+                "report (epoch %d); full replan on next cycle",
+                self.mission_epoch,
+            )
+
+    def _load_return_start_pose_locked(self):
+        """Load only the public team scene file; caller owns ``self.lock``."""
+        path = self.team_scene_info_path
+        if not os.path.isabs(path):
+            path = os.path.join(
+                rospy.get_param("/competition_loop/workspace_root", ""),
+                path,
+            )
+        try:
+            with open(path, "r", encoding="utf-8") as scene_file:
+                data = json.load(scene_file)
+            if data.get("coordinate_frame") != WORLD_FRAME:
+                raise ValueError("coordinate_frame must be 'world'")
+            start = data.get("robot_start")
+            if not isinstance(start, dict):
+                raise ValueError("robot_start is missing")
+            values = {
+                key: float(start[key])
+                for key in ("x", "y", "z", "yaw")
+            }
+            if not all(isfinite(value) for value in values.values()):
+                raise ValueError("robot_start contains non-finite values")
+            self.return_start_pose = values
+            self.return_start_pose_error = None
+            rospy.loginfo(
+                "planning_node: loaded return goal from public scene: "
+                "x=%.3f y=%.3f z=%.3f yaw=%.3f",
+                values["x"], values["y"], values["z"], values["yaw"],
+            )
+        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
+            self.return_start_pose = None
+            self.return_start_pose_error = str(error)
+            rospy.logerr("planning_node: return start pose unavailable: %s", error)
+
     def map_callback(self, msg):
-        self.map_msg = msg
-        self.map_received_at = rospy.Time.now()
+        now = self._observe_ros_time()
+        if now is None:
+            return
+        with self.lock:
+            if not self._accept_ingress_stamp_locked(
+                "map",
+                msg.header.stamp,
+                now,
+                "map_stamp_invalid",
+            ):
+                return
+            # Strict boundary: a Map produced before the current
+            # generation began must be dropped, not cached and not
+            # allowed to open yet another generation. Delayed old
+            # messages must not revive pre-generation data.
+            if msg.header.stamp <= self.generation_start_stamp:
+                rospy.logwarn_throttle(
+                    5.0,
+                    "dropping pre-generation map: header stamp %s is "
+                    "not after generation boundary %s",
+                    msg.header.stamp,
+                    self.generation_start_stamp,
+                )
+                return
+            self.map_msg = msg
+            self.map_received_at = now
+            self.map_generation = self.generation
+            self.active_faults.discard("map_timeout")
 
     def odom_callback(self, msg):
-        self.odom_msg = msg
-        self.odom_received_at = rospy.Time.now()
+        now = self._observe_ros_time()
+        if now is None:
+            return
+        with self.lock:
+            if not self._accept_ingress_stamp_locked(
+                "localization",
+                msg.header.stamp,
+                now,
+                "localization_stamp_invalid",
+            ):
+                return
+            # Strict boundary, symmetric with the Map admission rule:
+            # pre-generation Odometry is dropped without touching the
+            # current generation or its boundary.
+            if msg.header.stamp <= self.generation_start_stamp:
+                rospy.logwarn_throttle(
+                    5.0,
+                    "dropping pre-generation localization: header "
+                    "stamp %s is not after generation boundary %s",
+                    msg.header.stamp,
+                    self.generation_start_stamp,
+                )
+                return
+            self.odom_msg = msg
+            self.odom_received_at = now
+            self.odom_generation = self.generation
+            self.active_faults.discard("localization_timeout")
 
-    def publish_status(
+    def mapping_status_callback(self, msg):
+        now = self._observe_ros_time()
+        if now is None:
+            return
+
+        with self.lock:
+            if not self._accept_ingress_stamp_locked(
+                "mapping status",
+                msg.header.stamp,
+                now,
+                "mapping_status_stamp_invalid",
+            ):
+                return
+            # Per-stream ordering: a status not strictly after the last
+            # accepted one is delayed/duplicate. Dropping it must not
+            # change the stored status, clear any fault, or open a
+            # generation; in particular an old valid=true status must
+            # never mask a newer invalid one.
+            if (
+                self.last_mapping_status_stamp is not None
+                and msg.header.stamp <= self.last_mapping_status_stamp
+            ):
+                rospy.logwarn_throttle(
+                    5.0,
+                    "dropping out-of-order mapping status: stamp %s is "
+                    "not after last accepted stamp %s",
+                    msg.header.stamp,
+                    self.last_mapping_status_stamp,
+                )
+                return
+            self.last_mapping_status_stamp = msg.header.stamp
+            previous_valid = (
+                self.mapping_status is not None
+                and self.mapping_status.valid
+            )
+            self.mapping_status = msg
+            self.mapping_status_received_at = now
+            self.active_faults.discard("mapping_status_timeout")
+
+            if not msg.valid:
+                self._enter_new_generation(
+                    "mapping_invalid",
+                    now,
+                    force=previous_valid,
+                )
+                self._invalidate_plan_locked(
+                    ModuleStatus.BLOCKED,
+                    0.0,
+                    "mapping status is invalid: {}".format(msg.detail),
+                    stamp=now,
+                )
+            else:
+                self.active_faults.discard("mapping_invalid")
+
+    def localization_status_callback(self, msg):
+        now = self._observe_ros_time()
+        if now is None:
+            return
+
+        with self.lock:
+            if not self._accept_ingress_stamp_locked(
+                "localization status",
+                msg.header.stamp,
+                now,
+                "localization_status_stamp_invalid",
+            ):
+                return
+            # Per-stream ordering, symmetric with mapping status.
+            if (
+                self.last_localization_status_stamp is not None
+                and msg.header.stamp <= self.last_localization_status_stamp
+            ):
+                rospy.logwarn_throttle(
+                    5.0,
+                    "dropping out-of-order localization status: stamp %s "
+                    "is not after last accepted stamp %s",
+                    msg.header.stamp,
+                    self.last_localization_status_stamp,
+                )
+                return
+            self.last_localization_status_stamp = msg.header.stamp
+            previous_valid = (
+                self.localization_status is not None
+                and self.localization_status.valid
+            )
+            self.localization_status = msg
+            self.localization_status_received_at = now
+            self.active_faults.discard("localization_status_timeout")
+
+            if not msg.valid:
+                self._enter_new_generation(
+                    "localization_invalid",
+                    now,
+                    force=previous_valid,
+                )
+                self._invalidate_plan_locked(
+                    ModuleStatus.BLOCKED,
+                    0.0,
+                    "localization status is invalid: {}".format(msg.detail),
+                    stamp=now,
+                )
+            else:
+                self.active_faults.discard("localization_invalid")
+
+    def publish_status(self, state, valid, confidence, detail):
+        with self.lock:
+            self.last_status = (state, valid, confidence, detail)
+            self._publish_status_message_locked(
+                state,
+                valid,
+                confidence,
+                detail,
+            )
+
+    def _publish_status_message_locked(
         self,
         state,
         valid,
         confidence,
         detail,
+        stamp=None,
     ):
         msg = ModuleStatus()
-        msg.header.stamp = rospy.Time.now()
+        msg.header.stamp = stamp if stamp is not None else rospy.Time.now()
         msg.state = state
         msg.valid = valid
         msg.confidence = confidence
         msg.detail = detail
         self.status_pub.publish(msg)
 
-    def invalidate_plan(
+    def heartbeat_callback(self, _event):
+        now = self._observe_ros_time()
+        if now is None:
+            return
+        with self.lock:
+            failure = self._watchdog_failure_locked(now)
+            if failure is not None:
+                state, confidence, detail = failure
+                self._invalidate_plan_locked(
+                    state,
+                    confidence,
+                    detail,
+                    stamp=now,
+                )
+                return
+            status = self.last_status
+            self._publish_status_message_locked(*status, stamp=now)
+
+    def invalidate_plan(self, state, confidence, detail):
+        """Withdraw the latched path and publish an invalid status."""
+        with self.lock:
+            self._invalidate_plan_locked(state, confidence, detail)
+
+    def _invalidate_plan_locked(
         self,
         state,
         confidence,
         detail,
+        stamp=None,
     ):
-        """Withdraw the latched path and publish an invalid status."""
-        frame_id = "map"
-
-        if self.map_msg is not None:
-            frame_id = (
-                self.map_msg.header.frame_id.strip()
-                or "map"
-            )
-
+        """Withdraw path and status while the caller owns self.lock."""
+        if stamp is None:
+            stamp = rospy.Time.now()
         empty_path = Path()
-        empty_path.header.stamp = rospy.Time.now()
-        empty_path.header.frame_id = frame_id
+        empty_path.header.stamp = stamp
+        empty_path.header.frame_id = WORLD_FRAME
         self.path_pub.publish(empty_path)
-
-        self.publish_status(
+        self.last_status = (state, False, confidence, detail)
+        self._publish_status_message_locked(
             state,
             False,
             confidence,
             detail,
+            stamp=stamp,
         )
 
+    def _watchdog_failure_locked(self, now):
+        """Return an invalid status tuple when cached inputs are unsafe."""
+        missing_statuses = []
+        if (
+            self.mapping_status is None
+            or self.mapping_status_received_at is None
+        ):
+            missing_statuses.append("mapping status")
+        if (
+            self.localization_status is None
+            or self.localization_status_received_at is None
+        ):
+            missing_statuses.append("localization status")
+        if missing_statuses:
+            return (
+                ModuleStatus.STARTING,
+                0.0,
+                "waiting for " + " and ".join(missing_statuses),
+            )
+
+        stale_statuses = []
+        if (
+            now - self.mapping_status_received_at
+        ).to_sec() > self.mapping_status_timeout:
+            stale_statuses.append("mapping status")
+        if (
+            now - self.localization_status_received_at
+        ).to_sec() > self.localization_status_timeout:
+            stale_statuses.append("localization status")
+        if stale_statuses:
+            for name in stale_statuses:
+                self._enter_new_generation(
+                    name.replace(" ", "_") + "_timeout",
+                    now,
+                )
+            return (
+                ModuleStatus.TIMEOUT,
+                0.0,
+                "stale upstream status timeout: "
+                + " and ".join(stale_statuses),
+            )
+
+        if (
+            not self.mapping_status.valid
+            or not self.localization_status.valid
+        ):
+            invalid_statuses = []
+            if not self.mapping_status.valid:
+                invalid_statuses.append("mapping")
+            if not self.localization_status.valid:
+                invalid_statuses.append("localization")
+            return (
+                ModuleStatus.BLOCKED,
+                0.0,
+                "invalid upstream status: "
+                + " and ".join(invalid_statuses),
+            )
+
+        map_missing = (
+            self.map_msg is None
+            or self.map_received_at is None
+            or self.map_generation != self.generation
+        )
+        odom_missing = (
+            self.odom_msg is None
+            or self.odom_received_at is None
+            or self.odom_generation != self.generation
+        )
+        if map_missing or odom_missing:
+            missing_inputs = []
+            if map_missing:
+                missing_inputs.append("current-generation map")
+            if odom_missing:
+                missing_inputs.append(
+                    "current-generation localization"
+                )
+            return (
+                ModuleStatus.STARTING,
+                0.0,
+                "waiting for " + " and ".join(missing_inputs),
+            )
+
+        stale_inputs = []
+        if (now - self.map_received_at).to_sec() > self.map_timeout:
+            stale_inputs.append("map")
+        if (
+            now - self.odom_received_at
+        ).to_sec() > self.localization_timeout:
+            stale_inputs.append("localization")
+        if stale_inputs:
+            for name in stale_inputs:
+                self._enter_new_generation(name + "_timeout", now)
+            return (
+                ModuleStatus.TIMEOUT,
+                0.0,
+                "stale input timeout: " + " and ".join(stale_inputs),
+            )
+
+        try:
+            self._validate_message_stamp(
+                "mapping status",
+                self.mapping_status.header.stamp,
+                now,
+                self.mapping_status_timeout,
+            )
+            self._validate_message_stamp(
+                "localization status",
+                self.localization_status.header.stamp,
+                now,
+                self.localization_status_timeout,
+            )
+            self._validate_message_stamp(
+                "map",
+                self.map_msg.header.stamp,
+                now,
+                self.map_timeout,
+            )
+            self._validate_message_stamp(
+                "localization",
+                self.odom_msg.header.stamp,
+                now,
+                self.localization_timeout,
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            self._enter_new_generation(
+                "message_timestamp_invalid",
+                now,
+            )
+            return (ModuleStatus.FAILED, 0.0, str(error))
+
+        # All four current-generation timestamps validated: this counts
+        # as a full recovery, so a later independent stale message can
+        # open a fresh generation again instead of being absorbed by
+        # the still-active fault.
+        self.active_faults.discard("message_timestamp_invalid")
+
+        return None
+
+    @staticmethod
+    def _status_age(now, received_at):
+        if received_at is None:
+            return None
+        return (now - received_at).to_sec()
+
+    def _validate_message_stamp(
+        self,
+        name,
+        stamp,
+        now,
+        max_age,
+    ):
+        if stamp.is_zero():
+            raise ValueError("{} timestamp must be non-zero".format(name))
+        future_offset = (stamp - now).to_sec()
+        if future_offset > self.future_stamp_tolerance:
+            raise ValueError(
+                "{} timestamp is {:.3f}s in the future".format(
+                    name,
+                    future_offset,
+                )
+            )
+        age = (now - stamp).to_sec()
+        if age > max_age:
+            raise ValueError(
+                "{} timestamp is {:.3f}s old; limit is {:.3f}s".format(
+                    name,
+                    age,
+                    max_age,
+                )
+            )
+
+    def _commit_invalid_result_if_current(
+        self,
+        state,
+        confidence,
+        detail,
+        expected_generation,
+        map_msg,
+        odom_msg,
+    ):
+        """Commit a negative planning result only for its own snapshot.
+
+        Negative results (``PLAN_NO_FRONTIER``, ``PLAN_UNREACHABLE``
+        and computation exceptions) are published only when the
+        generation, cached inputs and upstream statuses are still the
+        ones the computation ran on, and the watchdog still passes.
+        A stale snapshot is discarded so it cannot overwrite the
+        current generation's state with an old SUCCEEDED, BLOCKED or
+        FAILED result.
+
+        Returns True when the result was committed.
+        """
+        with self.lock:
+            snapshot_is_current = (
+                self.generation == expected_generation
+                and self.map_generation == expected_generation
+                and self.odom_generation == expected_generation
+                and self.mapping_status is not None
+                and self.mapping_status.valid
+                and self.localization_status is not None
+                and self.localization_status.valid
+            )
+            if not snapshot_is_current:
+                rospy.logwarn(
+                    "discarding negative planning result because its "
+                    "generation or inputs changed during planning"
+                )
+                return False
+
+            commit_now = rospy.Time.now()
+            watchdog_failure = self._watchdog_failure_locked(
+                commit_now
+            )
+            if watchdog_failure is not None:
+                failure_state, failure_confidence, failure_detail = (
+                    watchdog_failure
+                )
+                self._invalidate_plan_locked(
+                    failure_state,
+                    failure_confidence,
+                    failure_detail,
+                    stamp=commit_now,
+                )
+                return True
+
+            self._invalidate_plan_locked(
+                state,
+                confidence,
+                detail,
+                stamp=commit_now,
+            )
+            return True
+
     def plan_callback(self, _event):
-        map_msg = self.map_msg
-        odom_msg = self.odom_msg
-        map_received_at = self.map_received_at
-        odom_received_at = self.odom_received_at
+        now = self._observe_ros_time()
+        if now is None:
+            return
+
+        with self.lock:
+            generation = self.generation
+            map_msg = self.map_msg
+            odom_msg = self.odom_msg
+            map_generation = self.map_generation
+            odom_generation = self.odom_generation
+            map_received_at = self.map_received_at
+            odom_received_at = self.odom_received_at
+            mapping_status = self.mapping_status
+            localization_status = self.localization_status
+            mission_epoch = self.mission_epoch
+            returning = self.returning
+            return_start_pose = (
+                dict(self.return_start_pose)
+                if self.return_start_pose is not None
+                else None
+            )
+            return_start_pose_error = self.return_start_pose_error
+            mapping_status_received_at = (
+                self.mapping_status_received_at
+            )
+            localization_status_received_at = (
+                self.localization_status_received_at
+            )
+
+        missing_statuses = []
+        if mapping_status is None or mapping_status_received_at is None:
+            missing_statuses.append("mapping status")
+        if (
+            localization_status is None
+            or localization_status_received_at is None
+        ):
+            missing_statuses.append("localization status")
+
+        if missing_statuses:
+            self.invalidate_plan(
+                ModuleStatus.STARTING,
+                0.0,
+                "waiting for " + " and ".join(missing_statuses),
+            )
+            return
+
+        stale_statuses = []
+        mapping_status_age = self._status_age(
+            now,
+            mapping_status_received_at,
+        )
+        localization_status_age = self._status_age(
+            now,
+            localization_status_received_at,
+        )
+        if mapping_status_age > self.mapping_status_timeout:
+            stale_statuses.append("mapping status")
+        if (
+            localization_status_age
+            > self.localization_status_timeout
+        ):
+            stale_statuses.append("localization status")
+
+        if stale_statuses:
+            for stale_status in stale_statuses:
+                self._enter_new_generation(
+                    stale_status.replace(" ", "_") + "_timeout",
+                    now,
+                )
+            self.invalidate_plan(
+                ModuleStatus.TIMEOUT,
+                0.0,
+                "stale upstream status timeout: "
+                + " and ".join(stale_statuses),
+            )
+            return
+
+        self._clear_fault("mapping_status_timeout")
+        self._clear_fault("localization_status_timeout")
+
+        if not mapping_status.valid or not localization_status.valid:
+            invalid_statuses = []
+            if not mapping_status.valid:
+                invalid_statuses.append("mapping")
+            if not localization_status.valid:
+                invalid_statuses.append("localization")
+            self.invalidate_plan(
+                ModuleStatus.BLOCKED,
+                0.0,
+                "invalid upstream status: "
+                + " and ".join(invalid_statuses),
+            )
+            return
+
+        if returning and return_start_pose is None:
+            self.invalidate_plan(
+                ModuleStatus.BLOCKED,
+                0.0,
+                "RETURNING start pose unavailable: {}".format(
+                    return_start_pose_error or "unknown error"
+                ),
+            )
+            return
 
         map_missing = (
             map_msg is None
             or map_received_at is None
+            or map_generation != generation
         )
         localization_missing = (
             odom_msg is None
             or odom_received_at is None
+            or odom_generation != generation
         )
 
         if map_missing or localization_missing:
             missing = []
-
             if map_missing:
-                missing.append("map")
-
+                missing.append("current-generation map")
             if localization_missing:
-                missing.append("localization")
-
+                missing.append("current-generation localization")
             self.invalidate_plan(
                 ModuleStatus.STARTING,
                 0.0,
-                "waiting for "
-                + " and ".join(missing),
+                "waiting for " + " and ".join(missing),
             )
             return
 
-        now = rospy.Time.now()
         stale_inputs = []
-
-        map_age = (
-            now - map_received_at
-        ).to_sec()
-        localization_age = (
-            now - odom_received_at
-        ).to_sec()
-
-        if map_age > self.map_timeout:
+        if (now - map_received_at).to_sec() > self.map_timeout:
             stale_inputs.append("map")
-
         if (
-            localization_age
+            (now - odom_received_at).to_sec()
             > self.localization_timeout
         ):
             stale_inputs.append("localization")
 
         if stale_inputs:
-            detail = (
-                "stale input timeout: "
-                + " and ".join(stale_inputs)
+            for stale_input in stale_inputs:
+                self._enter_new_generation(
+                    stale_input + "_timeout",
+                    now,
+                )
+            detail = "stale input timeout: " + " and ".join(
+                stale_inputs
             )
-            rospy.logwarn_throttle(
-                5.0,
-                detail,
-            )
+            rospy.logwarn_throttle(5.0, detail)
             self.invalidate_plan(
                 ModuleStatus.TIMEOUT,
                 0.0,
@@ -333,70 +1204,101 @@ class PlanningNode:
             )
             return
 
-        map_frame = map_msg.header.frame_id.strip()
-        odom_frame = odom_msg.header.frame_id.strip()
-
-        if not map_frame or not odom_frame:
-            detail = (
-                "map and localization frame_id "
-                "must both be non-empty"
-            )
-            rospy.logerr_throttle(
-                5.0,
-                detail,
-            )
-            self.invalidate_plan(
-                ModuleStatus.FAILED,
-                0.0,
-                detail,
-            )
-            return
-
-        if odom_frame != map_frame:
-            detail = (
-                "frame mismatch: map uses {!r}, "
-                "localization uses {!r}"
-            ).format(
-                map_frame,
-                odom_frame,
-            )
-            rospy.logerr_throttle(
-                5.0,
-                detail,
-            )
-            self.invalidate_plan(
-                ModuleStatus.FAILED,
-                0.0,
-                detail,
-            )
-            return
+        self._clear_fault("map_timeout")
+        self._clear_fault("localization_timeout")
 
         try:
+            self._validate_message_stamp(
+                "mapping status",
+                mapping_status.header.stamp,
+                now,
+                self.mapping_status_timeout,
+            )
+            self._validate_message_stamp(
+                "localization status",
+                localization_status.header.stamp,
+                now,
+                self.localization_status_timeout,
+            )
+            self._validate_message_stamp(
+                "map",
+                map_msg.header.stamp,
+                now,
+                self.map_timeout,
+            )
+            self._validate_message_stamp(
+                "localization",
+                odom_msg.header.stamp,
+                now,
+                self.localization_timeout,
+            )
+
+            map_frame = map_msg.header.frame_id.strip()
+            odom_frame = odom_msg.header.frame_id.strip()
+            child_frame = odom_msg.child_frame_id.strip()
+
+            if map_frame != WORLD_FRAME:
+                raise ValueError(
+                    "map header.frame_id must be 'world', got {!r}".format(
+                        map_frame
+                    )
+                )
+            if odom_frame != WORLD_FRAME:
+                raise ValueError(
+                    "localization header.frame_id must be 'world', "
+                    "got {!r}".format(odom_frame)
+                )
+            if child_frame != BASE_FRAME:
+                raise ValueError(
+                    "localization child_frame_id must be 'base', "
+                    "got {!r}".format(child_frame)
+                )
+
             self.plan_and_publish(
                 map_msg,
                 odom_msg,
+                generation,
+                mission_epoch=mission_epoch,
+                returning=returning,
+                return_start_pose=return_start_pose,
             )
-        except (
-            TypeError,
-            ValueError,
-            OverflowError,
-        ) as error:
+        except (TypeError, ValueError, OverflowError) as error:
             rospy.logerr_throttle(
                 5.0,
                 "planning failed: %s",
                 str(error),
             )
-            self.invalidate_plan(
+            # The failure may come from a computation that started in
+            # an older generation, so its result is committed only if
+            # the snapshot is still the current one.
+            self._commit_invalid_result_if_current(
                 ModuleStatus.FAILED,
                 0.0,
                 str(error),
+                generation,
+                map_msg,
+                odom_msg,
             )
 
     def plan_and_publish(
         self,
         map_msg,
         odom_msg,
+        expected_generation,
+        mission_epoch=None,
+        returning=False,
+        return_start_pose=None,
     ):
+        if (
+            returning
+            and self.return_path_commit_enabled
+            and self._publish_committed_return_path_if_current(
+                expected_generation,
+                mission_epoch,
+            )
+        ):
+            return
+
         info = map_msg.info
 
         if (
@@ -408,13 +1310,9 @@ class PlanningNode:
             )
 
         origin = info.origin
-        origin_yaw = quaternion_to_yaw(
-            origin.orientation
-        )
-
-        robot_position = (
-            odom_msg.pose.pose.position
-        )
+        origin_yaw = quaternion_to_yaw(origin.orientation)
+        robot_position = odom_msg.pose.pose.position
+        robot_yaw = quaternion_to_yaw(odom_msg.pose.pose.orientation)
 
         finite_pose_values = (
             origin.position.x,
@@ -422,165 +1320,501 @@ class PlanningNode:
             origin_yaw,
             robot_position.x,
             robot_position.y,
+            robot_yaw,
         )
-
-        if not all(
-            isfinite(value)
-            for value in finite_pose_values
-        ):
+        if not all(isfinite(value) for value in finite_pose_values):
             raise ValueError(
                 "map origin and robot position must be finite"
             )
 
         robot_cell = world_to_grid_cell(
-            (
-                robot_position.x,
-                robot_position.y,
-            ),
+            (robot_position.x, robot_position.y),
             resolution=info.resolution,
             origin_x=origin.position.x,
             origin_y=origin.position.y,
             origin_yaw=origin_yaw,
         )
-
         inflation_radius_cells = int(
-            ceil(
-                self.inflation_radius
-                / info.resolution
-            )
+            ceil(self.inflation_radius / info.resolution)
         )
 
-        result = plan_to_frontier_with_status(
-            list(map_msg.data),
-            width=info.width,
-            height=info.height,
-            robot_cell=robot_cell,
-            min_frontier_size=(
-                self.frontier_min_size
-            ),
-            inflation_radius_cells=(
-                inflation_radius_cells
-            ),
-            size_weight=self.size_weight,
-            distance_weight=self.distance_weight,
-            obstacle_threshold=(
-                self.obstacle_threshold
-            ),
-        )
+        initial_forward = False
+        if returning:
+            return_cell = world_to_grid_cell(
+                (return_start_pose["x"], return_start_pose["y"]),
+                resolution=info.resolution,
+                origin_x=origin.position.x,
+                origin_y=origin.position.y,
+                origin_yaw=origin_yaw,
+            )
+            result = plan_to_goal_region_with_status(
+                list(map_msg.data),
+                width=info.width,
+                height=info.height,
+                robot_cell=robot_cell,
+                goal_cell=return_cell,
+                goal_search_radius_cells=self.return_goal_search_radius_cells,
+                inflation_radius_cells=inflation_radius_cells,
+                start_recovery_radius_cells=(
+                    self.start_recovery_radius_cells
+                ),
+                obstacle_threshold=self.obstacle_threshold,
+            )
+            result["frontier_count"] = 0
+        else:
+            result = self._plan_initial_forward_segment(
+                map_msg,
+                odom_msg,
+                robot_cell,
+                inflation_radius_cells,
+            )
+            initial_forward = result is not None
+        if not returning and not initial_forward:
+            result = plan_to_frontier_with_status(
+                list(map_msg.data),
+                width=info.width,
+                height=info.height,
+                robot_cell=robot_cell,
+                min_frontier_size=self.frontier_min_size,
+                inflation_radius_cells=inflation_radius_cells,
+                start_recovery_radius_cells=(
+                    self.start_recovery_radius_cells
+                ),
+                frontier_goal_search_radius_cells=(
+                    self.frontier_goal_search_radius_cells
+                ),
+                size_weight=self.size_weight,
+                distance_weight=self.distance_weight,
+                heading_yaw=robot_yaw - origin_yaw,
+                heading_weight=self.heading_weight,
+                obstacle_threshold=self.obstacle_threshold,
+            )
 
         if result["status"] == PLAN_NO_FRONTIER:
-            detail = (
-                "exploration complete: "
-                "no usable frontier"
-            )
-            rospy.loginfo_throttle(
-                5.0,
-                detail,
-            )
-            self.invalidate_plan(
+            if returning:
+                detail = "RETURNING: no return frontier/map goal available"
+            else:
+                detail = "exploration complete: no usable frontier"
+            committed = self._commit_invalid_result_if_current(
                 ModuleStatus.SUCCEEDED,
                 1.0,
                 detail,
+                expected_generation,
+                map_msg,
+                odom_msg,
             )
+            if committed:
+                rospy.loginfo_throttle(5.0, detail)
             return
 
         if result["status"] == PLAN_UNREACHABLE:
-            detail = (
-                "frontiers detected but none "
-                "is currently reachable"
+            detail_prefix = (
+                "RETURNING goal is not reachable; "
+                if returning
+                else "frontiers detected but none is currently reachable; "
             )
-            rospy.logwarn_throttle(
-                5.0,
-                detail,
+            detail = detail_prefix + (
+                "cluster_count={}; reachable_cell_count={}; "
+                "reachable_frontier_count={}; robot_cell={}; "
+                "robot_cell_raw_value={}; "
+                "robot_cell_inflated_value={}; "
+                "start_recovery_used={}; "
+                "start_recovery_cell={}; "
+                "inflation_radius_cells={}"
+            ).format(
+                result.get("cluster_count", "unknown"),
+                result.get("reachable_cell_count", "unknown"),
+                result.get("reachable_frontier_count", "unknown"),
+                result.get("robot_cell", "unknown"),
+                result.get("robot_cell_raw_value", "unknown"),
+                result.get("robot_cell_inflated_value", "unknown"),
+                result.get("start_recovery_used", "unknown"),
+                result.get("start_recovery_cell", "unknown"),
+                result.get("inflation_radius_cells", "unknown"),
             )
-            self.invalidate_plan(
+            if (
+                not returning
+                and self.exploration_blocked_nudge_enabled
+                and result.get("nearest_frontier_cell") is not None
+            ):
+                nudge_detail = self._publish_exploration_blocked_nudge(
+                    map_msg,
+                    robot_cell,
+                    result["nearest_frontier_cell"],
+                    origin_yaw,
+                    result,
+                )
+                if nudge_detail is not None:
+                    rospy.logwarn_throttle(5.0, nudge_detail)
+                    return
+            committed = self._commit_invalid_result_if_current(
                 ModuleStatus.BLOCKED,
                 0.0,
                 detail,
+                expected_generation,
+                map_msg,
+                odom_msg,
             )
+            if committed:
+                rospy.logwarn_throttle(5.0, detail)
             return
 
         if result["status"] != PLAN_SUCCESS:
             raise ValueError(
-                "unknown planning status: {}".format(
-                    result["status"]
-                )
+                "unknown planning status: {}".format(result["status"])
             )
 
-        frame_id = (
-            map_msg.header.frame_id.strip()
-            or "map"
+        output_path = (
+            compress_collinear_path(result["path"])
+            if self.path_compression_enabled
+            else result["path"]
         )
         stamp = rospy.Time.now()
-
         path_yaws = path_cell_yaws(
-            result["path"],
+            output_path,
             origin_yaw=origin_yaw,
         )
 
         path_msg = Path()
         path_msg.header.stamp = stamp
-        path_msg.header.frame_id = frame_id
+        path_msg.header.frame_id = WORLD_FRAME
         path_msg.poses = [
             self.make_pose(
                 cell,
                 info,
                 origin_yaw,
-                frame_id,
                 stamp,
                 pose_yaw,
             )
             for cell, pose_yaw in zip(
-                result["path"],
+                output_path,
                 path_yaws,
             )
         ]
 
-        goal_yaw = (
-            path_yaws[-1]
-            if path_yaws
-            else origin_yaw
-        )
+        goal_yaw = path_yaws[-1] if path_yaws else origin_yaw
         goal_msg = self.make_pose(
             result["goal_cell"],
             info,
             origin_yaw,
-            frame_id,
             stamp,
             goal_yaw,
         )
 
+        if returning:
+            detail = "RETURNING path with {} poses to start {}; ".format(
+                len(output_path),
+                result.get("requested_goal_cell", result["goal_cell"]),
+            )
+            if result.get("goal_offset_used", False):
+                detail += "reachable arrival goal {}; ".format(result["goal_cell"])
+        elif initial_forward:
+            detail = (
+                "initial forward exploration path with {} poses to {}; "
+            ).format(len(output_path), result["goal_cell"])
+        else:
+            detail = "planned path with {} poses to frontier {}; ".format(
+                len(output_path),
+                result.get("frontier_goal_cell", result["goal_cell"]),
+            )
+            if result.get("frontier_goal_offset_used", False):
+                detail += "safe standoff goal {}; ".format(result["goal_cell"])
+        detail += (
+            "{} frontier cells detected; robot_cell={}; "
+            "robot_cell_raw_value={}; "
+            "robot_cell_inflated_value={}; "
+            "start_recovery_used={}; start_recovery_cell={}"
+        ).format(
+            result["frontier_count"],
+            result.get("robot_cell", "unknown"),
+            result.get("robot_cell_raw_value", "unknown"),
+            result.get("robot_cell_inflated_value", "unknown"),
+            result.get("start_recovery_used", "unknown"),
+            result.get("start_recovery_cell", "unknown"),
+        )
+
+        with self.lock:
+            result_is_current = (
+                self.generation == expected_generation
+                and self.map_generation == expected_generation
+                and self.odom_generation == expected_generation
+                and self.mapping_status is not None
+                and self.mapping_status.valid
+                and self.localization_status is not None
+                and self.localization_status.valid
+                and (mission_epoch is None or self.mission_epoch == mission_epoch)
+                and self.returning == returning
+            )
+            if result_is_current:
+                commit_now = rospy.Time.now()
+                watchdog_failure = self._watchdog_failure_locked(
+                    commit_now
+                )
+                if watchdog_failure is not None:
+                    state, confidence, failure_detail = watchdog_failure
+                    self._invalidate_plan_locked(
+                        state,
+                        confidence,
+                        failure_detail,
+                        stamp=commit_now,
+                    )
+                    return
+
+                # The final check and all three output publications are one
+                # lock-protected commit. An invalidating callback can only
+                # publish after this block, so an old path cannot revive.
+                self.goal_pub.publish(goal_msg)
+                self.path_pub.publish(path_msg)
+                self.last_status = (
+                    ModuleStatus.RUNNING,
+                    True,
+                    1.0,
+                    detail,
+                )
+                self._publish_status_message_locked(
+                    ModuleStatus.RUNNING,
+                    True,
+                    1.0,
+                    detail,
+                    stamp=stamp,
+                )
+                if (
+                    returning
+                    and self.return_path_commit_enabled
+                    and self.return_committed_path is None
+                ):
+                    # Preserve the first successful route produced by this
+                    # planner for the current RETURNING epoch.  It is an
+                    # exact planner output, not a synthetic motion command;
+                    # the normal localization/map watchdogs still gate every
+                    # later republish.
+                    self.return_committed_path = copy.deepcopy(path_msg)
+                    self.return_committed_goal = copy.deepcopy(goal_msg)
+                    self.return_committed_detail = detail
+
+        if not result_is_current:
+            rospy.logwarn(
+                "discarding planning result because its "
+                "generation or inputs changed during planning"
+            )
+            return
+
+        rospy.loginfo_throttle(5.0, detail)
+
+    def _publish_committed_return_path_if_current(
+        self,
+        expected_generation,
+        mission_epoch,
+    ):
+        """Republish the committed planner route only while inputs are safe.
+
+        This is deliberately a planner-local recovery mechanism: it keeps a
+        previously valid planner path stable when incremental occupancy-map
+        changes make equivalent replans oscillate or temporarily unreachable.
+        It never constructs geometry, publishes commands, or suppresses an
+        upstream freshness/validity failure.
+        """
+        with self.lock:
+            if (
+                self.return_committed_path is None
+                or self.return_committed_goal is None
+                or self.return_committed_detail is None
+            ):
+                return False
+
+            result_is_current = (
+                self.generation == expected_generation
+                and self.map_generation == expected_generation
+                and self.odom_generation == expected_generation
+                and self.mapping_status is not None
+                and self.mapping_status.valid
+                and self.localization_status is not None
+                and self.localization_status.valid
+                and (mission_epoch is None or self.mission_epoch == mission_epoch)
+                and self.returning
+            )
+            if not result_is_current:
+                return False
+
+            commit_now = rospy.Time.now()
+            watchdog_failure = self._watchdog_failure_locked(commit_now)
+            if watchdog_failure is not None:
+                state, confidence, detail = watchdog_failure
+                self._invalidate_plan_locked(
+                    state,
+                    confidence,
+                    detail,
+                    stamp=commit_now,
+                )
+                return True
+
+            path_msg = copy.deepcopy(self.return_committed_path)
+            goal_msg = copy.deepcopy(self.return_committed_goal)
+            path_msg.header.stamp = commit_now
+            for pose in path_msg.poses:
+                pose.header.stamp = commit_now
+            goal_msg.header.stamp = commit_now
+            detail = (
+                "RETURNING committed planner path with {} poses; {}"
+            ).format(len(path_msg.poses), self.return_committed_detail)
+            self.goal_pub.publish(goal_msg)
+            self.path_pub.publish(path_msg)
+            self.last_status = (
+                ModuleStatus.RUNNING,
+                True,
+                1.0,
+                detail,
+            )
+            self._publish_status_message_locked(
+                ModuleStatus.RUNNING,
+                True,
+                1.0,
+                detail,
+                stamp=commit_now,
+            )
+            return True
+
+    def _plan_initial_forward_segment(
+        self,
+        map_msg,
+        odom_msg,
+        robot_cell,
+        inflation_radius_cells,
+    ):
+        """Plan a short map-validated path along the legal initial heading.
+
+        This optional startup policy uses only competition localization and
+        the current occupancy grid.  It neither knows scene coordinates nor
+        creates a path outside the existing grid planner.
+        """
+        if self.initial_forward_distance <= 0.0 or self.initial_forward_complete:
+            return None
+
+        robot = odom_msg.pose.pose.position
+        if self.initial_forward_anchor is None:
+            self.initial_forward_anchor = {
+                "x": robot.x,
+                "y": robot.y,
+                "yaw": quaternion_to_yaw(odom_msg.pose.pose.orientation),
+            }
+
+        anchor = self.initial_forward_anchor
+        direction_x = cos(anchor["yaw"])
+        direction_y = sin(anchor["yaw"])
+        progress = max(
+            0.0,
+            (robot.x - anchor["x"]) * direction_x
+            + (robot.y - anchor["y"]) * direction_y,
+        )
+        if progress >= self.initial_forward_distance - 0.25:
+            self.initial_forward_complete = True
+            return None
+
+        maximum_step = min(
+            self.initial_forward_lookahead,
+            self.initial_forward_distance - progress,
+        )
+        candidate = plan_to_heading_goal_with_status(
+            list(map_msg.data),
+            width=map_msg.info.width,
+            height=map_msg.info.height,
+            robot_cell=robot_cell,
+            heading_yaw=anchor["yaw"] - quaternion_to_yaw(map_msg.info.origin.orientation),
+            max_forward_cells=maximum_step / map_msg.info.resolution,
+            min_forward_cells=max(0.5, map_msg.info.resolution) / map_msg.info.resolution,
+            corridor_half_width_cells=1.0 / map_msg.info.resolution,
+            inflation_radius_cells=inflation_radius_cells,
+            start_recovery_radius_cells=self.start_recovery_radius_cells,
+            obstacle_threshold=self.obstacle_threshold,
+        )
+        if candidate["status"] != PLAN_SUCCESS:
+            return None
+        candidate["frontier_count"] = 0
+        candidate["initial_forward_target_distance"] = progress + maximum_step
+        return candidate
+
+    def _publish_exploration_blocked_nudge(
+        self,
+        map_msg,
+        robot_cell,
+        nearest_frontier_cell,
+        origin_yaw,
+        result,
+    ):
+        """Command a short blind drive toward the nearest frontier cell.
+
+        Exploration planner-BLOCKED (R29): no frontier is reachable in the
+        current map, typically because localization drift enclosed the
+        robot's reachability pocket.  Driving toward the nearest frontier
+        lets the robot re-observe and the map correct itself.  The nudge is
+        bounded to exploration_blocked_nudge_distance metres and re-published
+        every replan cycle, so it terminates naturally once a frontier is
+        reachable again.  The path intentionally crosses map-occupied cells —
+        that is the point (the map is wrong); it is a short, bounded, blind
+        probe, not an open-loop run.
+
+        Returns the detail string on success, or None when the nudge cannot
+        be produced (e.g. no room to move).
+        """
+        rx, ry = robot_cell
+        fx, fy = nearest_frontier_cell
+        dx = fx - rx
+        dy = fy - ry
+        distance_cells = hypot(dx, dy)
+        if distance_cells <= 0.0:
+            return None
+        nudge_cells = max(
+            1,
+            int(round(self.exploration_blocked_nudge_distance / map_msg.info.resolution)),
+        )
+        step = min(distance_cells, nudge_cells)
+        gx = int(round(rx + dx / distance_cells * step))
+        gy = int(round(ry + dy / distance_cells * step))
+        gx = max(0, min(map_msg.info.width - 1, gx))
+        gy = max(0, min(map_msg.info.height - 1, gy))
+        if (gx, gy) == (rx, ry):
+            return None
+
+        goal_yaw = atan2(gy - ry, gx - rx)
+        stamp = rospy.Time.now()
+        path_msg = Path()
+        path_msg.header.stamp = stamp
+        path_msg.header.frame_id = WORLD_FRAME
+        path_msg.poses = [
+            self.make_pose(cell, map_msg.info, origin_yaw, stamp, goal_yaw)
+            for cell in ((rx, ry), (gx, gy))
+        ]
+        goal_msg = self.make_pose(
+            (gx, gy), map_msg.info, origin_yaw, stamp, goal_yaw
+        )
         self.goal_pub.publish(goal_msg)
         self.path_pub.publish(path_msg)
-
         detail = (
-            "planned path with {} poses "
-            "to frontier {}; "
-            "{} frontier cells detected"
+            "exploration blocked; nudging toward nearest frontier cell "
+            "{} ({} m); cluster_count={}; reachable_cell_count={}; "
+            "reachable_frontier_count={}"
         ).format(
-            len(result["path"]),
-            result["goal_cell"],
-            result["frontier_count"],
+            (gx, gy),
+            step * map_msg.info.resolution,
+            result.get("cluster_count", "unknown"),
+            result.get("reachable_cell_count", "unknown"),
+            result.get("reachable_frontier_count", "unknown"),
         )
-
-        self.publish_status(
+        self.last_status = (ModuleStatus.RUNNING, True, 0.5, detail)
+        self._publish_status_message_locked(
             ModuleStatus.RUNNING,
             True,
-            1.0,
+            0.5,
             detail,
+            stamp=stamp,
         )
-
-        rospy.loginfo_throttle(
-            5.0,
-            detail,
-        )
+        return detail
 
     @staticmethod
     def make_pose(
         cell,
         info,
         origin_yaw,
-        frame_id,
         stamp,
         pose_yaw,
     ):
@@ -594,24 +1828,17 @@ class PlanningNode:
 
         pose = PoseStamped()
         pose.header.stamp = stamp
-        pose.header.frame_id = frame_id
+        pose.header.frame_id = WORLD_FRAME
         pose.pose.position.x = world_x
         pose.pose.position.y = world_y
         pose.pose.position.z = 0.0
-        pose.pose.orientation.z = sin(
-            pose_yaw / 2.0
-        )
-        pose.pose.orientation.w = cos(
-            pose_yaw / 2.0
-        )
+        pose.pose.orientation.z = sin(pose_yaw / 2.0)
+        pose.pose.orientation.w = cos(pose_yaw / 2.0)
         return pose
 
 
 def main():
-    rospy.init_node(
-        "planning_node",
-        log_level=rospy.INFO,
-    )
+    rospy.init_node("planning_node", log_level=rospy.INFO)
     PlanningNode()
     rospy.spin()
 

@@ -16,10 +16,52 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from planning_core import (  # noqa: E402
     _bfs_reachability,
+    compress_collinear_path,
+    order_frontier_candidates,
     path_cell_yaws,
+    plan_to_goal_with_status,
+    plan_to_goal_region_with_status,
+    plan_to_heading_goal_with_status,
     plan_to_frontier,
     plan_to_frontier_with_status,
 )
+
+
+class FrontierCandidateHeadingTest(unittest.TestCase):
+    def test_optional_heading_orders_forward_cell_first(self):
+        cluster = [(-1, 0), (0, 2), (4, 0)]
+
+        ordered = order_frontier_candidates(
+            cluster,
+            robot_cell=(0, 0),
+            heading_yaw=0.0,
+            heading_weight=5.0,
+        )
+
+        self.assertEqual(ordered[0], (4, 0))
+
+    def test_robot_cell_is_not_returned_as_frontier_goal(self):
+        ordered = order_frontier_candidates(
+            [(0, 0), (1, 0)],
+            robot_cell=(0, 0),
+            heading_yaw=0.0,
+            heading_weight=1.0,
+        )
+
+        self.assertEqual(ordered, [(1, 0)])
+
+
+class PathCompressionTest(unittest.TestCase):
+    def test_keeps_start_turns_and_goal(self):
+        path = [(0, 0), (1, 0), (2, 0), (2, 1), (2, 2), (3, 2)]
+        self.assertEqual(
+            compress_collinear_path(path),
+            [(0, 0), (2, 0), (2, 2), (3, 2)],
+        )
+
+    def test_does_not_change_short_paths(self):
+        self.assertEqual(compress_collinear_path([]), [])
+        self.assertEqual(compress_collinear_path([(1, 2)]), [(1, 2)])
 
 
 class PlanToFrontierTest(unittest.TestCase):
@@ -598,6 +640,129 @@ class PlanToFrontierTest(unittest.TestCase):
                 "expected well under 1.0 s"
             ),
         )
+
+
+class PlanToReturnGoalTest(unittest.TestCase):
+    def test_returns_path_to_free_start_goal(self):
+        data = [
+            0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+        ]
+        result = plan_to_goal_with_status(
+            data,
+            width=5,
+            height=5,
+            robot_cell=(4, 4),
+            goal_cell=(0, 0),
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["path"][0], (4, 4))
+        self.assertEqual(result["path"][-1], (0, 0))
+
+    def test_occupied_goal_is_unreachable(self):
+        data = [0] * 9
+        data[0] = 100
+        result = plan_to_goal_with_status(
+            data,
+            width=3,
+            height=3,
+            robot_cell=(2, 2),
+            goal_cell=(0, 0),
+        )
+        self.assertEqual(result["status"], "unreachable")
+        self.assertIn("occupied", result["detail"])
+
+    def test_unknown_start_uses_finite_recovery_radius(self):
+        data = [
+            0, 0, 0,
+            0, -1, 0,
+            0, 0, 0,
+        ]
+        result = plan_to_goal_with_status(
+            data,
+            width=3,
+            height=3,
+            robot_cell=(1, 1),
+            goal_cell=(0, 0),
+            start_recovery_radius_cells=1,
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["start_recovery_used"])
+        self.assertEqual(result["path"][-1], (0, 0))
+
+    def test_occupied_start_does_not_recover(self):
+        data = [0] * 9
+        data[4] = 100
+        result = plan_to_goal_with_status(
+            data,
+            width=3,
+            height=3,
+            robot_cell=(1, 1),
+            goal_cell=(0, 0),
+            start_recovery_radius_cells=1,
+        )
+        self.assertEqual(result["status"], "unreachable")
+
+    def test_out_of_bounds_goal_is_unreachable(self):
+        result = plan_to_goal_with_status(
+            [0] * 9,
+            width=3,
+            height=3,
+            robot_cell=(1, 1),
+            goal_cell=(3, 3),
+        )
+        self.assertEqual(result["status"], "unreachable")
+        self.assertIn("out of bounds", result["detail"])
+
+    def test_region_uses_nearest_reachable_cell_when_exact_goal_is_occupied(self):
+        data = [0] * 25
+        data[2 * 5 + 2] = 100
+        result = plan_to_goal_region_with_status(
+            data,
+            width=5,
+            height=5,
+            robot_cell=(4, 4),
+            goal_cell=(2, 2),
+            goal_search_radius_cells=1,
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["goal_offset_used"])
+        self.assertEqual(result["requested_goal_cell"], (2, 2))
+
+
+class PlanToHeadingGoalTest(unittest.TestCase):
+    def test_selects_furthest_reachable_cell_around_scattered_obstacle(self):
+        data = [0] * 49
+        data[3 * 7 + 3] = 100
+        result = plan_to_heading_goal_with_status(
+            data,
+            width=7,
+            height=7,
+            robot_cell=(1, 3),
+            heading_yaw=0.0,
+            max_forward_cells=4.0,
+            min_forward_cells=1.0,
+            corridor_half_width_cells=2.0,
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["goal_cell"][0], 5)
+        self.assertNotIn((3, 3), result["path"])
+
+    def test_reports_unreachable_when_forward_corridor_is_unknown(self):
+        data = [-1] * 25
+        data[2 * 5 + 2] = 0
+        result = plan_to_heading_goal_with_status(
+            data,
+            width=5,
+            height=5,
+            robot_cell=(2, 2),
+            heading_yaw=0.0,
+            max_forward_cells=2.0,
+        )
+        self.assertEqual(result["status"], "unreachable")
 
 
 if __name__ == "__main__":

@@ -3,6 +3,10 @@
 ***********************************************************************/
 #include <iostream>
 #include <cmath>
+#include <algorithm>
+#include <cstdlib>
+#include <chrono>
+#include <fstream>
 #include "FSM/State_RL_test.h"
 
 namespace {
@@ -19,11 +23,74 @@ float finiteAxis(float value)
     }
     return value;
 }
+
+// =====================================================================
+// CONTROL-POLICY AUDIT INSTRUMENTATION (read-only, env-gated).
+// UNITREE_POLICY_TRACE_CSV=<path> enables a per-inference CSV trace of
+// the complete policy observation vector, its raw sources, actions and
+// commanded targets.  Unset => zero behavior change.
+// =====================================================================
+bool g_policyTraceEnabled = false;
+std::ofstream g_policyTrace;
+std::chrono::steady_clock::time_point g_policyTraceWall0;
+
+void policyTraceInit()
+{
+    const char *path = std::getenv("UNITREE_POLICY_TRACE_CSV");
+    g_policyTraceEnabled = false;
+    if(path == nullptr || path[0] == '\0'){
+        return;
+    }
+    g_policyTrace.open(path, std::ios::out | std::ios::trunc);
+    if(!g_policyTrace.is_open()){
+        return;
+    }
+    g_policyTraceEnabled = true;
+    g_policyTraceWall0 = std::chrono::steady_clock::now();
+    g_policyTrace << "sim_us,wall_us,obs45,base_w_ori4,base_w_angvel3,"
+                     "imu_quat4,imu_gyro3,q_motor12,dq_motor12,commands3,"
+                     "raw_action12,policy_target12,commanded_target12,ready\n";
+    g_policyTrace.flush();
 }
+
+double policyTraceWallUs()
+{
+    const auto now = std::chrono::steady_clock::now();
+    return static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+        now - g_policyTraceWall0).count());
+}
+
+template<typename ValueT>
+void policyTraceFloatsPtr(std::ofstream &out, const ValueT *values, std::size_t n)
+{
+    for(std::size_t i = 0; i < n; ++i){
+        if(i != 0){
+            out << ";";
+        }
+        out << values[i];
+    }
+}
+
+void policyTraceTensor(std::ofstream &out, const torch::Tensor &t)
+{
+    const torch::Tensor cpu = t.to(torch::kCPU);
+    const float *p = cpu.data_ptr<float>();
+    for(long i = 0; i < cpu.numel(); ++i){
+        if(i != 0){
+            out << ";";
+        }
+        out << p[i];
+    }
+}
+} // namespace
 
 State_RL::State_RL(CtrlComponents *ctrlComp)
                 :FSMState(ctrlComp, FSMStateName::RL, "RL")
 {
+    _handoffDuration = RLHandoffTransition::parseDurationOrThrow(
+        std::getenv("UNITREE_RL_HANDOFF_DURATION"));
+    _handoffMaxTargetStep = RLHandoffTransition::parseMaxTargetStepOrThrow(
+        std::getenv("UNITREE_RL_HANDOFF_MAX_TARGET_STEP"));
     load_policy();
     gravity(0,0) = 0.0;
     gravity(1,0) = 0.0;
@@ -45,10 +112,19 @@ void State_RL::enter(){
         std::cout << "[INFO] Entered RL /cmd_vel mode." << std::endl;
     }
 
+        RLHandoffTransition::JointTargets handoffStartTargets{};
+        float maxTrackingError = 0.0f;
      // if (real == false){
         for(int i=0; i<12; i++){
-            _lowCmd->motorCmd[i].q = _lowState->motorState[i].q;
-            _startPos[i] = _lowState->motorState[i].q;
+            const float measuredQ = _lowState->motorState[i].q;
+            const float previousTarget = _lowCmd->motorCmd[i].q;
+            handoffStartTargets[i] = std::isfinite(previousTarget) ?
+                                     previousTarget : measuredQ;
+            maxTrackingError = std::max(
+                maxTrackingError,
+                std::fabs(measuredQ - handoffStartTargets[i]));
+            _lowCmd->motorCmd[i].q = handoffStartTargets[i];
+            _startPos[i] = handoffStartTargets[i];
             _lowCmd->motorCmd[i].mode = 10;
             _lowCmd->motorCmd[i].dq = 0;
             _lowCmd->motorCmd[i].Kp = 80;
@@ -74,9 +150,69 @@ void State_RL::enter(){
             _ctrlComp->ioInterFreeDog->setCmd(i,joint);
         }
     // }
+    actions_tensor = torch::zeros({12});
+    actions_tensor_scaled = torch::zeros({12});
+    previous_applied_actions_tensor = torch::zeros({12});
+    commands_tensor = torch::zeros({3});
+    obs_tensor = torch::zeros({45});
+    obs_history_tensor = torch::zeros({HISTORY_LEN, 45}).to(device);
+    current_cmd_vel_ = {};
+    updatePreviousAppliedActions(handoffStartTargets);
+    const long long handoffStartTime = getTime();
+    _handoffTransition.reset(
+        handoffStartTargets, nominalJointTargets(), handoffStartTime,
+        _handoffDuration, _handoffMaxTargetStep);
+    _handoffCompletionLogged = false;
+    _lastHandoffDiagnosticTime = handoffStartTime;
+    std::cout << "[INFO] RL handoff started: duration=" << _handoffDuration
+              << " sim-s, source=previous_actuator_target, intermediate=RL_nominal_pose, "
+                 "max_target_step=" << _handoffMaxTargetStep << " rad, "
+                 "max_tracking_error="
+              << maxTrackingError << " rad." << std::endl;
     for (int i = 0; i < HISTORY_LEN; i++)
     {
         refresh_rl_obs();
+    }
+    // AUDIT-INSTRUMENTATION: entry snapshot before the inference thread starts.
+    policyTraceInit();
+    if(g_policyTraceEnabled){
+        std::array<float, 12> qMotor{};
+        std::array<float, 12> dqMotor{};
+        for(int i = 0; i < 12; ++i){
+            qMotor[i] = _lowState->motorState[i].q;
+            dqMotor[i] = _lowState->motorState[i].dq;
+        }
+        g_policyTrace << getTime() << "," << policyTraceWallUs() << ",";
+        policyTraceTensor(g_policyTrace, obs_tensor);
+        g_policyTrace << ",";
+        policyTraceFloatsPtr(g_policyTrace,
+            _ctrlComp->ioInter->_base_w_ori.data(), 4);
+        g_policyTrace << ",";
+        policyTraceFloatsPtr(g_policyTrace,
+            _ctrlComp->ioInter->_base_w_angular_vel.data(), 3);
+        g_policyTrace << ",";
+        policyTraceFloatsPtr(g_policyTrace,
+            _lowState->imu.quaternion, 4);
+        g_policyTrace << ",";
+        policyTraceFloatsPtr(g_policyTrace,
+            _lowState->imu.gyroscope, 3);
+        g_policyTrace << ",";
+        policyTraceFloatsPtr(g_policyTrace, qMotor.data(), 12);
+        g_policyTrace << ",";
+        policyTraceFloatsPtr(g_policyTrace, dqMotor.data(), 12);
+        g_policyTrace << ",";
+        policyTraceTensor(g_policyTrace, commands_tensor);
+        g_policyTrace << ",";
+        policyTraceFloatsPtr(g_policyTrace,
+            actions_tensor.data_ptr<float>(), 12);
+        g_policyTrace << ",";
+        policyTraceFloatsPtr(g_policyTrace,
+            handoffStartTargets.data(), 12);
+        g_policyTrace << ",";
+        policyTraceFloatsPtr(g_policyTrace,
+            handoffStartTargets.data(), 12);
+        g_policyTrace << ",0\n";
+        g_policyTrace.flush();
     }
     infer_thread_runnning = State_RL::RUNNING;
     infer_thread = new std::thread(&State_RL::infer_thread_callback,this);
@@ -175,6 +311,12 @@ void State_RL::infer_thread_callback()
         long long _start_time = getTime();
         // std::cout << "_start_time" << _start_time << std::endl;
         refresh_rl_obs();
+        // AUDIT-INSTRUMENTATION: snapshot the exact observation fed to the
+        // model this iteration (before the model call mutates anything).
+        torch::Tensor auditObs;
+        if(g_policyTraceEnabled){
+            auditObs = obs_tensor.to(torch::kCPU);
+        }
         torch::Tensor flattened_obs = obs_history_tensor.view({1, HISTORY_LEN * 45});
         if (debug == true)
         {
@@ -194,14 +336,54 @@ void State_RL::infer_thread_callback()
             torch::Tensor output = model.get_method("act_inference")(test).toTensor().to(torch::kCPU).squeeze();
             // printTensorHorizontal(output, "same_net_work_test");
         }
-        actions_tensor_scaled = actions_tensor.clone() * 0.25;
-        std::vector<float> actions(actions_tensor_scaled.data_ptr<float>(),
-                           actions_tensor_scaled.data_ptr<float>() + actions_tensor_scaled.numel());
+        actions_tensor_scaled = actions_tensor.clone() * ACTION_SCALE;
+        const auto policyTargets = policyJointTargets();
+        const auto commandedTargets = _handoffTransition.step(
+            policyTargets, getTime());
+        // AUDIT-INSTRUMENTATION: per-inference trace row.
+        if(g_policyTraceEnabled){
+            std::array<float, 12> qMotor{};
+            std::array<float, 12> dqMotor{};
+            for(int i = 0; i < 12; ++i){
+                qMotor[i] = _lowState->motorState[i].q;
+                dqMotor[i] = _lowState->motorState[i].dq;
+            }
+            g_policyTrace << _start_time << "," << policyTraceWallUs() << ",";
+            policyTraceTensor(g_policyTrace, auditObs);
+            g_policyTrace << ",";
+            policyTraceFloatsPtr(g_policyTrace,
+                _ctrlComp->ioInter->_base_w_ori.data(), 4);
+            g_policyTrace << ",";
+            policyTraceFloatsPtr(g_policyTrace,
+                _ctrlComp->ioInter->_base_w_angular_vel.data(), 3);
+            g_policyTrace << ",";
+            policyTraceFloatsPtr(g_policyTrace,
+                _lowState->imu.quaternion, 4);
+            g_policyTrace << ",";
+            policyTraceFloatsPtr(g_policyTrace,
+                _lowState->imu.gyroscope, 3);
+            g_policyTrace << ",";
+            policyTraceFloatsPtr(g_policyTrace, qMotor.data(), 12);
+            g_policyTrace << ",";
+            policyTraceFloatsPtr(g_policyTrace, dqMotor.data(), 12);
+            g_policyTrace << ",";
+            policyTraceTensor(g_policyTrace, commands_tensor);
+            g_policyTrace << ",";
+            policyTraceFloatsPtr(g_policyTrace,
+                actions_tensor.data_ptr<float>(), 12);
+            g_policyTrace << ",";
+            policyTraceFloatsPtr(g_policyTrace, policyTargets.data(), 12);
+            g_policyTrace << ",";
+            policyTraceFloatsPtr(g_policyTrace, commandedTargets.data(), 12);
+            g_policyTrace << "," << (_handoffTransition.ready() ? "1" : "0")
+                          << "\n";
+            g_policyTrace.flush();
+        }
         if (debug == true) std::cout << "actions[reindex[j]]  + default_dof_pos" << std::endl;
         for(int i=0; i<12; i++){
             if (real == false)
             {
-                _lowCmd->motorCmd[i].q = actions[reindex[i]]  + default_dof_pos_tensor[reindex[i]].item<float>();
+                _lowCmd->motorCmd[i].q = commandedTargets[i];
                 _lowCmd->motorCmd[i].Kp = 80;
                 _lowCmd->motorCmd[i].Kd = 1;
             }
@@ -211,7 +393,31 @@ void State_RL::infer_thread_callback()
                 // std::vector<double> joint{t_joint, 0, 0, 80, 1};
                 // _ctrlComp->ioInterFreeDog->setCmd(i,joint);
             }
-            if (debug == true) std::cout << actions[reindex[i]]  + default_dof_pos_tensor[reindex[i]].item<float>() << " ";
+            if (debug == true) std::cout << policyTargets[i] << " ";
+        }
+        updatePreviousAppliedActions(commandedTargets);
+        if(!_handoffCompletionLogged && _handoffTransition.ready()){
+            _handoffCompletionLogged = true;
+            std::cout << "[INFO] RL_HANDOFF_READY=True; policy targets and "
+                         "locomotion commands are now enabled." << std::endl;
+        }
+        const long long handoffDiagnosticTime = getTime();
+        if(!_handoffTransition.ready() &&
+           handoffDiagnosticTime - _lastHandoffDiagnosticTime >= 500000){
+            _lastHandoffDiagnosticTime = handoffDiagnosticTime;
+            std::cout << "[INFO] RL_HANDOFF_PROGRESS stable_policy_samples="
+                      << _handoffTransition.stablePolicySamples()
+                      << ", policy_catchup_started="
+                      << (_handoffTransition.policyCatchupStarted() ? "true" : "false")
+                      << ", latest_policy_target_delta="
+                      << _handoffTransition.latestMaxPolicyTargetDelta()
+                      << ", min_policy_target_delta="
+                      << _handoffTransition.minimumMaxPolicyTargetDelta()
+                      << ", max_policy_target_delta="
+                      << _handoffTransition.maximumMaxPolicyTargetDelta()
+                      << ", output_policy_error="
+                      << _handoffTransition.maxOutputPolicyError()
+                      << std::endl;
         }
         if (debug == true)
             std::cout << std::endl;
@@ -263,17 +469,50 @@ void State_RL::save_amp_obs_thread()
 }
 
 void State_RL::updateCommandTensor(){
+    RLHandoffTransition::VelocityCommand requested{{0.0f, 0.0f, 0.0f}};
     if(_keyboardMode.load()){
         _userValue = _lowState->userValue;
-        commands_tensor[0] = finiteAxis(_userValue.ly) * _keyboardVxScale;
-        commands_tensor[1] = -finiteAxis(_userValue.lx) * _keyboardVyScale;
-        commands_tensor[2] = -finiteAxis(_userValue.rx) * _keyboardWzScale;
-        return;
+        requested[0] = finiteAxis(_userValue.ly) * _keyboardVxScale;
+        requested[1] = -finiteAxis(_userValue.lx) * _keyboardVyScale;
+        requested[2] = -finiteAxis(_userValue.rx) * _keyboardWzScale;
+    }else{
+        requested[0] = static_cast<float>(this->current_cmd_vel_.linear_x);
+        requested[1] = static_cast<float>(this->current_cmd_vel_.linear_y);
+        requested[2] = static_cast<float>(this->current_cmd_vel_.angular_z);
     }
 
-    commands_tensor[0] = this->current_cmd_vel_.linear_x;
-    commands_tensor[1] = this->current_cmd_vel_.linear_y;
-    commands_tensor[2] = this->current_cmd_vel_.angular_z;
+    const auto gated = _handoffTransition.gateCommand(requested);
+    commands_tensor[0] = gated[0];
+    commands_tensor[1] = gated[1];
+    commands_tensor[2] = gated[2];
+}
+
+RLHandoffTransition::JointTargets State_RL::policyJointTargets() const{
+    RLHandoffTransition::JointTargets targets{};
+    const float *actions = actions_tensor_scaled.data_ptr<float>();
+    for(int i = 0; i < 12; ++i){
+        targets[i] = actions[reindex[i]] +
+                     default_dof_pos_tensor[reindex[i]].item<float>();
+    }
+    return targets;
+}
+
+RLHandoffTransition::JointTargets State_RL::nominalJointTargets() const{
+    RLHandoffTransition::JointTargets targets{};
+    for(int i = 0; i < 12; ++i){
+        targets[i] = default_dof_pos_tensor[reindex[i]].item<float>();
+    }
+    return targets;
+}
+
+void State_RL::updatePreviousAppliedActions(
+    const RLHandoffTransition::JointTargets &commandedTargets){
+    const auto appliedActionsMotorOrder = RLHandoffTransition::actionEquivalent(
+        commandedTargets, nominalJointTargets(), ACTION_SCALE);
+    float *historyActions = previous_applied_actions_tensor.data_ptr<float>();
+    for(int motorIndex = 0; motorIndex < 12; ++motorIndex){
+        historyActions[reindex[motorIndex]] = appliedActionsMotorOrder[motorIndex];
+    }
 }
 
 
@@ -283,16 +522,37 @@ void State_RL::refresh_rl_obs(){
     //gazebo simulation mode
     if (real == false)
     {
-        for (int i=0; i<4; i++) {
-            base_w_orientation[i] = _ctrlComp->ioInter->_base_w_ori[i];
+        // Balance observation (obs[0:6]) from the legitimate IMU source
+        // (/trunk_imu -> _lowState->imu).  This replaces the previous
+        // /ground_truth/base_w dependency: that topic is gated behind
+        // ENABLE_GROUND_TRUTH and never published in competition-compliant
+        // launches, which froze obs[0:6] at initializer garbage.
+        // Semantics verified in artifacts/review/full-loop/
+        // control-policy-fix/imu_observation_semantics_audit.txt.
+        RLBalanceObservation::BalanceObs balanceObs;
+        if(RLBalanceObservation::compute(
+               _lowState->imu.quaternion, _lowState->imu.gyroscope,
+               {0.0f, 0.0f, -1.0f}, balanceObs)){
+            base_ang_vel_tensor = torch::from_blob(
+                balanceObs.angularVelocity.data(), {3}, opts).clone();
+            projected_gravity_tensor = torch::from_blob(
+                balanceObs.projectedGravity.data(), {3}, opts).clone();
+        }else{
+            // Safe failure: never build a garbage observation from invalid
+            // IMU data; hold the last valid observation instead.  The FSM
+            // only reaches RL after a finite IMU message was received
+            // (FSM::run -> hasFullStateFeedback), so the held value is a
+            // real measurement in practice.
+            ++_imuObsFallbackCount;
+            const long long now = getTime();
+            if(now - _lastImuObsWarningTime >= 1000000){
+                _lastImuObsWarningTime = now;
+                std::cout << "[WARNING] IMU balance observation invalid "
+                             "(non-finite or zero-norm quaternion); holding "
+                             "last valid obs[0:6]. fallback_count="
+                          << _imuObsFallbackCount << std::endl;
+            }
         }
-        for (int i=0; i<3; i++) {
-            base_w_angular_vel[i] = _ctrlComp->ioInter->_base_w_angular_vel[i];
-        }
-        torch::Tensor orientation_tensor = torch::from_blob(base_w_orientation.data(), {int64_t(base_w_orientation.size())}, opts).unsqueeze(0).clone();
-        torch::Tensor w_angular_vel_tensor = torch::from_blob(base_w_angular_vel.data(), {int64_t(base_w_angular_vel.size())}, opts).unsqueeze(0).clone();
-        base_ang_vel_tensor = quat_rotate_inverse(orientation_tensor, w_angular_vel_tensor).squeeze().clone();
-        projected_gravity_tensor = quat_rotate_inverse(orientation_tensor, gravity_tensor.unsqueeze(0)).squeeze().clone();
         
         //订阅cmd_vel
         // this->Sub_=nh.subscribe<geometry_msgs::Twist>("/cmd_vel",1000,boost::bind(&FSMState::cmdVelCallback,this,_1));
@@ -317,7 +577,7 @@ void State_RL::refresh_rl_obs(){
             commands_tensor * commands_scale,
             (dof_pos_tensor - default_dof_pos_tensor) * obs_scales_dof_pos,
             dof_vel_tensor * obs_scales_dof_vel,
-            actions_tensor
+            previous_applied_actions_tensor
         }, -1).to(device);
         obs_history_tensor = torch::cat({
             obs_history_tensor.slice(0, 1, HISTORY_LEN).to(device),  // 删除最早的一步
@@ -350,7 +610,7 @@ void State_RL::refresh_rl_obs(){
             commands_tensor * commands_scale,
             (dof_pos_tensor - default_dof_pos_tensor) * obs_scales_dof_pos,
             dof_vel_tensor * obs_scales_dof_vel,
-            actions_tensor
+            previous_applied_actions_tensor
         }, -1).to(device);
         obs_history_tensor = torch::cat({
             obs_history_tensor.slice(0, 1, HISTORY_LEN).to(device),  // 删除最早的一步
@@ -511,8 +771,11 @@ torch::Tensor State_RL::quat_rotate_inverse(const torch::Tensor& q, const torch:
 
 void State_RL::load_policy()
 {
-    model_path = "src/unitree_guide/logs/policy_act_inference_stair.pt";
-    std::cout << model_path << std::endl;
+    const char *configuredPolicyPath = std::getenv("UNITREE_POLICY_PATH");
+    model_path = (configuredPolicyPath != nullptr && configuredPolicyPath[0] != '\0')
+        ? configuredPolicyPath
+        : "src/unitree_guide/logs/policy_act_inference_plane.pt";
+    std::cout << "[INFO] Loading RL policy: " << model_path << std::endl;
     // load model from check point
     std::cout << "cuda::is_available():" << torch::cuda::is_available() << std::endl;
     device= torch::kCPU;

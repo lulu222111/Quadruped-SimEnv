@@ -22,6 +22,7 @@ import threading
 import geometry_msgs.msg
 import nav_msgs.msg
 import rospy
+import std_msgs.msg
 
 from competition_interfaces.msg import ModuleStatus
 
@@ -103,6 +104,62 @@ class PathFollower:
         self.max_linear = self._positive_param("~max_linear", 0.25)
         self.max_angular = self._positive_param("~max_angular", 0.8)
         self.goal_tolerance = self._positive_param("~goal_tolerance", 0.2)
+        # Minimum forward speed commanded while actively driving to a
+        # waypoint outside goal_tolerance.  The RL locomotion policy cannot
+        # execute arbitrarily small speeds: below ~0.2 m/s it stands still,
+        # which deadlocks the proportional 0.6*distance slowdown just outside
+        # goal_tolerance (observed in RETURNING-FIX-R24: cmd=0.13 m/s, joints
+        # frozen, waypoint never reached).  Floor the drive command at an
+        # executable speed; 0.0 preserves the legacy unclamped behaviour.
+        self.min_linear = self._nonnegative_param("~min_linear", 0.0)
+        if self.min_linear > self.max_linear:
+            self.min_linear = self.max_linear
+
+        # Physical stuck detection (R25): the follower may keep commanding an
+        # executable forward speed while the robot is wedged against a wall
+        # that the drifted map marks as free.  When we have been driving
+        # (non-zero commanded linear speed) for stuck_duration_sec while the
+        # measured position moved less than stuck_progress_epsilon, publish a
+        # one-shot notice on /competition/planning/stuck so the planner can
+        # drop a committed RETURNING route and replan once.  The follower
+        # itself does not change behaviour on stuck; this is an advisory
+        # signal only.  Disabled by default (stuck_duration_sec=0).
+        self.stuck_duration_sec = self._nonnegative_param(
+            "~stuck_duration_sec", 0.0
+        )
+        self.stuck_progress_epsilon = self._positive_param(
+            "~stuck_progress_epsilon", 0.05
+        )
+        # Stuck backoff (R27 exploration-wedge recovery): when the robot has
+        # been driving with no measured progress, briefly command a backward
+        # velocity to physically break the wedge, then resume normal path
+        # following.  Works in every mission phase (the R26 planner re-commit
+        # only covers RETURNING; exploration had no recovery at all).  The RL
+        # policy is trained with vx in [-0.5, 0.5] (commands_scale=2.0), so a
+        # small negative vx is in distribution.  Bound repeats per path so a
+        # permanently-blocked robot does not oscillate forever.
+        self.stuck_backoff_linear = self._nonnegative_param(
+            "~stuck_backoff_linear", 0.15
+        )
+        self.stuck_backoff_duration = self._positive_param(
+            "~stuck_backoff_duration", 3.0
+        )
+        self.stuck_backoff_max = int(
+            self._positive_param("~stuck_backoff_max", 3)
+        )
+        self._stuck_start_time = None
+        self._stuck_start_position = None
+        self._stuck_notified = False
+        self._recovery_until = None
+        self._stuck_backoff_count = 0
+        self.stuck_pub = None
+        if self.stuck_duration_sec > 0.0:
+            self.stuck_pub = rospy.Publisher(
+                "/competition/planning/stuck",
+                std_msgs.msg.Bool,
+                queue_size=1,
+                latch=True,
+            )
 
         self.path_timeout = rospy.Duration(
             self._positive_param("~path_timeout", 5.0)
@@ -162,13 +219,15 @@ class PathFollower:
     # ------------------------------------------------------------------
 
     def on_path(self, msg):
-        """Atomically replace/cancel the current path."""
+        """Atomically replace/cancel the current path.
+
+        A planner may refresh an unchanged valid route to keep its header
+        fresh.  Treat that as a heartbeat, not a new route: retaining the
+        current waypoint progress prevents a long return path from repeatedly
+        snapping the follower back to its first waypoint.
+        """
         with self._lock:
             now, _ = self._now_locked()
-
-            # Any new Path replaces the old cached Path atomically.
-            self._invalidate_path_locked()
-            self._state_version += 1
 
             # The top-level Path Header is validated even for an empty Path.
             # An invalid cancellation message still stops the robot, but is
@@ -184,6 +243,8 @@ class PathFollower:
             error = stamp_error or path_error
 
             if error is not None:
+                self._invalidate_path_locked()
+                self._state_version += 1
                 self._generation += 1
                 self._min_path_stamp = self._max_stamp(
                     self._min_path_stamp,
@@ -194,6 +255,8 @@ class PathFollower:
                 return
 
             if not msg.poses:
+                self._invalidate_path_locked()
+                self._state_version += 1
                 self._generation += 1
                 self._min_path_stamp = self._max_stamp(
                     self._min_path_stamp,
@@ -205,12 +268,26 @@ class PathFollower:
                 )
                 return
 
+            if self._same_path_geometry_locked(msg):
+                # Geometry and frame are exactly the current route.  Only
+                # refresh its liveness; target_index remains monotonic.
+                self.path_received_at = now
+                self.path_stamp = msg.header.stamp
+                self.path_error = None
+                self._state_version += 1
+                return
+
+            # A geometrically new Path replaces the old cached Path
+            # atomically and must select a new initial target.
+            self._invalidate_path_locked()
+            self._state_version += 1
             self.path = list(msg.poses)
             self.path_frame = msg.header.frame_id
             self.path_received_at = now
             self.path_stamp = msg.header.stamp
             self.path_error = None
             self.target_index = self._initial_target_index_locked()
+            self._reset_stuck_locked()
 
     def on_planning_status(self, msg):
         with self._lock:
@@ -507,16 +584,27 @@ class PathFollower:
                 )
                 return
 
+            if self._recovery_active(now_after_compute):
+                cmd = self._backoff_command()
             self.raw_vel_pub.publish(cmd)
-            self.publish_status(
-                ModuleStatus.RUNNING,
-                True,
-                0.6,
-                "following waypoint {}/{}".format(
-                    self.target_index + 1,
-                    len(self.path),
-                ),
-            )
+            self._track_stuck_locked(cmd, snapshot_odom, now_after_compute)
+            if self._recovery_active(now_after_compute):
+                self.publish_status(
+                    ModuleStatus.RUNNING,
+                    True,
+                    0.5,
+                    "stuck recovery: backing up",
+                )
+            else:
+                self.publish_status(
+                    ModuleStatus.RUNNING,
+                    True,
+                    0.6,
+                    "following waypoint {}/{}".format(
+                        self.target_index + 1,
+                        len(self.path),
+                    ),
+                )
 
     def _check_inputs_locked(self, now):
         # Planning gate.
@@ -677,6 +765,115 @@ class PathFollower:
         return None
 
     # ------------------------------------------------------------------
+    # Physical stuck detection (advisory; does not change follower output)
+    # ------------------------------------------------------------------
+
+    def _track_stuck_locked(self, cmd, odom, now):
+        """Detect commanded-motion-without-measured-motion (wall wedged).
+
+        Only arms while we are actually driving (non-zero commanded linear
+        speed on a valid, unfinished path).  If the measured position has not
+        moved at least stuck_progress_epsilon after stuck_duration_sec of
+        continuous driving, publish a latched notice so the planner can react
+        (RETURNING re-commit), and start a short backward backoff to break the
+        wedge physically.  The window resets after firing so a re-wedge after
+        the backoff can trigger again (bounded by stuck_backoff_max).  Caller
+        owns lock.
+        """
+        if self.stuck_duration_sec <= 0.0 or self.stuck_pub is None:
+            return
+
+        driving = (
+            cmd is not None
+            and abs(cmd.linear.x) > 0.0
+            and self.path
+        )
+        if not driving:
+            self._stuck_start_time = None
+            self._stuck_start_position = None
+            return
+
+        px = odom.pose.pose.position.x
+        py = odom.pose.pose.position.y
+        if not (math.isfinite(px) and math.isfinite(py)):
+            return
+
+        if self._stuck_start_time is None:
+            self._stuck_start_time = now.to_sec()
+            self._stuck_start_position = (px, py)
+            return
+
+        # Moved enough: reset the window.
+        sx, sy = self._stuck_start_position
+        if math.hypot(px - sx, py - sy) >= self.stuck_progress_epsilon:
+            self._stuck_start_time = now.to_sec()
+            self._stuck_start_position = (px, py)
+            return
+
+        # Stuck long enough: report once per path, then back off.
+        if (now.to_sec() - self._stuck_start_time) < self.stuck_duration_sec:
+            return
+
+        if not self._stuck_notified:
+            self._stuck_notified = True
+            notice = std_msgs.msg.Bool()
+            notice.data = True
+            self.stuck_pub.publish(notice)
+            rospy.logwarn(
+                "path_follower: no measured progress for %.1f s while "
+                "driving (%.3f m) — reporting stuck to planner",
+                now.to_sec() - self._stuck_start_time,
+                math.hypot(px - sx, py - sy),
+            )
+
+        # Physically break the wedge: command a short backward motion.
+        if (
+            self.stuck_backoff_linear > 0.0
+            and self._stuck_backoff_count < self.stuck_backoff_max
+        ):
+            self._stuck_backoff_count += 1
+            self._recovery_until = now.to_sec() + self.stuck_backoff_duration
+            rospy.logwarn(
+                "path_follower: stuck backoff #%d for %.1f s at %.2f m/s",
+                self._stuck_backoff_count,
+                self.stuck_backoff_duration,
+                self.stuck_backoff_linear,
+            )
+
+        # Reset the window so a re-wedge after the backoff re-triggers.
+        self._stuck_start_time = now.to_sec()
+        self._stuck_start_position = (px, py)
+
+    def _recovery_active(self, now):
+        return (
+            self._recovery_until is not None
+            and now.to_sec() < self._recovery_until
+        )
+
+    def _backoff_command(self):
+        cmd = geometry_msgs.msg.Twist()
+        cmd.linear.x = -self.stuck_backoff_linear
+        cmd.angular.z = 0.0
+        return cmd
+
+    def _reset_stuck_locked(self):
+        """Re-arm stuck detection for a new path / cleared state.
+
+        Caller owns lock.  Keeps the one-shot latch False until a fresh
+        window accumulates on the new route; also clears any active backoff
+        and the per-path backoff budget.
+        """
+        self._stuck_start_time = None
+        self._stuck_start_position = None
+        self._stuck_notified = False
+        self._recovery_until = None
+        self._stuck_backoff_count = 0
+        if self.stuck_pub is not None:
+            cleared = std_msgs.msg.Bool()
+            cleared.data = False
+            self.stuck_pub.publish(cleared)
+
+    # ------------------------------------------------------------------
     # Pure control calculation on a stable snapshot
     # ------------------------------------------------------------------
 
@@ -728,7 +925,7 @@ class PathFollower:
         if abs(yaw_error) < 0.8:
             cmd.linear.x = clamp(
                 0.6 * distance,
-                0.0,
+                self.min_linear,
                 self.max_linear,
             )
 
@@ -917,6 +1114,42 @@ class PathFollower:
         self._invalidate_planning_status_locked()
         self._invalidate_localization_status_locked()
 
+    def _same_path_geometry_locked(self, msg):
+        """Return whether ``msg`` is the current route with only new stamps.
+
+        Exact component comparison is intentional.  A planner that changes
+        even one coordinate or orientation remains a genuine route update,
+        resets waypoint selection, and receives the normal safety handling.
+        """
+        if not self.path or msg.header.frame_id != self.path_frame:
+            return False
+        if len(msg.poses) != len(self.path):
+            return False
+        for current, incoming in zip(self.path, msg.poses):
+            current_pose = current.pose
+            incoming_pose = incoming.pose
+            current_values = (
+                current_pose.position.x,
+                current_pose.position.y,
+                current_pose.position.z,
+                current_pose.orientation.x,
+                current_pose.orientation.y,
+                current_pose.orientation.z,
+                current_pose.orientation.w,
+            )
+            incoming_values = (
+                incoming_pose.position.x,
+                incoming_pose.position.y,
+                incoming_pose.position.z,
+                incoming_pose.orientation.x,
+                incoming_pose.orientation.y,
+                incoming_pose.orientation.z,
+                incoming_pose.orientation.w,
+            )
+            if current_values != incoming_values:
+                return False
+        return True
+
     def _initial_target_index_locked(self):
         if self.odom is None or self.odom_error is not None:
             return 0
@@ -958,6 +1191,19 @@ class PathFollower:
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError(
                 "{} must be finite and greater than zero".format(name)
+            )
+
+        return value
+
+    @staticmethod
+    def _nonnegative_param(name, default):
+        value = float(rospy.get_param(name, default))
+
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(
+                "{} must be finite and greater than or equal to zero".format(
+                    name
+                )
             )
 
         return value

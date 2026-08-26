@@ -20,7 +20,9 @@ origin_y: -20.0
 # Points are filtered after timestamped TF conversion into base
 sensor_min_range: 0.30
 sensor_max_range: 20.0
-min_height: -0.50
+# Base-frame floor returns measured in the qualification scene are
+# -0.31..-0.18 m.  Exclude them while retaining obstacles >=~0.16 m tall.
+min_height: -0.15
 max_height: 1.50
 point_stride: 1
 max_points_per_cloud: 50000

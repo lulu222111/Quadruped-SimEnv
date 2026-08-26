@@ -6,6 +6,9 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
   std_srvs
   geometry_msgs
+  nav_msgs
+  tf2_ros
+  tf2_geometry_msgs
   competition_interfaces
 )
 
@@ -15,6 +18,9 @@ catkin_package(
   std_msgs
   std_srvs
   geometry_msgs
+  nav_msgs
+  tf2_ros
+  tf2_geometry_msgs
   competition_interfaces
 )
 
@@ -40,4 +46,7 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_time_keeper.py)
   catkin_add_nosetests(test/test_state_machine.py)
   catkin_add_nosetests(test/test_result_writer.py)
+  catkin_add_nosetests(test/test_hazard_candidate_router.py)
+  catkin_add_nosetests(test/test_competition_loop_node.py)
+  catkin_add_nosetests(test/test_returning_launch.py)
 endif()

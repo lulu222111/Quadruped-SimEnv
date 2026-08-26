@@ -181,11 +181,14 @@ def _append_foundation(model: ET.Element, layout: BuildingLayout) -> None:
 
 
 def _append_entrance_apron(model: ET.Element, layout: BuildingLayout) -> None:
+    # Keep the public entrance transition coplanar with the Gazebo ground.
+    # A box centred at +0.04 m creates an 8 cm vertical step that the
+    # validated flat-terrain A1 policy cannot traverse.
     _append_box(
         model,
         name="entrance_apron",
         size=(4.5, 2.4, 0.08),
-        pose=(0.0, -1.2, 0.04, 0.0, 0.0, 0.0),
+        pose=(0.0, -1.2, -0.04, 0.0, 0.0, 0.0),
         color="0.62 0.62 0.64 1",
     )
 

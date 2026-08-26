@@ -158,16 +158,25 @@ def select_best_frontier_cluster(
     robot_cell,
     size_weight=1.0,
     distance_weight=1.0,
+    heading_yaw=None,
+    heading_weight=0.0,
 ):
-    """Select a frontier cluster by balancing size and travel distance."""
+    """Select a frontier cluster by size, distance, and optional heading.
+
+    ``heading_weight`` uses grid-cell score units.  Zero preserves the
+    original selector; a positive value favours the robot's forward
+    half-plane without using scene or hazard truth.
+    """
     if size_weight < 0.0:
         raise ValueError("size_weight must not be negative")
     if distance_weight < 0.0:
         raise ValueError("distance_weight must not be negative")
+    if heading_weight < 0.0:
+        raise ValueError("heading_weight must not be negative")
     if not clusters:
         return None
 
-    from math import hypot
+    from math import cos, hypot, sin
 
     robot_x, robot_y = robot_cell
     candidates = []
@@ -181,7 +190,17 @@ def select_best_frontier_cluster(
             representative[0] - robot_x,
             representative[1] - robot_y,
         )
-        score = size_weight * len(cluster) - distance_weight * distance
+        heading_alignment = 0.0
+        if heading_yaw is not None and distance > 0.0:
+            heading_alignment = (
+                cos(heading_yaw) * (representative[0] - robot_x)
+                + sin(heading_yaw) * (representative[1] - robot_y)
+            ) / distance
+        score = (
+            size_weight * len(cluster)
+            - distance_weight * distance
+            + heading_weight * heading_alignment
+        )
 
         candidates.append(
             (

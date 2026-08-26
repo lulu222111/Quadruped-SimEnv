@@ -90,6 +90,9 @@ class _MockRospy:
     def loginfo_throttle(self, *_args, **_kwargs):
         pass
 
+    def logwarn(self, *_args, **_kwargs):
+        pass
+
 
 ROSPY = _MockRospy()
 sys.modules["rospy"] = ROSPY
@@ -185,6 +188,23 @@ sys.modules["nav_msgs"] = _NavMsgs()
 sys.modules["nav_msgs.msg"] = _NavMsgsMsg()
 
 
+class _Bool:
+    def __init__(self, data=False):
+        self.data = data
+
+
+class _StdMsgsMsg:
+    Bool = _Bool
+
+
+class _StdMsgs:
+    msg = _StdMsgsMsg()
+
+
+sys.modules["std_msgs"] = _StdMsgs()
+sys.modules["std_msgs.msg"] = _StdMsgsMsg()
+
+
 class _ModuleStatus:
     UNKNOWN = 0
     STARTING = 1
@@ -271,6 +291,18 @@ class TestPathFollower(unittest.TestCase):
         self.follower.max_linear = 0.25
         self.follower.max_angular = 0.8
         self.follower.goal_tolerance = 0.2
+        self.follower.min_linear = 0.0
+        self.follower.stuck_duration_sec = 0.0
+        self.follower.stuck_progress_epsilon = 0.05
+        self.follower.stuck_backoff_linear = 0.0
+        self.follower.stuck_backoff_duration = 3.0
+        self.follower.stuck_backoff_max = 3
+        self.follower._stuck_start_time = None
+        self.follower._stuck_start_position = None
+        self.follower._stuck_notified = False
+        self.follower._recovery_until = None
+        self.follower._stuck_backoff_count = 0
+        self.follower.stuck_pub = None
         self.follower.path_timeout = _MockDuration(5.0)
         self.follower.odom_timeout = _MockDuration(1.0)
         self.follower.planning_status_timeout = _MockDuration(3.0)
@@ -401,6 +433,153 @@ class TestPathFollower(unittest.TestCase):
         self.assertEqual(self._last_status().state, _ModuleStatus.RUNNING)
         self.assertTrue(self._last_status().valid)
 
+    def test_min_linear_floors_close_approach_command(self):
+        # R24 RETURNING stall: 0.6*distance falls below the RL policy's
+        # minimum executable speed just outside goal_tolerance, freezing the
+        # robot in place. The floor must keep the drive command executable.
+        self.follower.min_linear = 0.25
+        self._arm(points=[(0.21, 0.0)])
+        self.follower.step()
+        self.assertAlmostEqual(self._last_cmd().linear.x, 0.25)
+        self.assertEqual(self._last_status().state, _ModuleStatus.RUNNING)
+
+    def test_min_linear_does_not_block_finish(self):
+        self.follower.min_linear = 0.25
+        self._arm(points=[(0.05, 0.0)])
+        self.follower.step()
+        self._assert_zero()
+        self.assertEqual(self._last_status().state, _ModuleStatus.SUCCEEDED)
+
+    def test_min_linear_does_not_drive_during_in_place_turn(self):
+        self.follower.min_linear = 0.25
+        self._arm(points=[(-1.0, 0.0)])
+        self.follower.step()
+        self.assertEqual(self._last_cmd().linear.x, 0.0)
+        self.assertNotEqual(self._last_cmd().angular.z, 0.0)
+
+    # ------------------------------------------------------------------
+    # Stuck detection (advisory notice to planner)
+    # ------------------------------------------------------------------
+
+    def _arm_stuck(self, duration=5.0, backoff_linear=0.0, backoff_max=3):
+        self.follower.stuck_duration_sec = duration
+        self.follower.stuck_backoff_linear = backoff_linear
+        self.follower.stuck_backoff_max = backoff_max
+        self.follower.stuck_pub = _Publisher("/competition/planning/stuck")
+        self._arm()
+        # on_path(_arm) resets stuck and publishes a cleared (False) latch.
+        self.assertEqual(len(self.follower.stuck_pub.messages), 1)
+        self.assertFalse(self.follower.stuck_pub.messages[0].data)
+
+    def _stuck_true_count(self):
+        return sum(
+            1 for msg in self.follower.stuck_pub.messages
+            if getattr(msg, "data", False)
+        )
+
+    def _fresh_stuck_step(self, t, x=0.0, y=0.0, points=None):
+        """Re-publish fresh inputs at time t with the given measured pose.
+
+        Keeps planning/localization/odom/path stamps fresh (as the real stack
+        does at 10 Hz) so the stuck window is what expires, not the inputs.
+        Position stays (x, y): progress toward the waypoint is whatever the
+        caller chooses.  Same-geometry path refresh does NOT re-arm stuck.
+        """
+        _MockTime.set(t)
+        self._planning(True)
+        self._localization(True)
+        self._odom(x=x, y=y)
+        self._path(points=points if points is not None else [(1.0, 0.0)])
+        self.follower.step()
+
+    def test_stuck_notice_after_duration_without_progress(self):
+        self._arm_stuck(duration=5.0)
+        self._fresh_stuck_step(10.0)  # anchor at (0,0), t=10
+        self.assertEqual(self._stuck_true_count(), 0)
+        self._fresh_stuck_step(16.0)  # 6 s without motion -> stuck
+        self.assertEqual(self._stuck_true_count(), 1)
+        # one-shot: no repeat on further stuck steps
+        self._fresh_stuck_step(20.0)
+        self.assertEqual(self._stuck_true_count(), 1)
+
+    def test_stuck_window_resets_on_progress(self):
+        self._arm_stuck(duration=5.0)
+        self._fresh_stuck_step(10.0, x=0.0)  # anchor at (0,0)
+        self._fresh_stuck_step(14.0, x=0.3)  # moved 0.3 m -> window restarts
+        self._fresh_stuck_step(18.5, x=0.3)  # 4.5 s < duration -> no notice
+        self.assertEqual(self._stuck_true_count(), 0)
+        self._fresh_stuck_step(20.0, x=0.3)  # 6 s since reset -> stuck
+        self.assertEqual(self._stuck_true_count(), 1)
+
+    def test_stuck_disabled_by_default(self):
+        self._arm()  # stuck_duration_sec = 0.0, stuck_pub None
+        self.follower.step()
+        _MockTime.set(60.0)
+        self.follower.step()
+        self.assertIsNone(self.follower.stuck_pub)
+
+    def test_stuck_rearmed_on_new_path_geometry(self):
+        self._arm_stuck(duration=5.0)
+        self._fresh_stuck_step(10.0)
+        self._fresh_stuck_step(16.0)
+        self.assertEqual(self._stuck_true_count(), 1)
+        # new path geometry re-arms and publishes a cleared latch
+        self._path(points=[(2.0, 1.0)], stamp=16.0)
+        self.assertEqual(self._stuck_true_count(), 1)
+        self.assertFalse(self.follower.stuck_pub.messages[-1].data)
+        self.assertFalse(self.follower._stuck_notified)
+        # same-geometry refresh must NOT re-arm (commit republish case)
+        self._fresh_stuck_step(17.0, points=[(2.0, 1.0)])
+        self.assertEqual(self._stuck_true_count(), 1)
+
+    # ------------------------------------------------------------------
+    # Stuck backoff (physical un-wedge: brief backward command)
+    # ------------------------------------------------------------------
+
+    def test_stuck_backoff_issues_backward_command(self):
+        self._arm_stuck(duration=5.0, backoff_linear=0.15)
+        self._fresh_stuck_step(10.0)   # anchor
+        self._fresh_stuck_step(16.0)   # stuck fires; recovery starts next step
+        self.assertEqual(self._stuck_true_count(), 1)
+        self.assertIsNotNone(self.follower._recovery_until)
+        # recovery active -> backward command
+        self._fresh_stuck_step(17.0)
+        self.assertLess(self._last_cmd().linear.x, 0.0)
+        self.assertIn("backing up", self._last_status().detail)
+        # recovery still active
+        self._fresh_stuck_step(18.0)
+        self.assertLess(self._last_cmd().linear.x, 0.0)
+        # recovery over (16 + 3 = 19) -> forward again
+        self._fresh_stuck_step(19.5)
+        self.assertGreater(self._last_cmd().linear.x, 0.0)
+
+    def test_stuck_backoff_is_bounded(self):
+        self._arm_stuck(duration=5.0, backoff_linear=0.15, backoff_max=1)
+        self._fresh_stuck_step(10.0)   # anchor
+        self._fresh_stuck_step(16.0)   # backoff #1 (recovery_until=19)
+        self.assertEqual(self.follower._stuck_backoff_count, 1)
+        self._fresh_stuck_step(17.0)   # recovery -> backward
+        self.assertLess(self._last_cmd().linear.x, 0.0)
+        # re-wedge: stuck #2 at 21, but budget (max=1) is used -> no backoff
+        self._fresh_stuck_step(21.0)
+        self.assertEqual(self.follower._stuck_backoff_count, 1)
+        self.assertFalse(self.follower._recovery_active(
+            _MockTimeInstance(22.0)))
+        self._fresh_stuck_step(22.0)   # not in recovery -> forward
+        self.assertGreater(self._last_cmd().linear.x, 0.0)
+
+    def test_stuck_backoff_resets_on_new_path(self):
+        self._arm_stuck(duration=5.0, backoff_linear=0.15)
+        self._fresh_stuck_step(10.0)
+        self._fresh_stuck_step(16.0)   # backoff #1
+        self.assertEqual(self.follower._stuck_backoff_count, 1)
+        # new path geometry -> reset count and recovery
+        self._path(points=[(2.0, 1.0)], stamp=16.0)
+        self.assertEqual(self.follower._stuck_backoff_count, 0)
+        self.assertIsNone(self.follower._recovery_until)
+        self._fresh_stuck_step(17.0, points=[(2.0, 1.0)])
+        self.assertGreater(self._last_cmd().linear.x, 0.0)
+
     def test_finished_path_reports_succeeded_and_zero(self):
         self._arm(points=[(0.05, 0.0)])
         self.follower.step()
@@ -440,6 +619,27 @@ class TestPathFollower(unittest.TestCase):
         self.follower.on_path(empty)
         self._assert_failed_with("non-zero")
         self.assertEqual(self.follower.path, [])
+
+    def test_identical_path_refresh_keeps_waypoint_progress(self):
+        self._arm(points=[(0.5, 0.0), (1.0, 0.0), (2.0, 0.0)])
+        self.follower.target_index = 2
+        _MockTime.set(10.1)
+        self._path(
+            points=[(0.5, 0.0), (1.0, 0.0), (2.0, 0.0)],
+            stamp=10.1,
+        )
+        self.assertEqual(self.follower.target_index, 2)
+        self.assertEqual(self.follower.path_stamp.to_sec(), 10.1)
+
+    def test_geometry_change_still_resets_waypoint_progress(self):
+        self._arm(points=[(0.5, 0.0), (1.0, 0.0), (2.0, 0.0)])
+        self.follower.target_index = 2
+        _MockTime.set(10.1)
+        self._path(
+            points=[(0.5, 0.0), (1.1, 0.0), (2.0, 0.0)],
+            stamp=10.1,
+        )
+        self.assertEqual(self.follower.target_index, 0)
 
     # ------------------------------------------------------------------
     # Invalid / recovery generation semantics
