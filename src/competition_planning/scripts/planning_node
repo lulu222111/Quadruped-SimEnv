@@ -121,6 +121,18 @@ class PlanningNode:
         self.initial_forward_anchor = None
         self.initial_forward_complete = False
         self.active_exploration_target = None
+        # Once a visual checkpoint is selected, keep the route prefix that
+        # reaches that checkpoint stable across ordinary map replans.  The
+        # path is still refreshed with current timestamps, but changing its
+        # geometry every cycle would reset the follower's waypoint progress
+        # and can leave the robot rotating toward a moving first segment.
+        self.visual_scan_checkpoint_path = None
+        self.visual_scan_checkpoint_goal = None
+        # The route checkpoint is a visual-coverage obligation.  Remember
+        # where it was assigned so a controller/localization detour cannot
+        # leave that obligation pending forever after the robot has made
+        # bounded real progress away from it.
+        self.visual_scan_checkpoint_origin = None
         self.visual_scan_final_pending = False
         self._exploration_complete_streak = 0
         self._exploration_complete_active = False
@@ -611,6 +623,9 @@ class PlanningNode:
         """Reset all scan bookkeeping at a mission/generation boundary."""
         self.visual_coverage.reset()
         self.active_exploration_target = None
+        self.visual_scan_checkpoint_path = None
+        self.visual_scan_checkpoint_goal = None
+        self.visual_scan_checkpoint_origin = None
         self.visual_scan_final_pending = False
         self._exploration_complete_streak = 0
         self._exploration_complete_active = False
@@ -621,16 +636,19 @@ class PlanningNode:
         Frontier replanning can replace a distant frontier goal before the
         robot reaches it.  A route checkpoint keeps visual exposure tied to
         actual motion while avoiding a scan on every grid cell.  The caller
-        preserves an existing checkpoint until it is reached or a generation
-        boundary clears it.
+        preserves an existing checkpoint across ordinary replans, then
+        re-anchors it only after bounded physical progress shows that the
+        pending station was missed.
         """
         if not self.visual_scan_enabled or not path_msg.poses:
             return None
 
-        # Treat the first path pose as the initial search station.  It is
-        # normally the current free cell, so the first successful route gets
-        # one visual exposure before the robot travels to a farther route
-        # checkpoint.  Later checkpoints use the configured spacing below.
+        # The starting station is a useful coverage point even when the
+        # first frontier route is later invalidated by map updates.  It also
+        # makes the first visual exposure independent of a long initial
+        # navigation segment.  Subsequent stations are selected by route
+        # spacing below because the tracker records this position when the
+        # episode finishes.
         if not self.visual_coverage.scanned_positions:
             first_pose = path_msg.poses[0].pose.position
             return (float(first_pose.x), float(first_pose.y))
@@ -653,28 +671,75 @@ class PlanningNode:
                 break
         return selected
 
-    def _visual_checkpoint_on_path(self, path_msg, checkpoint):
-        """Return whether a pending visual checkpoint survives replanning.
+    def _visual_checkpoint_should_reanchor_locked(self, robot_position):
+        """Return whether a missed checkpoint should be re-anchored.
 
-        Frontier routes can change when a new map update arrives.  Keeping a
-        checkpoint that is no longer represented by the current route would
-        leave the planner waiting for a position the controller will never
-        visit.  A checkpoint is therefore preserved only while the current
-        path still passes within the normal target-reached tolerance.
+        A pending checkpoint is kept across ordinary map replans so route
+        vertices do not chase the robot.  If the robot has nevertheless
+        travelled one configured station spacing from the point where that
+        checkpoint was assigned, and is still not near the checkpoint, the
+        old obligation has been passed or invalidated.  Re-anchoring lets the
+        next plan establish a new, bounded visual station without treating
+        the old station as scanned.
         """
-        if checkpoint is None or not path_msg.poses:
+        if (
+            not self.visual_scan_enabled
+            or self.active_exploration_target is None
+            or self.visual_scan_checkpoint_origin is None
+        ):
             return False
-        for pose_stamped in path_msg.poses:
-            position = pose_stamped.pose.position
-            if (
-                hypot(
-                    float(position.x) - checkpoint[0],
-                    float(position.y) - checkpoint[1],
-                )
-                <= self.visual_scan_target_tolerance
-            ):
-                return True
-        return False
+
+        origin_x, origin_y = self.visual_scan_checkpoint_origin
+        progress = hypot(
+            float(robot_position.x) - origin_x,
+            float(robot_position.y) - origin_y,
+        )
+        distance_to_checkpoint = hypot(
+            float(robot_position.x) - self.active_exploration_target[0],
+            float(robot_position.y) - self.active_exploration_target[1],
+        )
+        return (
+            progress >= self.visual_scan_route_spacing
+            and distance_to_checkpoint > self.visual_scan_target_tolerance
+        )
+
+    @staticmethod
+    def _checkpoint_route(path_msg, checkpoint):
+        """Return a route prefix ending at the selected scan checkpoint.
+
+        The checkpoint is selected from ``path_msg`` itself, so the nearest
+        pose is the route vertex the planner intended to use.  Truncating the
+        route makes the follower stop at the station instead of driving past
+        it while the planner waits for its next timer tick.
+        """
+        if not path_msg.poses or checkpoint is None:
+            return None, None
+
+        checkpoint_x, checkpoint_y = checkpoint
+        checkpoint_index = min(
+            range(len(path_msg.poses)),
+            key=lambda index: hypot(
+                path_msg.poses[index].pose.position.x - checkpoint_x,
+                path_msg.poses[index].pose.position.y - checkpoint_y,
+            ),
+        )
+        route = copy.deepcopy(path_msg)
+        route.poses = route.poses[: checkpoint_index + 1]
+        if not route.poses:
+            return None, None
+        goal = copy.deepcopy(route.poses[-1])
+        return route, goal
+
+    @staticmethod
+    def _restamp_path_and_goal(path_msg, goal_msg, stamp):
+        """Refresh a held route without changing its geometry."""
+        path = copy.deepcopy(path_msg)
+        goal = copy.deepcopy(goal_msg)
+        path.header.stamp = stamp
+        goal.header.stamp = stamp
+        for pose in path.poses:
+            pose.header.stamp = stamp
+        return path, goal
 
     def _exploration_target_reached_locked(self, robot_position):
         """Return whether the current planner target is within scan range."""
@@ -713,8 +778,14 @@ class PlanningNode:
                     robot.y,
                 )
                 self.active_exploration_target = None
+                self.visual_scan_checkpoint_path = None
+                self.visual_scan_checkpoint_goal = None
+                self.visual_scan_checkpoint_origin = None
                 return False
 
+            self.visual_scan_checkpoint_origin = None
+            self.visual_scan_checkpoint_path = None
+            self.visual_scan_checkpoint_goal = None
             self.visual_scan_final_pending = False
             self._clear_exploration_complete()
             self._publish_visual_scan_heading_locked(event, odom_msg)
@@ -768,9 +839,15 @@ class PlanningNode:
             )
             if event.kind == SCAN_SKIPPED:
                 self.active_exploration_target = None
+                self.visual_scan_checkpoint_path = None
+                self.visual_scan_checkpoint_goal = None
+                self.visual_scan_checkpoint_origin = None
                 return False
 
             self.active_exploration_target = None
+            self.visual_scan_checkpoint_path = None
+            self.visual_scan_checkpoint_goal = None
+            self.visual_scan_checkpoint_origin = None
             self.visual_scan_final_pending = True
             self._clear_exploration_complete()
             self._publish_visual_scan_heading_locked(event, odom_msg)
@@ -817,6 +894,9 @@ class PlanningNode:
             if event.kind in (SCAN_COMPLETE, SCAN_TIMEOUT) or final_heading_timeout:
                 self.visual_scan_final_pending = False
                 self.active_exploration_target = None
+                self.visual_scan_checkpoint_path = None
+                self.visual_scan_checkpoint_goal = None
+                self.visual_scan_checkpoint_origin = None
                 if event.kind == SCAN_COMPLETE:
                     rospy.loginfo(
                         "planning_node: visual scan complete (%d headings); "
@@ -2049,11 +2129,126 @@ class PlanningNode:
                     )
                     return
 
-                # The final check and all three output publications are one
+                # The final check and all output publications are one
                 # lock-protected commit. An invalidating callback can only
                 # publish after this block, so an old path cannot revive.
-                self.goal_pub.publish(goal_msg)
-                self.path_pub.publish(path_msg)
+                published_path = path_msg
+                published_goal = goal_msg
+                published_stamp = stamp
+                if not returning:
+                    # A checkpoint is a visual-coverage obligation for this
+                    # generation, not a copy of the latest frontier route.
+                    # Map replanning can move nearby route vertices by more
+                    # than target tolerance while the robot is still
+                    # approaching the same area.  Replacing the obligation on
+                    # every such update makes the target chase the robot and
+                    # prevents the scan from ever starting.  Keep it until
+                    # the robot reaches it, a scan handles it, or reset()
+                    # clears the generation.
+                    reanchored_checkpoint = False
+                    if self._visual_checkpoint_should_reanchor_locked(
+                        robot_position
+                    ):
+                        previous_checkpoint = (
+                            self.active_exploration_target
+                        )
+                        self.active_exploration_target = None
+                        self.visual_scan_checkpoint_path = None
+                        self.visual_scan_checkpoint_goal = None
+                        self.visual_scan_checkpoint_origin = None
+                        reanchored_checkpoint = True
+                        rospy.logwarn(
+                            "planning_node: re-anchoring missed visual "
+                            "scan checkpoint (%.2f, %.2f) after %.2f m "
+                            "of progress",
+                            previous_checkpoint[0],
+                            previous_checkpoint[1],
+                            self.visual_scan_route_spacing,
+                        )
+
+                    # If a checkpoint is pending, keep the planner-generated
+                    # route prefix that reaches it.  Refreshing the same
+                    # geometry keeps path_follower's progress monotonic while
+                    # still allowing the normal map/localization watchdogs to
+                    # invalidate the route.  The prefix is deliberately
+                    # bounded by the checkpoint, so the robot cannot pass a
+                    # station before the next planner tick can start its
+                    # scan.
+                    if (
+                        self.active_exploration_target is not None
+                        and self.visual_scan_checkpoint_path is not None
+                    ):
+                        (
+                            published_path,
+                            published_goal,
+                        ) = self._restamp_path_and_goal(
+                            self.visual_scan_checkpoint_path,
+                            self.visual_scan_checkpoint_goal,
+                            commit_now,
+                        )
+                        published_stamp = commit_now
+                        detail += " visual_scan_checkpoint_path_held"
+                    else:
+                        if reanchored_checkpoint:
+                            # The robot has made real bounded progress but
+                            # missed the old route vertex.  Use its current
+                            # formal odometry pose as the next visual station
+                            # instead of selecting another possibly stale
+                            # route vertex behind the robot.
+                            self.active_exploration_target = (
+                                float(robot_position.x),
+                                float(robot_position.y),
+                            )
+                            self.visual_scan_checkpoint_origin = (
+                                float(robot_position.x),
+                                float(robot_position.y),
+                            )
+                        elif self.active_exploration_target is None:
+                            self.active_exploration_target = (
+                                self._select_visual_scan_checkpoint(
+                                    path_msg,
+                                    robot_position,
+                                )
+                            )
+                            if self.active_exploration_target is not None:
+                                self.visual_scan_checkpoint_origin = (
+                                    float(robot_position.x),
+                                    float(robot_position.y),
+                                )
+
+                        if self.active_exploration_target is not None:
+                            (
+                                self.visual_scan_checkpoint_path,
+                                self.visual_scan_checkpoint_goal,
+                            ) = self._checkpoint_route(
+                                path_msg,
+                                self.active_exploration_target,
+                            )
+                            if self.visual_scan_checkpoint_path is not None:
+                                published_path = (
+                                    self.visual_scan_checkpoint_path
+                                )
+                                published_goal = (
+                                    self.visual_scan_checkpoint_goal
+                                )
+                                detail += (
+                                    " visual_scan_checkpoint_path={};"
+                                ).format(
+                                    len(published_path.poses),
+                                )
+                    if self.active_exploration_target is not None:
+                        detail += (
+                            " visual_scan_checkpoint=({}, {})"
+                        ).format(
+                            round(self.active_exploration_target[0], 2),
+                            round(self.active_exploration_target[1], 2),
+                        )
+                    if reanchored_checkpoint:
+                        detail += " visual_scan_checkpoint_reanchored"
+                    self.visual_scan_final_pending = False
+
+                self.goal_pub.publish(published_goal)
+                self.path_pub.publish(published_path)
                 self.last_status = (
                     ModuleStatus.RUNNING,
                     True,
@@ -2065,58 +2260,8 @@ class PlanningNode:
                     True,
                     1.0,
                     detail,
-                    stamp=stamp,
+                    stamp=published_stamp,
                 )
-                if not returning:
-                    if (
-                        self.active_exploration_target is None
-                        or not self._visual_checkpoint_on_path(
-                            path_msg,
-                            self.active_exploration_target,
-                        )
-                    ):
-                        previous_checkpoint = (
-                            self.active_exploration_target
-                        )
-                        self.active_exploration_target = (
-                            self._select_visual_scan_checkpoint(
-                                path_msg,
-                                robot_position,
-                            )
-                        )
-                        if (
-                            previous_checkpoint is not None
-                            and self.active_exploration_target != (
-                                previous_checkpoint
-                            )
-                        ):
-                            rospy.loginfo(
-                                "planning_node: refreshed visual scan "
-                                "checkpoint after route change: "
-                                "(%s, %s) -> (%s, %s)",
-                                round(previous_checkpoint[0], 2),
-                                round(previous_checkpoint[1], 2),
-                                round(
-                                    self.active_exploration_target[0],
-                                    2,
-                                )
-                                if self.active_exploration_target
-                                else None,
-                                round(
-                                    self.active_exploration_target[1],
-                                    2,
-                                )
-                                if self.active_exploration_target
-                                else None,
-                            )
-                    if self.active_exploration_target is not None:
-                        detail += (
-                            " visual_scan_checkpoint=({}, {})"
-                        ).format(
-                            round(self.active_exploration_target[0], 2),
-                            round(self.active_exploration_target[1], 2),
-                        )
-                    self.visual_scan_final_pending = False
                 if (
                     returning
                     and self.return_path_commit_enabled

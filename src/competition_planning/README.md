@@ -124,10 +124,15 @@ Planning 分别检查：
 ## Active visual coverage
 
 Frontier 是地图覆盖信号，不代表 RGB-D 相机已经覆盖了房间内部。探索模式下，
-Planner 会先把新 route 的首个自由位姿作为初始搜索 station；之后在新的 Frontier
-route 上选择间隔至少为 `visual_scan_route_spacing` 的 checkpoint，机器人实际到达
-checkpoint 后进入内部 `VISUAL_SCAN` 子状态；若 route 很短，则使用 route 终点作为
-checkpoint。
+Planner 会先把首个 route 的首个自由位姿作为初始搜索 station；之后在新的 route 上
+选择间隔至少为 `visual_scan_route_spacing` 的 checkpoint，机器人实际到达 checkpoint
+后进入内部 `VISUAL_SCAN` 子状态；若后续 route 短于该间隔则使用 route 终点。
+checkpoint 一旦为当前 generation 选定，就保持到机器人实际到达并处理该位置，或
+generation/reset 清除它；地图重规划不会用抖动的 route 顶点替换尚未完成的视觉义务。
+同时只发布到该 checkpoint 为止的 planner 路径前缀，并在重规划时刷新时间戳而保持几何
+不变，避免 follower 反复重置路径进度。若机器人已经从 checkpoint 分配位置实际前进
+至少一个 route-spacing 且仍未到达，则当前正式 odometry 位置会作为下一视觉站重新锚定，
+而旧位置不会被标记为已扫描，避免控制器/定位偏差造成永久等待。
 以当前位姿为中心发布一组同位置、不同 yaw 的短路径点。默认以 45° 间隔
 覆盖 360°，每个 heading 到达后停留 0.6 秒；状态机由 timer 驱动，不阻塞规划
 callback。每个 heading 和整个 episode 都有超时，失败后有限重试并继续 Frontier

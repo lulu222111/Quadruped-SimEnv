@@ -488,13 +488,39 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
             path.poses.append(pose)
 
         robot = self._make_odom(100.1).pose.pose.position
+        self.node.visual_scan_route_spacing = 2.0
         checkpoint = self.node._select_visual_scan_checkpoint(path, robot)
         self.assertEqual(checkpoint, (2.5, 2.5))
+
+    def test_short_route_checkpoint_falls_back_to_route_endpoint(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        robot = self._make_odom(100.1).pose.pose.position
+        self.node.visual_scan_route_spacing = 2.0
+        self.node.visual_coverage.scanned_positions = [(0.0, 0.0)]
+        checkpoint = self.node._select_visual_scan_checkpoint(path, robot)
+        self.assertEqual(checkpoint, (3.5, 2.5))
 
     def test_route_checkpoint_is_preserved_across_replans(self):
         self._publish_healthy_generation(100.0)
         checkpoint = self.node.active_exploration_target
         self.assertIsNotNone(checkpoint)
+        first_path = self._last_path()
+        first_geometry = [
+            (
+                pose.pose.position.x,
+                pose.pose.position.y,
+                pose.pose.orientation.z,
+                pose.pose.orientation.w,
+            )
+            for pose in first_path.poses
+        ]
+        first_stamp = first_path.header.stamp.to_sec()
 
         set_clock(100.4)
         self.node.plan_and_publish(
@@ -505,8 +531,38 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
             returning=False,
         )
         self.assertEqual(self.node.active_exploration_target, checkpoint)
+        held_path = self._last_path()
+        held_geometry = [
+            (
+                pose.pose.position.x,
+                pose.pose.position.y,
+                pose.pose.orientation.z,
+                pose.pose.orientation.w,
+            )
+            for pose in held_path.poses
+        ]
+        self.assertEqual(held_geometry, first_geometry)
+        self.assertGreater(held_path.header.stamp.to_sec(), first_stamp)
+        self.assertIn(
+            "visual_scan_checkpoint_path_held",
+            self._last_status_msg().detail,
+        )
 
-    def test_route_checkpoint_is_replaced_when_replan_drops_it(self):
+    def test_checkpoint_route_is_bounded_at_selected_station(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5, 4.0):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        route, goal = self.node._checkpoint_route(path, (3.5, 2.5))
+
+        self.assertEqual(len(route.poses), 3)
+        self.assertAlmostEqual(route.poses[-1].pose.position.x, 3.5)
+        self.assertAlmostEqual(goal.pose.position.x, 3.5)
+
+    def test_route_checkpoint_is_kept_when_replan_drops_it(self):
         self._publish_healthy_generation(100.0)
         checkpoint = self.node.active_exploration_target
         self.assertIsNotNone(checkpoint)
@@ -518,21 +574,6 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
             pose.pose.position.y = y
             path.poses.append(pose)
 
-        self.assertFalse(
-            self.node._visual_checkpoint_on_path(path, checkpoint)
-        )
-        self.node.visual_coverage.scanned_positions = [(0.0, 0.0)]
-        replacement = self.node._select_visual_scan_checkpoint(
-            path,
-            self.node.odom_msg.pose.pose.position,
-        )
-        self.assertEqual(replacement, (8.0, 8.0))
-
-    def test_replan_commit_replaces_checkpoint_not_on_current_route(self):
-        self._publish_healthy_generation(100.0)
-        self.node.active_exploration_target = (99.0, 99.0)
-        self.node.visual_coverage.scanned_positions = [(0.0, 0.0)]
-
         set_clock(100.4)
         self.node.plan_and_publish(
             self.node.map_msg,
@@ -542,15 +583,54 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
             returning=False,
         )
 
-        self.assertNotEqual(
+        self.assertEqual(
             self.node.active_exploration_target,
-            (99.0, 99.0),
+            checkpoint,
         )
+
+    def test_missed_checkpoint_reanchors_after_bounded_progress(self):
+        self._publish_healthy_generation(100.0)
+        checkpoint = self.node.active_exploration_target
+        self.assertIsNotNone(checkpoint)
+        self.assertEqual(
+            self.node.visual_scan_checkpoint_origin,
+            (2.5, 2.5),
+        )
+
+        robot = self._make_odom(100.5).pose.pose.position
+        robot.x = 3.5
+        robot.y = 2.5
+        self.node.visual_scan_route_spacing = 1.0
         self.assertTrue(
-            self.node._visual_checkpoint_on_path(
-                self._last_path(),
-                self.node.active_exploration_target,
-            )
+            self.node._visual_checkpoint_should_reanchor_locked(robot)
+        )
+
+        self.node.active_exploration_target = checkpoint
+        self.node.visual_scan_checkpoint_origin = (2.5, 2.5)
+        robot_msg = self._make_odom(100.5)
+        robot_msg.pose.pose.position.x = 3.5
+        robot_msg.pose.pose.position.y = 2.5
+        self.node.plan_and_publish(
+            self.node.map_msg,
+            robot_msg,
+            self.node.generation,
+            mission_epoch=self.node.mission_epoch,
+            returning=False,
+        )
+        # Re-anchoring must not mark the old point as scanned or start a scan
+        # by itself; the next odometry callback owns the actual trigger.
+        self.assertEqual(self.node.visual_coverage.scanned_positions, [])
+        self.assertEqual(
+            self.node.active_exploration_target,
+            (3.5, 2.5),
+        )
+        self.assertEqual(
+            self.node.visual_scan_checkpoint_origin,
+            (3.5, 2.5),
+        )
+        self.assertIn(
+            "visual_scan_checkpoint_reanchored",
+            self._last_status_msg().detail,
         )
 
 
@@ -665,11 +745,15 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
         set_clock(100.2)
         self.assertTrue(self.node._handle_reached_exploration_target(odom))
         self.node.visual_coverage.scanned_positions.append((4.0, 4.0))
+        self.node.visual_scan_checkpoint_path = FakePath()
+        self.node.visual_scan_checkpoint_goal = FakePoseStamped()
 
         self.node._enter_new_generation("test_reset", FakeTime(101.0))
         self.assertFalse(self.node.visual_coverage.active)
         self.assertEqual(self.node.visual_coverage.scanned_positions, [])
         self.assertIsNone(self.node.active_exploration_target)
+        self.assertIsNone(self.node.visual_scan_checkpoint_path)
+        self.assertIsNone(self.node.visual_scan_checkpoint_goal)
         self.assertFalse(self.node.visual_scan_final_pending)
 
     def test_planning_status_stays_running_during_scan_progress(self):
