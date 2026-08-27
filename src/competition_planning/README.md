@@ -113,6 +113,7 @@ Planning 分别检查：
 | `~visual_scan_heading_timeout` | `4.0` | 单个 heading 的到达超时（秒） |
 | `~visual_scan_timeout` | `45.0` | 整个 scan episode 的最大时间（秒） |
 | `~visual_scan_position_dedup_radius` | `1.0` | 已扫描位置的 2D 去重半径（米） |
+| `~visual_scan_route_spacing` | `2.0` | 沿 frontier route 选择视觉扫描 checkpoint 的最小间距（米） |
 | `~visual_scan_target_tolerance` | `0.35` | 判断探索目标已到达的距离容差（米） |
 | `~visual_scan_max_heading_retries` | `1` | 单个 heading 的有限重试次数 |
 | `~visual_scan_update_interval` | `0.1` | 非阻塞 scan 状态机更新周期（秒） |
@@ -123,7 +124,10 @@ Planning 分别检查：
 ## Active visual coverage
 
 Frontier 是地图覆盖信号，不代表 RGB-D 相机已经覆盖了房间内部。探索模式下，
-Planner 在一个新的 Frontier 目标实际到达后进入内部 `VISUAL_SCAN` 子状态，
+Planner 会先把新 route 的首个自由位姿作为初始搜索 station；之后在新的 Frontier
+route 上选择间隔至少为 `visual_scan_route_spacing` 的 checkpoint，机器人实际到达
+checkpoint 后进入内部 `VISUAL_SCAN` 子状态；若 route 很短，则使用 route 终点作为
+checkpoint。
 以当前位姿为中心发布一组同位置、不同 yaw 的短路径点。默认以 45° 间隔
 覆盖 360°，每个 heading 到达后停留 0.6 秒；状态机由 timer 驱动，不阻塞规划
 callback。每个 heading 和整个 episode 都有超时，失败后有限重试并继续 Frontier
@@ -180,7 +184,7 @@ Planner 会先尝试一次当前位置的 final scan；只有该 scan 完成或�
 ### 无 ROS 单元测试
 
 ```text
-Ran 125 tests
+Ran 130 tests
 OK
 ```
 
@@ -192,7 +196,7 @@ python3 -m unittest discover \
 ```
 
 覆盖 Frontier、坐标转换、单源 BFS、多候选回退、障碍膨胀、状态区分、路径方向、
-active visual coverage 的 heading/dwell/timeout/去重/completion gate，以及 20×36 m
+active visual coverage 的 heading/dwell/timeout/去重/route checkpoint/completion gate，以及 20×36 m
 和 400×400 地图性能。
 
 ### ROS 契约集成测试

@@ -302,6 +302,9 @@ class PlanningNode:
                     "~visual_scan_position_dedup_radius", 1.0
                 )
             )
+            self.visual_scan_route_spacing = float(
+                rospy.get_param("~visual_scan_route_spacing", 2.0)
+            )
             self.visual_scan_target_tolerance = float(
                 rospy.get_param("~visual_scan_target_tolerance", 0.35)
             )
@@ -397,6 +400,7 @@ class PlanningNode:
                 "visual_scan_position_dedup_radius",
                 self.visual_scan_position_dedup_radius,
             ),
+            ("visual_scan_route_spacing", self.visual_scan_route_spacing),
             (
                 "visual_scan_target_tolerance",
                 self.visual_scan_target_tolerance,
@@ -480,6 +484,10 @@ class PlanningNode:
         if self.visual_scan_target_tolerance < 0.0:
             raise ValueError(
                 "visual_scan_target_tolerance must not be negative"
+            )
+        if self.visual_scan_route_spacing <= 0.0:
+            raise ValueError(
+                "visual_scan_route_spacing must be positive"
             )
 
         if self.future_stamp_tolerance < 0.0:
@@ -607,6 +615,67 @@ class PlanningNode:
         self._exploration_complete_streak = 0
         self._exploration_complete_active = False
 
+    def _select_visual_scan_checkpoint(self, path_msg, robot_position):
+        """Choose a progress checkpoint on a newly planned route.
+
+        Frontier replanning can replace a distant frontier goal before the
+        robot reaches it.  A route checkpoint keeps visual exposure tied to
+        actual motion while avoiding a scan on every grid cell.  The caller
+        preserves an existing checkpoint until it is reached or a generation
+        boundary clears it.
+        """
+        if not self.visual_scan_enabled or not path_msg.poses:
+            return None
+
+        # Treat the first path pose as the initial search station.  It is
+        # normally the current free cell, so the first successful route gets
+        # one visual exposure before the robot travels to a farther route
+        # checkpoint.  Later checkpoints use the configured spacing below.
+        if not self.visual_coverage.scanned_positions:
+            first_pose = path_msg.poses[0].pose.position
+            return (float(first_pose.x), float(first_pose.y))
+
+        previous_x = float(robot_position.x)
+        previous_y = float(robot_position.y)
+        travelled = 0.0
+        selected = None
+        for pose_stamped in path_msg.poses:
+            current_x = float(pose_stamped.pose.position.x)
+            current_y = float(pose_stamped.pose.position.y)
+            travelled += hypot(
+                current_x - previous_x,
+                current_y - previous_y,
+            )
+            selected = (current_x, current_y)
+            previous_x = current_x
+            previous_y = current_y
+            if travelled >= self.visual_scan_route_spacing:
+                break
+        return selected
+
+    def _visual_checkpoint_on_path(self, path_msg, checkpoint):
+        """Return whether a pending visual checkpoint survives replanning.
+
+        Frontier routes can change when a new map update arrives.  Keeping a
+        checkpoint that is no longer represented by the current route would
+        leave the planner waiting for a position the controller will never
+        visit.  A checkpoint is therefore preserved only while the current
+        path still passes within the normal target-reached tolerance.
+        """
+        if checkpoint is None or not path_msg.poses:
+            return False
+        for pose_stamped in path_msg.poses:
+            position = pose_stamped.pose.position
+            if (
+                hypot(
+                    float(position.x) - checkpoint[0],
+                    float(position.y) - checkpoint[1],
+                )
+                <= self.visual_scan_target_tolerance
+            ):
+                return True
+        return False
+
     def _exploration_target_reached_locked(self, robot_position):
         """Return whether the current planner target is within scan range."""
         if self.active_exploration_target is None:
@@ -685,13 +754,12 @@ class PlanningNode:
                     robot.y - self.active_exploration_target[1],
                 )
                 if distance > self.visual_scan_target_tolerance:
-                    rospy.logwarn_throttle(
-                        5.0,
-                        "planning_node: no frontier while exploration "
-                        "target is still %.2f m away; delaying completion",
+                    rospy.loginfo(
+                        "planning_node: no frontier before route visual "
+                        "checkpoint (%.2f m away); using final scan at "
+                        "current position",
                         distance,
                     )
-                    return False
 
             event = self.visual_coverage.start(
                 (robot.x, robot.y),
@@ -2000,10 +2068,54 @@ class PlanningNode:
                     stamp=stamp,
                 )
                 if not returning:
-                    self.active_exploration_target = (
-                        goal_msg.pose.position.x,
-                        goal_msg.pose.position.y,
-                    )
+                    if (
+                        self.active_exploration_target is None
+                        or not self._visual_checkpoint_on_path(
+                            path_msg,
+                            self.active_exploration_target,
+                        )
+                    ):
+                        previous_checkpoint = (
+                            self.active_exploration_target
+                        )
+                        self.active_exploration_target = (
+                            self._select_visual_scan_checkpoint(
+                                path_msg,
+                                robot_position,
+                            )
+                        )
+                        if (
+                            previous_checkpoint is not None
+                            and self.active_exploration_target != (
+                                previous_checkpoint
+                            )
+                        ):
+                            rospy.loginfo(
+                                "planning_node: refreshed visual scan "
+                                "checkpoint after route change: "
+                                "(%s, %s) -> (%s, %s)",
+                                round(previous_checkpoint[0], 2),
+                                round(previous_checkpoint[1], 2),
+                                round(
+                                    self.active_exploration_target[0],
+                                    2,
+                                )
+                                if self.active_exploration_target
+                                else None,
+                                round(
+                                    self.active_exploration_target[1],
+                                    2,
+                                )
+                                if self.active_exploration_target
+                                else None,
+                            )
+                    if self.active_exploration_target is not None:
+                        detail += (
+                            " visual_scan_checkpoint=({}, {})"
+                        ).format(
+                            round(self.active_exploration_target[0], 2),
+                            round(self.active_exploration_target[1], 2),
+                        )
                     self.visual_scan_final_pending = False
                 if (
                     returning

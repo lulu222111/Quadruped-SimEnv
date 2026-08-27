@@ -44,6 +44,7 @@
   <arg name="planning_visual_scan_heading_timeout" default="4.0" />
   <arg name="planning_visual_scan_timeout" default="45.0" />
   <arg name="planning_visual_scan_position_dedup_radius" default="1.0" />
+  <arg name="planning_visual_scan_route_spacing" default="2.0" />
   <arg name="planning_visual_scan_target_tolerance" default="0.35" />
   <arg name="planning_visual_scan_max_heading_retries" default="1" />
   <arg name="planning_visual_scan_update_interval" default="0.1" />
@@ -182,6 +183,8 @@
                value="$(arg planning_visual_scan_timeout)" />
         <param name="visual_scan_position_dedup_radius"
                value="$(arg planning_visual_scan_position_dedup_radius)" />
+        <param name="visual_scan_route_spacing"
+               value="$(arg planning_visual_scan_route_spacing)" />
         <param name="visual_scan_target_tolerance"
                value="$(arg planning_visual_scan_target_tolerance)" />
         <param name="visual_scan_max_heading_retries"

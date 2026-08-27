@@ -53,6 +53,7 @@ planning:
   visual_scan_heading_timeout: 4.0         # seconds, before one retry/skip
   visual_scan_timeout: 45.0                # whole scan bound
   visual_scan_position_dedup_radius: 1.0   # metres
+  visual_scan_route_spacing: 2.0            # route checkpoint spacing (m)
   visual_scan_target_tolerance: 0.35       # metres
   visual_scan_max_heading_retries: 1
   visual_scan_update_interval: 0.1
