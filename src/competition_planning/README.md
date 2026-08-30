@@ -189,7 +189,7 @@ Planner 会先尝试一次当前位置的 final scan；只有该 scan 完成或�
 ### 无 ROS 单元测试
 
 ```text
-Ran 130 tests
+Ran 134 tests
 OK
 ```
 

@@ -169,7 +169,7 @@ class VisualCoverageTracker:
 
         if now - self.started_at > self.scan_timeout:
             event = self._event(SCAN_TIMEOUT)
-            self._finish_episode()
+            self._finish_episode(record_coverage=False)
             return event
 
         target_yaw = self.current_heading
@@ -181,7 +181,7 @@ class VisualCoverageTracker:
                 return self._event(SCAN_DWELLING)
             if self.heading_index + 1 >= self.heading_count:
                 event = self._event(SCAN_COMPLETE)
-                self._finish_episode()
+                self._finish_episode(record_coverage=True)
                 return event
 
             self.heading_index += 1
@@ -199,7 +199,7 @@ class VisualCoverageTracker:
 
             event = self._event(SCAN_HEADING_TIMEOUT)
             if self.heading_index + 1 >= self.heading_count:
-                self._finish_episode()
+                self._finish_episode(record_coverage=False)
                 return event
 
             self.heading_index += 1
@@ -210,8 +210,12 @@ class VisualCoverageTracker:
 
         return self._event(SCAN_DWELLING)
 
-    def _finish_episode(self):
-        if self.origin is not None and not self.position_is_covered(self.origin):
+    def _finish_episode(self, record_coverage=False):
+        if (
+            record_coverage
+            and self.origin is not None
+            and not self.position_is_covered(self.origin)
+        ):
             self.scanned_positions.append(self.origin)
         self.active = False
         self.heading_index = -1

@@ -863,6 +863,12 @@ class PlanningNode:
 
             odom_msg = self.odom_msg
             current_yaw = quaternion_to_yaw(odom_msg.pose.pose.orientation)
+
+            # Remember whether this is the mandatory final scan used to gate
+            # exploration_complete.  The tracker becomes inactive when an
+            # episode ends, so this obligation must be captured beforehand.
+            final_scan_was_pending = self.visual_scan_final_pending
+
             event = self.visual_coverage.update(
                 current_yaw,
                 rospy.Time.now().to_sec(),
@@ -891,35 +897,64 @@ class PlanningNode:
                 event.kind == SCAN_HEADING_TIMEOUT
                 and not self.visual_coverage.active
             )
-            if event.kind in (SCAN_COMPLETE, SCAN_TIMEOUT) or final_heading_timeout:
+
+            self.active_exploration_target = None
+            self.visual_scan_checkpoint_path = None
+            self.visual_scan_checkpoint_goal = None
+            self.visual_scan_checkpoint_origin = None
+
+            if event.kind == SCAN_COMPLETE:
+                # Only an explicitly completed episode satisfies the final
+                # visual-coverage gate.
                 self.visual_scan_final_pending = False
-                self.active_exploration_target = None
-                self.visual_scan_checkpoint_path = None
-                self.visual_scan_checkpoint_goal = None
-                self.visual_scan_checkpoint_origin = None
-                if event.kind == SCAN_COMPLETE:
-                    rospy.loginfo(
-                        "planning_node: visual scan complete (%d headings); "
-                        "resuming frontier exploration",
-                        event.heading_count,
-                    )
-                else:
-                    rospy.logwarn(
-                        "planning_node: visual scan ended with a bounded "
-                        "heading timeout; resuming frontier exploration"
-                    )
+                rospy.loginfo(
+                    "planning_node: visual scan complete (%d headings); "
+                    "resuming frontier exploration",
+                    event.heading_count,
+                )
+                detail = (
+                    "visual scan complete; resuming frontier exploration"
+                )
                 self.last_status = (
                     ModuleStatus.RUNNING,
                     True,
                     0.8,
-                    "visual scan complete; resuming frontier exploration",
+                    detail,
                 )
                 self._publish_status_message_locked(
                     ModuleStatus.RUNNING,
                     True,
                     0.8,
-                    self.last_status[3],
+                    detail,
                 )
+                return
+
+            if event.kind == SCAN_TIMEOUT or final_heading_timeout:
+                # A failed scan must never be converted into coverage.  If it
+                # was the mandatory final scan, retain the pending obligation
+                # so the no-frontier debounce cannot publish completion.
+                self.visual_scan_final_pending = final_scan_was_pending
+                self._clear_exploration_complete()
+
+                if event.kind == SCAN_TIMEOUT:
+                    state = ModuleStatus.TIMEOUT
+                    reason = "visual scan timed out"
+                else:
+                    state = ModuleStatus.BLOCKED
+                    reason = "visual scan final heading timed out"
+
+                detail = (
+                    "{}; coverage was not recorded; "
+                    "a new scan is required"
+                ).format(reason)
+
+                rospy.logwarn("planning_node: %s", detail)
+                self._invalidate_plan_locked(
+                    state,
+                    0.0,
+                    detail,
+                )
+                return
 
     def _publish_visual_scan_heading_locked(self, event, odom_msg):
         """Publish a stationary two-pose path for the current scan heading."""

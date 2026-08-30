@@ -738,6 +738,134 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
         ]
         self.assertEqual(len(true_messages), 1)
 
+    def test_final_scan_timeout_does_not_allow_completion(self):
+        self.node.visual_coverage = PLANNING_NODE.VisualCoverageTracker(
+            enabled=True,
+            yaw_step=math.pi / 2.0,
+            yaw_tolerance=0.1,
+            dwell=0.0,
+            heading_timeout=2.0,
+            scan_timeout=0.05,
+            position_dedup_radius=1.0,
+            max_heading_retries=0,
+        )
+        self.node.visual_scan_dwell = 0.0
+
+        set_clock(100.0)
+        self.node.mapping_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.localization_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.map_callback(self._make_fully_known_map(100.1))
+        self.node.odom_callback(self._make_odom(100.1))
+
+        set_clock(100.2)
+        self.node.plan_callback(None)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+
+        set_clock(100.3)
+        self.node.odom_msg = self._make_odom(100.3)
+        self.node.visual_scan_callback(None)
+
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertEqual(
+            self.node.visual_coverage.scanned_positions,
+            [],
+        )
+        self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertFalse(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+        self.assertFalse(self._last_status_msg().valid)
+        self.assertEqual(len(self._last_path().poses), 0)
+        self.assertIn(
+            "coverage was not recorded",
+            self._last_status_msg().detail,
+        )
+
+        # Even repeated no-frontier evidence cannot bypass the pending
+        # mandatory final scan.
+        for _ in range(
+            self.node.exploration_complete_confirmations
+        ):
+            self.node._record_exploration_complete(
+                self.node.generation,
+                self.node.mission_epoch,
+            )
+
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertFalse(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+
+        # A new planning cycle may retry the same uncovered position.
+        set_clock(100.31)
+        self.node.plan_callback(None)
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+
+    def test_final_heading_timeout_does_not_allow_completion(self):
+        self.node.visual_coverage = PLANNING_NODE.VisualCoverageTracker(
+            enabled=True,
+            yaw_step=math.pi / 2.0,
+            yaw_tolerance=0.05,
+            dwell=0.0,
+            heading_timeout=0.05,
+            scan_timeout=20.0,
+            position_dedup_radius=1.0,
+            max_heading_retries=0,
+        )
+        self.node.visual_scan_dwell = 0.0
+
+        set_clock(100.0)
+        self.node.mapping_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.localization_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.map_callback(self._make_fully_known_map(100.1))
+        self.node.odom_callback(self._make_odom(100.1))
+
+        set_clock(100.2)
+        self.node.plan_callback(None)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+
+        now = 100.3
+        for _ in range(4):
+            set_clock(now)
+            odom = self._set_odom_yaw(
+                self._make_odom(now),
+                0.7,
+            )
+            self.node.odom_msg = odom
+            self.node.visual_scan_callback(None)
+            now += 0.1
+
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertEqual(
+            self.node.visual_coverage.scanned_positions,
+            [],
+        )
+        self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertFalse(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+        self.assertFalse(self._last_status_msg().valid)
+        self.assertEqual(len(self._last_path().poses), 0)
+        self.assertIn(
+            "final heading timed out",
+            self._last_status_msg().detail,
+        )
+
     def test_generation_reset_clears_visual_coverage(self):
         self.node.active_exploration_target = (2.5, 2.5)
         odom = self._make_odom(100.1)

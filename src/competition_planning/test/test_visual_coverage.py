@@ -97,20 +97,21 @@ class VisualCoverageTrackerTest(unittest.TestCase):
 
     def test_position_dedup_skips_nearby_position(self):
         tracker = self.make_tracker(dwell=0.0)
-        tracker.start((0.0, 0.0), 0.0, 1.0)
-        # A bounded test shortcut: a whole episode timeout records coverage.
-        tracker.update(math.pi, 22.0)
-        self.assertEqual(len(tracker.scanned_positions), 1)
+        tracker.scanned_positions.append((0.0, 0.0))
+
         event = tracker.start((0.5, 0.5), 0.0, 23.0)
+
         self.assertEqual(event.kind, SCAN_SKIPPED)
+        self.assertFalse(tracker.active)
 
     def test_far_position_starts_new_scan(self):
         tracker = self.make_tracker(dwell=0.0)
-        tracker.start((0.0, 0.0), 0.0, 1.0)
-        tracker.update(math.pi, 22.0)
+        tracker.scanned_positions.append((0.0, 0.0))
+
         event = tracker.start((2.0, 0.0), 0.0, 23.0)
+
         self.assertEqual(event.kind, SCAN_STARTED)
-        self.assertEqual(len(tracker.scanned_positions), 1)
+        self.assertEqual(tracker.scanned_positions, [(0.0, 0.0)])
 
     def test_heading_timeout_retries_once_then_advances(self):
         tracker = self.make_tracker(dwell=0.0)
@@ -140,7 +141,10 @@ class VisualCoverageTrackerTest(unittest.TestCase):
         event = tracker.update(0.7, now)
         self.assertEqual(event.kind, SCAN_HEADING_TIMEOUT)
         self.assertFalse(tracker.active)
-        self.assertEqual(len(tracker.scanned_positions), 1)
+        self.assertEqual(tracker.scanned_positions, [])
+
+        retry = tracker.start((0.0, 0.0), 0.0, now + 0.1)
+        self.assertEqual(retry.kind, SCAN_STARTED)
 
     def test_whole_scan_timeout_terminates(self):
         tracker = self.make_tracker(scan_timeout=3.0)
@@ -148,7 +152,10 @@ class VisualCoverageTrackerTest(unittest.TestCase):
         event = tracker.update(math.pi, 4.1)
         self.assertEqual(event.kind, SCAN_TIMEOUT)
         self.assertFalse(tracker.active)
-        self.assertEqual(len(tracker.scanned_positions), 1)
+        self.assertEqual(tracker.scanned_positions, [])
+
+        retry = tracker.start((0.0, 0.0), 0.0, 4.2)
+        self.assertEqual(retry.kind, SCAN_STARTED)
 
     def test_reset_clears_active_episode_and_coverage(self):
         tracker = self.make_tracker()
