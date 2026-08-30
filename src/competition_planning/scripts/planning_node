@@ -878,7 +878,6 @@ class PlanningNode:
                 SCAN_STARTED,
                 SCAN_NEXT_HEADING,
                 SCAN_RETRY_HEADING,
-                SCAN_HEADING_TIMEOUT,
             ) and self.visual_coverage.active:
                 self._publish_visual_scan_heading_locked(event, odom_msg)
                 return
@@ -893,10 +892,7 @@ class PlanningNode:
                 )
                 return
 
-            final_heading_timeout = (
-                event.kind == SCAN_HEADING_TIMEOUT
-                and not self.visual_coverage.active
-            )
+            heading_timeout = event.kind == SCAN_HEADING_TIMEOUT
 
             self.active_exploration_target = None
             self.visual_scan_checkpoint_path = None
@@ -929,7 +925,7 @@ class PlanningNode:
                 )
                 return
 
-            if event.kind == SCAN_TIMEOUT or final_heading_timeout:
+            if event.kind == SCAN_TIMEOUT or heading_timeout:
                 # A failed scan must never be converted into coverage.  If it
                 # was the mandatory final scan, retain the pending obligation
                 # so the no-frontier debounce cannot publish completion.
@@ -941,7 +937,7 @@ class PlanningNode:
                     reason = "visual scan timed out"
                 else:
                     state = ModuleStatus.BLOCKED
-                    reason = "visual scan final heading timed out"
+                    reason = "visual scan heading timed out"
 
                 detail = (
                     "{}; coverage was not recorded; "

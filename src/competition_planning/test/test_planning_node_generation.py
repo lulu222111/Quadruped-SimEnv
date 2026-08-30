@@ -809,7 +809,7 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
         self.assertTrue(self.node.visual_coverage.active)
         self.assertTrue(self.node.visual_scan_final_pending)
 
-    def test_final_heading_timeout_does_not_allow_completion(self):
+    def test_any_heading_timeout_does_not_allow_completion(self):
         self.node.visual_coverage = PLANNING_NODE.VisualCoverageTracker(
             enabled=True,
             yaw_step=math.pi / 2.0,
@@ -838,16 +838,16 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
         self.assertTrue(self.node.visual_coverage.active)
         self.assertTrue(self.node.visual_scan_final_pending)
 
+        # The very first required heading cannot be reached.  Exhausting
+        # its retry budget must terminate the entire scan immediately.
         now = 100.3
-        for _ in range(4):
-            set_clock(now)
-            odom = self._set_odom_yaw(
-                self._make_odom(now),
-                0.7,
-            )
-            self.node.odom_msg = odom
-            self.node.visual_scan_callback(None)
-            now += 0.1
+        set_clock(now)
+        odom = self._set_odom_yaw(
+            self._make_odom(now),
+            0.7,
+        )
+        self.node.odom_msg = odom
+        self.node.visual_scan_callback(None)
 
         self.assertFalse(self.node.visual_coverage.active)
         self.assertEqual(
@@ -862,7 +862,7 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
         self.assertFalse(self._last_status_msg().valid)
         self.assertEqual(len(self._last_path().poses), 0)
         self.assertIn(
-            "final heading timed out",
+            "heading timed out",
             self._last_status_msg().detail,
         )
 

@@ -113,37 +113,39 @@ class VisualCoverageTrackerTest(unittest.TestCase):
         self.assertEqual(event.kind, SCAN_STARTED)
         self.assertEqual(tracker.scanned_positions, [(0.0, 0.0)])
 
-    def test_heading_timeout_retries_once_then_advances(self):
+    def test_heading_timeout_retries_once_then_terminates(self):
         tracker = self.make_tracker(dwell=0.0)
         tracker.start((0.0, 0.0), 0.0, 1.0)
+
         event = tracker.update(math.pi, 3.1)
         self.assertEqual(event.kind, SCAN_RETRY_HEADING)
         self.assertEqual(event.retry_count, 1)
+
         event = tracker.update(math.pi, 5.2)
         self.assertEqual(event.kind, SCAN_HEADING_TIMEOUT)
         self.assertEqual(event.heading_index, 0)
-        self.assertEqual(tracker.heading_index, 1)
-        self.assertTrue(tracker.active)
+        self.assertFalse(tracker.active)
+        self.assertEqual(tracker.scanned_positions, [])
 
-    def test_final_heading_timeout_is_bounded(self):
+        retry = tracker.start((0.0, 0.0), 0.0, 5.3)
+        self.assertEqual(retry.kind, SCAN_STARTED)
+
+    def test_first_heading_timeout_is_bounded(self):
         tracker = self.make_tracker(
             yaw_step=math.pi / 2.0,
             dwell=0.0,
             max_heading_retries=0,
         )
         tracker.start((0.0, 0.0), 0.0, 1.0)
-        now = 3.1
-        # Skip the first three headings by timeout.
-        for _ in range(3):
-            event = tracker.update(0.7, now)
-            self.assertEqual(event.kind, SCAN_HEADING_TIMEOUT)
-            now += 2.1
-        event = tracker.update(0.7, now)
+
+        event = tracker.update(0.7, 3.1)
+
         self.assertEqual(event.kind, SCAN_HEADING_TIMEOUT)
+        self.assertEqual(event.heading_index, 0)
         self.assertFalse(tracker.active)
         self.assertEqual(tracker.scanned_positions, [])
 
-        retry = tracker.start((0.0, 0.0), 0.0, now + 0.1)
+        retry = tracker.start((0.0, 0.0), 0.0, 3.2)
         self.assertEqual(retry.kind, SCAN_STARTED)
 
     def test_whole_scan_timeout_terminates(self):

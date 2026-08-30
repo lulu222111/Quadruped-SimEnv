@@ -197,15 +197,11 @@ class VisualCoverageTracker:
                 self.commanded_at = now
                 return self._event(SCAN_RETRY_HEADING)
 
+            # Missing any required heading makes the whole scan
+            # incomplete.  Do not skip the failed direction and later record
+            # the position as fully covered.
             event = self._event(SCAN_HEADING_TIMEOUT)
-            if self.heading_index + 1 >= self.heading_count:
-                self._finish_episode(record_coverage=False)
-                return event
-
-            self.heading_index += 1
-            self.commanded_at = now
-            self.reached_at = None
-            self.retry_count = 0
+            self._finish_episode(record_coverage=False)
             return event
 
         return self._event(SCAN_DWELLING)

@@ -135,12 +135,13 @@ generation/reset 清除它；地图重规划不会用抖动的 route 顶点替�
 而旧位置不会被标记为已扫描，避免控制器/定位偏差造成永久等待。
 以当前位姿为中心发布一组同位置、不同 yaw 的短路径点。默认以 45° 间隔
 覆盖 360°，每个 heading 到达后停留 0.6 秒；状态机由 timer 驱动，不阻塞规划
-callback。每个 heading 和整个 episode 都有超时，失败后有限重试并继续 Frontier
-探索，避免扫描形成新的死锁。
+callback。每个 heading 和整个 episode 都有超时。任一必要 heading 在有限重试后
+仍未到达，或整个 episode 超时，本轮扫描立即失败且不记录该位置的视觉覆盖；后续规划
+可重新尝试该位置，避免扫描形成新的死锁或产生虚假的完整覆盖。
 
 扫描位置以 2D 半径去重，附近目标不会反复触发完整扫描。若 Frontier 突然为空，
-Planner 会先尝试一次当前位置的 final scan；只有该 scan 完成或有界结束，并且
-连续达到 `exploration_complete_confirmations` 次同 generation 的 `NO_FRONTIER`
+Planner 会先尝试一次当前位置的 final scan；只有该 scan 的全部 heading 均实际
+到达并完成 dwell，且连续达到 `exploration_complete_confirmations` 次同 generation 的 `NO_FRONTIER`
 结果后，才锁存 `/competition/planning/exploration_complete=true`。新 generation
 或任务状态切换会清空扫描位置、当前 episode 和 completion debounce。
 
