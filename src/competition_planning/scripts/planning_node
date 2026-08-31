@@ -33,6 +33,7 @@ from planning_core import (
 )
 from visual_coverage import (
     SCAN_COMPLETE,
+    SCAN_COOLDOWN,
     SCAN_HEADING_REACHED,
     SCAN_HEADING_TIMEOUT,
     SCAN_NEXT_HEADING,
@@ -148,6 +149,7 @@ class PlanningNode:
             scan_timeout=self.visual_scan_timeout,
             position_dedup_radius=self.visual_scan_position_dedup_radius,
             max_heading_retries=self.visual_scan_max_heading_retries,
+            failure_cooldown=self.visual_scan_failure_cooldown,
         )
 
         self.status_pub = rospy.Publisher(
@@ -309,6 +311,12 @@ class PlanningNode:
             self.visual_scan_timeout = float(
                 rospy.get_param("~visual_scan_timeout", 45.0)
             )
+            self.visual_scan_failure_cooldown = float(
+                rospy.get_param(
+                    "~visual_scan_failure_cooldown",
+                    5.0,
+                )
+            )
             self.visual_scan_position_dedup_radius = float(
                 rospy.get_param(
                     "~visual_scan_position_dedup_radius", 1.0
@@ -409,6 +417,10 @@ class PlanningNode:
             ),
             ("visual_scan_timeout", self.visual_scan_timeout),
             (
+                "visual_scan_failure_cooldown",
+                self.visual_scan_failure_cooldown,
+            ),
+            (
                 "visual_scan_position_dedup_radius",
                 self.visual_scan_position_dedup_radius,
             ),
@@ -442,6 +454,10 @@ class PlanningNode:
         if self.visual_scan_max_heading_retries < 0:
             raise ValueError(
                 "visual_scan_max_heading_retries must not be negative"
+            )
+        if self.visual_scan_failure_cooldown < 0.0:
+            raise ValueError(
+                "visual_scan_failure_cooldown must not be negative"
             )
         if self.frontier_min_size < 1:
             raise ValueError("frontier_min_size must be at least 1")
@@ -770,6 +786,20 @@ class PlanningNode:
                 quaternion_to_yaw(odom_msg.pose.pose.orientation),
                 rospy.Time.now().to_sec(),
             )
+            if event.kind == SCAN_COOLDOWN:
+                rospy.loginfo_throttle(
+                    5.0,
+                    "planning_node: visual scan retry cooldown active at "
+                    "(%.2f, %.2f); continuing frontier exploration",
+                    robot.x,
+                    robot.y,
+                )
+                self.active_exploration_target = None
+                self.visual_scan_checkpoint_path = None
+                self.visual_scan_checkpoint_goal = None
+                self.visual_scan_checkpoint_origin = None
+                return False
+
             if event.kind == SCAN_SKIPPED:
                 rospy.loginfo(
                     "planning_node: visual scan skipped at nearby covered "
@@ -837,6 +867,30 @@ class PlanningNode:
                 quaternion_to_yaw(odom_msg.pose.pose.orientation),
                 rospy.Time.now().to_sec(),
             )
+            if event.kind == SCAN_COOLDOWN:
+                self.active_exploration_target = None
+                self.visual_scan_checkpoint_path = None
+                self.visual_scan_checkpoint_goal = None
+                self.visual_scan_checkpoint_origin = None
+                self.visual_scan_final_pending = True
+                self._clear_exploration_complete()
+
+                detail = (
+                    "final visual scan retry cooldown active; "
+                    "coverage remains pending"
+                )
+                rospy.logwarn_throttle(
+                    5.0,
+                    "planning_node: %s",
+                    detail,
+                )
+                self._invalidate_plan_locked(
+                    ModuleStatus.BLOCKED,
+                    0.0,
+                    detail,
+                )
+                return True
+
             if event.kind == SCAN_SKIPPED:
                 self.active_exploration_target = None
                 self.visual_scan_checkpoint_path = None

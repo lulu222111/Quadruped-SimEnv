@@ -748,6 +748,7 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
             scan_timeout=0.05,
             position_dedup_radius=1.0,
             max_heading_retries=0,
+            failure_cooldown=0.5,
         )
         self.node.visual_scan_dwell = 0.0
 
@@ -803,11 +804,28 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
             "/competition/planning/exploration_complete"
         )[-1].data)
 
-        # A new planning cycle may retry the same uncovered position.
+        # An immediate planning cycle must not restart the failed scan.
         set_clock(100.31)
         self.node.plan_callback(None)
+
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertFalse(self._last_status_msg().valid)
+        self.assertEqual(len(self._last_path().poses), 0)
+        self.assertIn(
+            "retry cooldown",
+            self._last_status_msg().detail,
+        )
+
+        # Once the bounded cooldown expires, the uncovered position may
+        # start a fresh final scan.
+        set_clock(100.81)
+        self.node.plan_callback(None)
+
         self.assertTrue(self.node.visual_coverage.active)
         self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
 
     def test_any_heading_timeout_does_not_allow_completion(self):
         self.node.visual_coverage = PLANNING_NODE.VisualCoverageTracker(

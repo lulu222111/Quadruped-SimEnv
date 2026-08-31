@@ -112,6 +112,7 @@ Planning 分别检查：
 | `~visual_scan_dwell` | `0.6` | 每个 heading 到达后的观察停留时间（秒） |
 | `~visual_scan_heading_timeout` | `4.0` | 单个 heading 的到达超时（秒） |
 | `~visual_scan_timeout` | `45.0` | 整个 scan episode 的最大时间（秒） |
+| `~visual_scan_failure_cooldown` | `5.0` | 同一失败位置再次执行视觉扫描前的冷却时间（秒） |
 | `~visual_scan_position_dedup_radius` | `1.0` | 已扫描位置的 2D 去重半径（米） |
 | `~visual_scan_route_spacing` | `2.0` | 沿 frontier route 选择视觉扫描 checkpoint 的最小间距（米） |
 | `~visual_scan_target_tolerance` | `0.35` | 判断探索目标已到达的距离容差（米） |
@@ -149,6 +150,12 @@ Planner 会先尝试一次当前位置的 final scan；只有该 scan 的全部 
 读取危险源位置、Gazebo 真值或隐藏场景信息。Control 通过同位置连续 Path pose
 识别 rotation-only waypoint 并执行原地 yaw；普通位置路径仍使用原有跟踪规则。
 
+
+失败位置冷却语义：任何必需 heading 未完成时，该位置不会被记录为已覆盖。
+同一位置在 `visual_scan_failure_cooldown` 时间内不会立即重复旋转；普通
+checkpoint 可继续 Frontier 探索，强制 final scan 则保持空 Path、
+`planning/status.valid=false` 和未完成状态，冷却结束后才允许重新扫描。
+该机制避免扫描失败造成高频重试，也防止失败的 final scan 被误判为探索完成。
 ## 当前已实现
 
 - [x] 四个正式输入话题接入
@@ -190,7 +197,7 @@ Planner 会先尝试一次当前位置的 final scan；只有该 scan 的全部 
 ### 无 ROS 单元测试
 
 ```text
-Ran 134 tests
+Ran 137 tests
 OK
 ```
 

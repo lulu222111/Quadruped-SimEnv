@@ -13,6 +13,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from visual_coverage import (  # noqa: E402
     SCAN_COMPLETE,
+    SCAN_COOLDOWN,
     SCAN_DWELLING,
     SCAN_HEADING_REACHED,
     SCAN_HEADING_TIMEOUT,
@@ -35,6 +36,8 @@ class VisualCoverageTrackerTest(unittest.TestCase):
             "scan_timeout": 20.0,
             "position_dedup_radius": 1.0,
             "max_heading_retries": 1,
+            # Tests unrelated to cooldown retain immediate retry behavior.
+            "failure_cooldown": 0.0,
         }
         params.update(overrides)
         return VisualCoverageTracker(**params)
@@ -159,6 +162,52 @@ class VisualCoverageTrackerTest(unittest.TestCase):
         retry = tracker.start((0.0, 0.0), 0.0, 4.2)
         self.assertEqual(retry.kind, SCAN_STARTED)
 
+    def test_failed_position_is_blocked_until_cooldown_expires(self):
+        tracker = self.make_tracker(
+            dwell=0.0,
+            max_heading_retries=0,
+            failure_cooldown=5.0,
+        )
+        tracker.start((0.0, 0.0), 0.0, 1.0)
+        event = tracker.update(math.pi, 3.1)
+        self.assertEqual(event.kind, SCAN_HEADING_TIMEOUT)
+
+        blocked = tracker.start((0.0, 0.0), 0.0, 3.2)
+        self.assertEqual(blocked.kind, SCAN_COOLDOWN)
+        self.assertFalse(tracker.active)
+        self.assertEqual(tracker.scanned_positions, [])
+
+        retry = tracker.start((0.0, 0.0), 0.0, 8.1)
+        self.assertEqual(retry.kind, SCAN_STARTED)
+
+    def test_failure_cooldown_does_not_block_far_position(self):
+        tracker = self.make_tracker(
+            dwell=0.0,
+            max_heading_retries=0,
+            failure_cooldown=5.0,
+        )
+        tracker.start((0.0, 0.0), 0.0, 1.0)
+        tracker.update(math.pi, 3.1)
+
+        event = tracker.start((2.0, 0.0), 0.0, 3.2)
+
+        self.assertEqual(event.kind, SCAN_STARTED)
+        self.assertEqual(tracker.origin, (2.0, 0.0))
+
+    def test_reset_clears_failure_cooldown(self):
+        tracker = self.make_tracker(
+            dwell=0.0,
+            max_heading_retries=0,
+            failure_cooldown=5.0,
+        )
+        tracker.start((0.0, 0.0), 0.0, 1.0)
+        tracker.update(math.pi, 3.1)
+
+        tracker.reset()
+        event = tracker.start((0.0, 0.0), 0.0, 3.2)
+
+        self.assertEqual(event.kind, SCAN_STARTED)
+
     def test_reset_clears_active_episode_and_coverage(self):
         tracker = self.make_tracker()
         tracker.start((0.0, 0.0), 0.0, 1.0)
@@ -174,6 +223,8 @@ class VisualCoverageTrackerTest(unittest.TestCase):
             self.make_tracker(yaw_tolerance=0.0)
         with self.assertRaises(ValueError):
             self.make_tracker(position_dedup_radius=-1.0)
+        with self.assertRaises(ValueError):
+            self.make_tracker(failure_cooldown=-1.0)
 
 
 if __name__ == "__main__":

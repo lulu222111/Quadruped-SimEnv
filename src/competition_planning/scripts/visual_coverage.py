@@ -10,6 +10,7 @@ from math import ceil, hypot, isfinite, pi
 SCAN_INACTIVE = "inactive"
 SCAN_STARTED = "started"
 SCAN_SKIPPED = "skipped"
+SCAN_COOLDOWN = "cooldown"
 SCAN_HEADING_REACHED = "heading_reached"
 SCAN_DWELLING = "dwelling"
 SCAN_NEXT_HEADING = "next_heading"
@@ -50,8 +51,9 @@ class VisualCoverageTracker:
 
     The class does not publish commands or sleep.  The caller drives it from
     a timer/callback and publishes a rotation-only path when an event asks for
-    a new heading.  A scan timeout always terminates the episode and records
-    the position, so a bad heading cannot deadlock frontier exploration.
+    a new heading.  A failed episode never records visual coverage.  A
+    position-scoped cooldown bounds repeated retries without blocking scans at
+    other locations.
     """
 
     def __init__(
@@ -64,6 +66,7 @@ class VisualCoverageTracker:
         scan_timeout=45.0,
         position_dedup_radius=1.0,
         max_heading_retries=1,
+        failure_cooldown=5.0,
     ):
         self.enabled = bool(enabled)
         self.yaw_step = float(yaw_step)
@@ -73,6 +76,7 @@ class VisualCoverageTracker:
         self.scan_timeout = float(scan_timeout)
         self.position_dedup_radius = float(position_dedup_radius)
         self.max_heading_retries = int(max_heading_retries)
+        self.failure_cooldown = float(failure_cooldown)
         self._validate_parameters()
         self.reset()
 
@@ -84,6 +88,7 @@ class VisualCoverageTracker:
             self.heading_timeout,
             self.scan_timeout,
             self.position_dedup_radius,
+            self.failure_cooldown,
         )
         if not all(isfinite(value) for value in finite):
             raise ValueError("visual coverage parameters must be finite")
@@ -101,6 +106,8 @@ class VisualCoverageTracker:
             raise ValueError("position_dedup_radius must not be negative")
         if self.max_heading_retries < 0:
             raise ValueError("max_heading_retries must not be negative")
+        if self.failure_cooldown < 0.0:
+            raise ValueError("failure_cooldown must not be negative")
 
     def reset(self):
         """Reset active scan state and all position coverage for a new epoch."""
@@ -113,6 +120,8 @@ class VisualCoverageTracker:
         self.commanded_at = None
         self.reached_at = None
         self.retry_count = 0
+        self.failed_position = None
+        self.retry_not_before = None
 
     @property
     def heading_count(self):
@@ -132,6 +141,21 @@ class VisualCoverageTracker:
             for scanned_x, scanned_y in self.scanned_positions
         )
 
+    def position_is_cooling_down(self, position, now):
+        x, y = self._position(position)
+        now = self._time(now)
+        if self.failed_position is None or self.retry_not_before is None:
+            return False
+        if now >= self.retry_not_before:
+            self.failed_position = None
+            self.retry_not_before = None
+            return False
+        failed_x, failed_y = self.failed_position
+        return (
+            hypot(x - failed_x, y - failed_y)
+            <= self.position_dedup_radius
+        )
+
     def start(self, position, initial_yaw, now):
         """Start a scan unless disabled or this position is already covered."""
         x, y = self._position(position)
@@ -144,6 +168,8 @@ class VisualCoverageTracker:
             raise RuntimeError("visual scan is already active")
         if self.position_is_covered((x, y)):
             return ScanEvent(SCAN_SKIPPED)
+        if self.position_is_cooling_down((x, y), now):
+            return ScanEvent(SCAN_COOLDOWN)
 
         heading_count = max(1, int(ceil((2.0 * pi) / self.yaw_step)))
         self.active = True
@@ -169,7 +195,7 @@ class VisualCoverageTracker:
 
         if now - self.started_at > self.scan_timeout:
             event = self._event(SCAN_TIMEOUT)
-            self._finish_episode(record_coverage=False)
+            self._finish_episode(record_coverage=False, finished_at=now)
             return event
 
         target_yaw = self.current_heading
@@ -181,7 +207,7 @@ class VisualCoverageTracker:
                 return self._event(SCAN_DWELLING)
             if self.heading_index + 1 >= self.heading_count:
                 event = self._event(SCAN_COMPLETE)
-                self._finish_episode(record_coverage=True)
+                self._finish_episode(record_coverage=True, finished_at=now)
                 return event
 
             self.heading_index += 1
@@ -201,19 +227,32 @@ class VisualCoverageTracker:
             # incomplete.  Do not skip the failed direction and later record
             # the position as fully covered.
             event = self._event(SCAN_HEADING_TIMEOUT)
-            self._finish_episode(record_coverage=False)
+            self._finish_episode(record_coverage=False, finished_at=now)
             return event
 
         return self._event(SCAN_DWELLING)
 
-    def _finish_episode(self, record_coverage=False):
+    def _finish_episode(self, record_coverage=False, finished_at=None):
+        episode_origin = self.origin
+
         if (
             record_coverage
-            and self.origin is not None
-            and not self.position_is_covered(self.origin)
+            and episode_origin is not None
+            and not self.position_is_covered(episode_origin)
         ):
-            self.scanned_positions.append(self.origin)
+            self.scanned_positions.append(episode_origin)
+
+        if record_coverage:
+            self.failed_position = None
+            self.retry_not_before = None
+        elif episode_origin is not None and finished_at is not None:
+            self.failed_position = episode_origin
+            self.retry_not_before = (
+                self._time(finished_at) + self.failure_cooldown
+            )
+
         self.active = False
+        self.origin = None
         self.heading_index = -1
         self.headings = ()
         self.started_at = None
