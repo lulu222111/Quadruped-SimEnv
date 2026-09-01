@@ -2,10 +2,10 @@
   <!--
     localization_filtered.launch : 调试用，让 FAST-LIO 消费过滤后的点云。
     与 localization_bringup.launch 相同，但 /common/lid_topic 指向
-    /livox/Pointcloud2_filtered（由 scripts/filter_livox.py 发布）。
+    /livox/Pointcloud2_filtered（由包内 scripts/filter_livox.py 发布）。
 
     用法:
-      python3 -u /workspace/SimEnv/scripts/filter_livox.py
+      rosrun competition_localization filter_livox.py
       roslaunch competition_localization localization_filtered.launch
   -->
 

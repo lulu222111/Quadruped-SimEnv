@@ -9,14 +9,9 @@
      环境去匹配，导致运动严重欠跟踪（真实 0.5m/s 只估 10%）。剔除后机器人
      自身不再进入配准。
 
-用法（容器内）:
-    python3 -u /workspace/SimEnv/scripts/filter_livox.py --max-range 40 --min-range 1.0
-
-FAST-LIO 使用过滤后话题:
-    roslaunch competition_localization localization_tuned.launch
+该节点是 experimental corrected launch 的可复现组成部分。本轮不改变
+min_range=1.0m / max_range=40m 的既有裁剪策略。
 """
-
-import argparse
 
 import numpy as np
 import rospy
@@ -24,12 +19,18 @@ from sensor_msgs.msg import PointCloud2
 
 
 class LivoxFilter:
-    def __init__(self, max_range, min_range):
-        self.max_range = max_range
-        self.min_range = min_range
-        self.sub = rospy.Subscriber("/livox/Pointcloud2", PointCloud2,
+    def __init__(self, max_range=40.0, min_range=1.0):
+        self.max_range = float(rospy.get_param("~max_range", max_range))
+        self.min_range = float(rospy.get_param("~min_range", min_range))
+        self.input_topic = rospy.get_param("~input_topic", "/livox/Pointcloud2")
+        self.output_topic = rospy.get_param(
+            "~output_topic", "/livox/Pointcloud2_filtered"
+        )
+        if self.min_range < 0.0 or self.max_range <= self.min_range:
+            raise ValueError("filter_livox requires 0 <= min_range < max_range")
+        self.sub = rospy.Subscriber(self.input_topic, PointCloud2,
                                     self.cb, queue_size=5, tcp_nodelay=True)
-        self.pub = rospy.Publisher("/livox/Pointcloud2_filtered", PointCloud2,
+        self.pub = rospy.Publisher(self.output_topic, PointCloud2,
                                    queue_size=5)
         self.fields_off = {}
         self.point_step = None
@@ -37,13 +38,21 @@ class LivoxFilter:
         self.kept_total = 0
 
     def _resolve_fields(self, msg):
-        for f in msg.fields:
-            self.fields_off[f.name] = f.offset
+        self.fields_off = {field.name: field.offset for field in msg.fields}
+        if not {"x", "y", "z"}.issubset(self.fields_off):
+            self.fields_off = {}
+            self.point_step = None
+            return False
         self.point_step = msg.point_step
+        return self.point_step >= 4
 
     def cb(self, msg):
         if not self.fields_off:
-            self._resolve_fields(msg)
+            if not self._resolve_fields(msg):
+                rospy.logwarn_throttle(
+                    1.0, "filter_livox: PointCloud2 missing x/y/z fields"
+                )
+                return
         ox, oy, oz = self.fields_off["x"], self.fields_off["y"], self.fields_off["z"]
         ps = self.point_step
         n = msg.width * msg.height
@@ -86,13 +95,15 @@ class LivoxFilter:
             rospy.loginfo_throttle(10.0, f"[filter_livox] 无剔除，保留 {n_keep}")
 
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--max-range", type=float, default=40.0)
-    ap.add_argument("--min-range", type=float, default=1.0,
-                    help="剔除距离小于该值的点（机器人自身身体/腿）")
-    args = ap.parse_args()
-    rospy.init_node("filter_livox", anonymous=True)
-    f = LivoxFilter(args.max_range, args.min_range)
-    rospy.loginfo(f"[filter_livox] 订阅 /livox/Pointcloud2，剔除 <{args.min_range}m 与 >{args.max_range}m 的点")
+def main():
+    rospy.init_node("filter_livox")
+    node = LivoxFilter()
+    rospy.loginfo(
+        "filter_livox: EXPERIMENTAL input=%s output=%s, crop <%.2fm or >%.2fm",
+        node.input_topic, node.output_topic, node.min_range, node.max_range,
+    )
     rospy.spin()
+
+
+if __name__ == "__main__":
+    main()

@@ -22,10 +22,17 @@ catkin_package(
   competition_interfaces
 )
 
-install(DIRECTORY scripts
-  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
-  PATTERN "__pycache__" EXCLUDE
-  PATTERN "*.pyc" EXCLUDE
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test)
+endif()
+
+catkin_install_python(PROGRAMS
+  scripts/localization_node
+  scripts/leg_odometry.py
+  scripts/filter_livox.py
+  scripts/mock_fast_lio_odom.py
+  scripts/verify_localization_consistency.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
 install(DIRECTORY launch

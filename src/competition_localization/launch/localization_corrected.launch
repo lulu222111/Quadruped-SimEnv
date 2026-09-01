@@ -1,50 +1,75 @@
 <launch>
   <!--
-    localization_corrected.launch : 方案B - FAST-LIO + 腿式里程计校正（调试用）。
-    基于 localization_tuned.launch（调优参数 + 过滤点云），并启用校正通道：
-      - correction_enabled = true
-      - correction_odom_topic = /leg_odometry（scripts/leg_odometry.py 发布）
-      - correction_mode = planar_relative（用腿式里程计的 x/y/yaw 覆盖 FAST-LIO 的
-        平面漂移，保留 FAST-LIO 的 z/roll/pitch）
-    leg_odometry.py 单独进程启动（与 filter_livox.py 一样，避免 catkin 重建）。
+    ================================================================
+    EXPERIMENTAL / VALIDATION ONLY
+    NOT YET APPROVED FOR FORMAL COMPETITION MODE
+    ================================================================
 
-    完整启动:
-      python3 -u /workspace/SimEnv/scripts/filter_livox.py  (max range 40, min range 1.0)
-      python3 -u /workspace/SimEnv/scripts/leg_odometry.py
-      roslaunch competition_localization localization_corrected.launch
+    Self-contained experimental chain:
+      raw Livox PointCloud2 -> filter_livox -> FAST-LIO
+      JointState + trunk IMU -> leg_odometry -> localization correction
+
+    Sensor compliance of /a1_gazebo/joint_states and /trunk_imu remains
+    unconfirmed.  This launch is intentionally not included by the formal
+    competition_system.launch.
   -->
 
   <arg name="rviz" default="false" />
-  <arg name="lid_topic" default="/livox/Pointcloud2_filtered" />
+  <arg name="raw_cloud_topic" default="/livox/Pointcloud2" />
+  <arg name="filtered_cloud_topic" default="/livox/Pointcloud2_filtered" />
   <arg name="imu_topic" default="/livox/imu" />
+  <arg name="joint_state_topic" default="/a1_gazebo/joint_states" />
+  <arg name="leg_imu_topic" default="/trunk_imu" />
+  <arg name="leg_odom_topic" default="/leg_odometry" />
   <arg name="odom_input_topic" default="/Odometry" />
   <arg name="team_scene_info_path" default="generated_building/team_scene_info.json" />
   <arg name="filter_size_surf" default="0.15" />
   <arg name="filter_size_map" default="0.25" />
   <arg name="correction_enabled" default="true" />
-  <arg name="correction_odom_topic" default="/leg_odometry" />
   <arg name="correction_mode" default="planar_relative" />
+  <arg name="correction_timeout" default="0.5" />
+  <arg name="max_correction_skew" default="0.20" />
+  <arg name="max_imu_age" default="0.5" />
+  <arg name="max_imu_joint_skew" default="0.05" />
+
+  <node pkg="competition_localization" type="filter_livox.py" name="filter_livox"
+        output="screen" respawn="false">
+    <param name="input_topic" value="$(arg raw_cloud_topic)" />
+    <param name="output_topic" value="$(arg filtered_cloud_topic)" />
+    <!-- Existing PR policy; intentionally unchanged in this hardening pass. -->
+    <param name="min_range" type="double" value="1.0" />
+    <param name="max_range" type="double" value="40.0" />
+  </node>
+
+  <node pkg="competition_localization" type="leg_odometry.py" name="leg_odometry"
+        output="screen" respawn="false">
+    <param name="joint_state_topic" value="$(arg joint_state_topic)" />
+    <param name="imu_topic" value="$(arg leg_imu_topic)" />
+    <param name="odom_topic" value="$(arg leg_odom_topic)" />
+    <param name="max_imu_age" value="$(arg max_imu_age)" />
+    <param name="max_imu_joint_skew" value="$(arg max_imu_joint_skew)" />
+    <param name="frame_id" value="c2r28_fastlio_local" />
+    <param name="child_frame_id" value="c2r28_base" />
+    <!-- Preserve PR #16 candidate values; this pass does not retune them. -->
+    <param name="vel_scale" type="double" value="1.2" />
+    <param name="lp_alpha" type="double" value="0.8" />
+    <param name="contact_vz_thresh" type="double" value="0.15" />
+  </node>
 
   <rosparam command="load" file="$(find fast_lio)/config/mid360_sim.yaml" />
+  <param name="common/lid_topic" type="string" value="$(arg filtered_cloud_topic)" />
 
-  <!-- 覆盖 lid_topic 到过滤后的话题（FAST-LIO 按 /common/lid_topic 订阅） -->
-  <param name="common/lid_topic" type="string" value="$(arg lid_topic)" />
-
-  <!-- 生产外参修正（同 localization_bringup.launch） -->
   <rosparam param="mapping/extrinsic_T" subst_value="True">[0.011, 0.02329, -0.04412]</rosparam>
   <rosparam param="mapping/extrinsic_R" subst_value="True">[1, 0, 0,
-                                                             0, 1, 0,
-                                                             0, 0, 1]</rosparam>
+                                                               0, 1, 0,
+                                                               0, 0, 1]</rosparam>
   <param name="mapping/extrinsic_est_en" type="bool" value="false" />
-
-  <!-- 调优参数（mapping/ 命名空间） -->
   <param name="mapping/acc_cov" type="double" value="1.0" />
   <param name="mapping/gyr_cov" type="double" value="1.0" />
   <param name="mapping/b_acc_cov" type="double" value="0.001" />
   <param name="mapping/b_gyr_cov" type="double" value="0.001" />
-
-  <param name="feature_extract_enable" type="bool" value="0"/>
-  <param name="point_filter_num" type="int" value="2"/>
+  <param name="feature_extract_enable" type="bool" value="0" />
+  <param name="point_filter_num" type="int" value="2" />
   <param name="max_iteration" type="int" value="5" />
   <param name="filter_size_surf" type="double" value="$(arg filter_size_surf)" />
   <param name="filter_size_map" type="double" value="$(arg filter_size_map)" />
@@ -54,7 +79,7 @@
 
   <node pkg="fast_lio" type="fastlio_mapping" name="laserMapping" output="screen"
         respawn="false">
-    <remap from="/livox/lidar" to="$(arg lid_topic)" />
+    <remap from="/livox/lidar" to="$(arg filtered_cloud_topic)" />
     <remap from="/livox/imu" to="$(arg imu_topic)" />
   </node>
 
@@ -64,8 +89,10 @@
     <param name="team_scene_info_path" value="$(arg team_scene_info_path)" />
     <param name="publish_tf" value="true" />
     <param name="correction_enabled" value="$(arg correction_enabled)" />
-    <param name="correction_odom_topic" value="$(arg correction_odom_topic)" />
+    <param name="correction_odom_topic" value="$(arg leg_odom_topic)" />
     <param name="correction_mode" value="$(arg correction_mode)" />
+    <param name="correction_timeout" value="$(arg correction_timeout)" />
+    <param name="max_correction_skew" value="$(arg max_correction_skew)" />
     <param name="correction_frame_id" value="c2r28_fastlio_local" />
     <param name="correction_child_frame_id" value="c2r28_base" />
     <rosparam param="base_to_imu_translation">[0.223404, -0.023290, 0.118985]</rosparam>
