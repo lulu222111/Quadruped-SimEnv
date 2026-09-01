@@ -317,6 +317,16 @@ def _make_odom(x=0.0, y=0.0, z=0.0, qx=0.0, qy=0.0, qz=0.0, qw=1.0,
     return odom
 
 
+def _make_correction(x=0.0, y=0.0, yaw=0.0, stamp=None) -> _Odometry:
+    return _make_odom(
+        x, y, 0.0,
+        0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0),
+        frame_id="c2r28_fastlio_local",
+        child_frame_id="c2r28_base",
+        stamp=stamp,
+    )
+
+
 def _adapter_with_start(start: dict) -> object:
     """Create a LocalizationAdapter instance (without __init__) with a given
     robot_start, so class methods like _odom_callback / _compute_alignment are
@@ -333,11 +343,29 @@ def _adapter_with_start(start: dict) -> object:
     adapter._first_valid_pose = None
     adapter._first_valid_pose_time = None
     adapter._last_input_stamp = None
+    adapter._last_ros_time = None
     adapter.start_alignment_delay = 2.0
     adapter.input_frame_id = "camera_init"
     adapter.input_child_frame_id = "body"
     adapter.input_timeout = 0.5
     adapter._max_future_stamp_skew = 1.0
+    adapter.correction_enabled = False
+    adapter.correction_mode = "full_pose"
+    adapter.correction_frame_id = "c2r28_fastlio_local"
+    adapter.correction_child_frame_id = "c2r28_base"
+    adapter.correction_timeout = 0.5
+    adapter.max_correction_skew = 0.20
+    adapter._latest_raw_world_to_base = None
+    adapter._T_world_to_correction = None
+    adapter._latest_correction_world_to_base = None
+    adapter._world_correction_yaw_offset = None
+    adapter._latest_correction_world_yaw = None
+    adapter._world_correction_xy_offset = None
+    adapter._latest_correction_world_xy = None
+    adapter._last_correction_stamp = None
+    adapter._last_correction_receive_time = None
+    adapter._correction_ever_received = False
+    adapter._correction_timed_out = False
     adapter.competition_mode = False
     adapter._state = _ModuleStatus.STARTING
     adapter._valid = False
@@ -363,6 +391,180 @@ class TestLocalizationNode(unittest.TestCase):
         self.assertAlmostEqual(result[0], v[0])
         self.assertAlmostEqual(result[1], v[1])
         self.assertAlmostEqual(result[2], v[2])
+
+    @staticmethod
+    def _corrected_adapter(mode="planar_relative"):
+        adapter = _adapter_with_start(
+            {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0}
+        )
+        adapter.start_alignment_delay = 0.0
+        adapter.correction_enabled = True
+        adapter.correction_mode = mode
+        adapter._odom_pub = _RecordingPublisher()
+        return adapter
+
+    def test_correction_required_in_every_mode(self):
+        """Enabled correction never silently falls back to raw FAST-LIO."""
+        for mode in ("full_pose", "yaw_only", "planar_relative"):
+            adapter = self._corrected_adapter(mode)
+            _MockTime._now = 10.0
+            mod.LocalizationAdapter._odom_callback(
+                adapter,
+                _make_odom(stamp=_MockTimeInstance(10.0)),
+            )
+            self.assertEqual(adapter._state, _ModuleStatus.STARTING, mode)
+            self.assertFalse(adapter._valid, mode)
+            self.assertIn("waiting for correction odometry", adapter._detail)
+            self.assertEqual(len(adapter._odom_pub.published), 0, mode)
+
+    def test_fresh_correction_passes_and_uses_fastlio_stamp(self):
+        adapter = self._corrected_adapter()
+        _MockTime._now = 10.0
+        mod.LocalizationAdapter._odom_callback(
+            adapter, _make_odom(stamp=_MockTimeInstance(10.0))
+        )
+        mod.LocalizationAdapter._correction_callback(
+            adapter, _make_correction(1.0, 2.0, 0.2, _MockTimeInstance(10.0))
+        )
+        _MockTime._now = 10.1
+        mod.LocalizationAdapter._odom_callback(
+            adapter, _make_odom(stamp=_MockTimeInstance(10.1))
+        )
+        self.assertEqual(adapter._state, _ModuleStatus.RUNNING)
+        self.assertTrue(adapter._valid)
+        self.assertEqual(len(adapter._odom_pub.published), 1)
+        self.assertEqual(
+            adapter._odom_pub.published[0].header.stamp.to_sec(), 10.1
+        )
+
+    def test_correction_timeout_blocks_stale_reuse(self):
+        adapter = self._corrected_adapter()
+        _MockTime._now = 10.0
+        mod.LocalizationAdapter._odom_callback(
+            adapter, _make_odom(stamp=_MockTimeInstance(10.0))
+        )
+        mod.LocalizationAdapter._correction_callback(
+            adapter, _make_correction(1.0, 0.0, 0.0, _MockTimeInstance(10.0))
+        )
+        _MockTime._now = 10.1
+        mod.LocalizationAdapter._odom_callback(
+            adapter, _make_odom(stamp=_MockTimeInstance(10.1))
+        )
+        self.assertEqual(len(adapter._odom_pub.published), 1)
+
+        _MockTime._now = 11.0
+        mod.LocalizationAdapter._odom_callback(
+            adapter, _make_odom(5.0, stamp=_MockTimeInstance(11.0))
+        )
+        self.assertEqual(adapter._state, _ModuleStatus.TIMEOUT)
+        self.assertFalse(adapter._valid)
+        self.assertEqual(len(adapter._odom_pub.published), 1)
+        self.assertIsNone(adapter._latest_correction_world_xy)
+        self.assertIsNone(adapter._latest_correction_world_yaw)
+
+    def test_correction_timestamp_skew_blocks(self):
+        adapter = self._corrected_adapter()
+        _MockTime._now = 20.0
+        mod.LocalizationAdapter._odom_callback(
+            adapter, _make_odom(stamp=_MockTimeInstance(20.0))
+        )
+        mod.LocalizationAdapter._correction_callback(
+            adapter, _make_correction(stamp=_MockTimeInstance(20.0))
+        )
+        _MockTime._now = 20.3
+        mod.LocalizationAdapter._odom_callback(
+            adapter, _make_odom(stamp=_MockTimeInstance(20.3))
+        )
+        self.assertEqual(adapter._state, _ModuleStatus.BLOCKED)
+        self.assertFalse(adapter._valid)
+        self.assertEqual(len(adapter._odom_pub.published), 0)
+
+    def test_fresh_correction_recovers_after_timeout(self):
+        adapter = self._corrected_adapter()
+        _MockTime._now = 30.0
+        mod.LocalizationAdapter._odom_callback(
+            adapter, _make_odom(stamp=_MockTimeInstance(30.0))
+        )
+        mod.LocalizationAdapter._correction_callback(
+            adapter, _make_correction(1.0, stamp=_MockTimeInstance(30.0))
+        )
+        _MockTime._now = 30.1
+        mod.LocalizationAdapter._odom_callback(
+            adapter, _make_odom(stamp=_MockTimeInstance(30.1))
+        )
+        _MockTime._now = 31.0
+        mod.LocalizationAdapter._odom_callback(
+            adapter, _make_odom(stamp=_MockTimeInstance(31.0))
+        )
+        self.assertEqual(adapter._state, _ModuleStatus.TIMEOUT)
+
+        _MockTime._now = 31.1
+        mod.LocalizationAdapter._correction_callback(
+            adapter, _make_correction(2.0, stamp=_MockTimeInstance(31.1))
+        )
+        _MockTime._now = 31.15
+        mod.LocalizationAdapter._odom_callback(
+            adapter, _make_odom(stamp=_MockTimeInstance(31.15))
+        )
+        self.assertEqual(adapter._state, _ModuleStatus.RUNNING)
+        self.assertTrue(adapter._valid)
+        self.assertEqual(len(adapter._odom_pub.published), 2)
+
+    def test_correction_timestamp_rollback_resets_alignment_generation(self):
+        adapter = self._corrected_adapter()
+        _MockTime._now = 40.0
+        mod.LocalizationAdapter._odom_callback(
+            adapter, _make_odom(stamp=_MockTimeInstance(40.0))
+        )
+        mod.LocalizationAdapter._correction_callback(
+            adapter, _make_correction(1.0, stamp=_MockTimeInstance(40.0))
+        )
+        self.assertIsNotNone(adapter._world_correction_xy_offset)
+
+        _MockTime._now = 40.1
+        mod.LocalizationAdapter._correction_callback(
+            adapter, _make_correction(2.0, stamp=_MockTimeInstance(5.0))
+        )
+        self.assertEqual(adapter._state, _ModuleStatus.FAILED)
+        self.assertFalse(adapter._valid)
+        self.assertIsNone(adapter._last_correction_stamp)
+        self.assertIsNone(adapter._world_correction_xy_offset)
+        self.assertIsNone(adapter._latest_correction_world_xy)
+
+        mod.LocalizationAdapter._correction_callback(
+            adapter, _make_correction(3.0, stamp=_MockTimeInstance(40.1))
+        )
+        _MockTime._now = 40.15
+        mod.LocalizationAdapter._odom_callback(
+            adapter, _make_odom(stamp=_MockTimeInstance(40.15))
+        )
+        self.assertEqual(adapter._state, _ModuleStatus.RUNNING)
+        self.assertTrue(adapter._valid)
+
+    def test_ros_clock_rollback_invalidates_correction_generation(self):
+        adapter = self._corrected_adapter()
+        _MockTime._now = 50.0
+        mod.LocalizationAdapter._odom_callback(
+            adapter, _make_odom(stamp=_MockTimeInstance(50.0))
+        )
+        mod.LocalizationAdapter._correction_callback(
+            adapter, _make_correction(1.0, stamp=_MockTimeInstance(50.0))
+        )
+        self.assertIsNotNone(adapter._latest_correction_world_xy)
+
+        # Global sim time returns to a new generation.  The triggering raw
+        # frame may seed raw state, but old correction alignment cannot live.
+        _MockTime._now = 5.0
+        mod.LocalizationAdapter._odom_callback(
+            adapter, _make_odom(stamp=_MockTimeInstance(5.0))
+        )
+        self.assertFalse(adapter._valid)
+        self.assertEqual(adapter._state, _ModuleStatus.STARTING)
+        self.assertFalse(adapter._correction_ever_received)
+        self.assertIsNone(adapter._last_correction_stamp)
+        self.assertIsNone(adapter._last_correction_receive_time)
+        self.assertIsNone(adapter._latest_correction_world_xy)
+        self.assertIsNone(adapter._world_correction_xy_offset)
 
     def test_transform_inverse_identity(self):
         """T * inv(T) should be the identity transform."""

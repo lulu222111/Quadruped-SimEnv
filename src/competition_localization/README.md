@@ -122,6 +122,41 @@ roslaunch competition_localization localization_bringup.launch rviz:=false
 roslaunch competition_localization localization_bringup.launch rviz:=true
 ```
 
+### 腿式里程计校正实验链的合规状态
+
+`localization_corrected.launch` 是 **EXPERIMENTAL / VALIDATION ONLY** 候选，尚未获准
+进入正式比赛模式。它现在可由单条命令复现完整实验链：
+
+```bash
+roslaunch competition_localization localization_corrected.launch
+```
+
+该命令同时启动 `filter_livox.py`、FAST-LIO、`leg_odometry.py` 和
+`localization_node`。腿式校正使用：
+
+- `/a1_gazebo/joint_states`：本体关节状态，用于足端正运动学与速度估计；
+- `/trunk_imu`：躯干姿态与角速度，用于身体旋转和世界/本体系转换。
+
+在把该链标记为正式比赛生产定位方案之前，必须由赛题规则负责人明确确认：
+
+1. `joint_states` 对应的数据是否属于机器人正常可用的本体状态；
+2. `trunk_imu` 是否属于正式允许的机载传感器；
+3. Gazebo 中这些 topic 是否包含实机不可获得的理想状态；
+4. 实物迁移时是否存在语义和时序等价的输入。
+
+因此当前结论仅为 `FORMAL_SENSOR_COMPLIANCE_CONFIRMED=False`，既不擅自判断
+`LEGAL=True`，也不判断 `ILLEGAL=True`。正式 `competition_system.launch` 仍只 include
+`localization_bringup.launch`，不会自动启用该实验链。
+
+校正开启后是 required input：任一模式在 correction 从未到达、接收超时、source
+stamp skew 超限、frame/pose/timestamp 非法时都停止发布 competition odom/TF，并令
+`valid=false`。普通 timeout 会丢弃 latest measurement、保留相对 alignment offset；
+只有新合法 correction 到达，且下一帧 FAST-LIO 与其时间差合规，才恢复 `RUNNING`。
+correction timestamp 或 ROS `/clock` rollback 会进一步清除 alignment generation。
+
+> FOLLOWUP: replace spherical near-field crop with robot self-mask evaluation.
+> 本轮保持 `min_range=1.0m`、`max_range=40m` 及所有 FAST-LIO/腿里程计算法参数不变。
+
 ### Debug vs Competition 区别
 
 | 项目 | 生产模式 | 调试模式 |
@@ -141,6 +176,8 @@ roslaunch competition_localization localization_bringup.launch rviz:=true
 - **Future stamp**: 拒绝超过 1 秒的未来时间戳 (clock skew guard)
 - **Stale data**: 拒绝超过 `input_timeout × 2` 的过时数据
 - **ROS /clock rollback**: 检测到回跳后重置 last_input_stamp 并继续
+- **Correction required**: `correction_enabled=true` 时所有 correction mode 均禁止 raw FAST-LIO 静默回退
+- **Correction freshness**: correction 接收年龄不超过 `correction_timeout`，且与 FAST-LIO source stamp 差不超过 `max_correction_skew`
 
 ## 超时与状态
 
@@ -148,6 +185,7 @@ roslaunch competition_localization localization_bringup.launch rviz:=true
 - **RUNNING + valid=true**: 接收合法输入, 发布 world->base odom + TF
 - **TIMEOUT + valid=false**: `input_timeout` 秒内无合法输入 (可恢复)
 - **FAILED + valid=false**: 场景文件/外参配置错误 (不可恢复, 需重启)
+- correction 非法 pose/stamp 为 **FAILED**，frame/skew 不匹配为 **BLOCKED**；新合法 generation 可恢复
 
 ---
 
@@ -169,6 +207,15 @@ roslaunch competition_localization localization_bringup.launch rviz:=true
 | `~base_to_imu_quaternion` | list[4] | — | 旋转的四元数表示 (与 rpy 二选一) |
 | `/competition_loop/competition_mode` | bool | true | 正式模式: 严格校验、禁止静默降级 |
 | `~team_scene_info_path` | string | `generated_building/team_scene_info.json` | 公开场景文件路径 |
+| `~correction_enabled` | bool | false | 启用时 correction 成为 required input，不允许 raw fallback |
+| `~correction_mode` | string | `full_pose` | `full_pose` / `yaw_only` / `planar_relative` |
+| `~correction_timeout` | float | 0.5 | correction 最大接收年龄（秒） |
+| `~max_correction_skew` | float | 0.20 | FAST-LIO 与 correction source stamp 最大绝对差（秒） |
+
+实验 `leg_odometry.py` 另有 `~max_imu_age=0.5` 与
+`~max_imu_joint_skew=0.05`。它拒绝 zero stamp、缺失 required joint、未准备/过期/错位
+IMU；无可靠支撑脚时不积分且不发布 fresh correction。其 Odometry pose 位于
+`c2r28_fastlio_local`，twist.linear 按 ROS 约定表达在 child `c2r28_base` 中。
 
 ---
 
@@ -184,9 +231,13 @@ python3 -m pytest src/competition_localization/test/ -q
 python3 src/competition_localization/test/test_localization_node.py
 python3 src/competition_localization/test/test_localization_extrinsic.py
 python3 src/competition_localization/test/test_localization_scene_file.py
+python3 src/competition_localization/test/test_leg_odometry.py
+python3 src/competition_localization/test/test_corrected_launch.py
 ```
 
-覆盖: 外参矩阵、首帧锁存、场景文件异常、静态稳定性、运动方向、TF 持续可查、断流超时、合规自检。
+覆盖: 外参矩阵、首帧锁存、场景文件异常、静态稳定性、运动方向、TF 持续可查、
+FAST-LIO/correction 双输入 fail-close、correction 恢复/rollback、腿里程计 freshness/
+支撑脚/twist frame，以及 corrected launch 完整链与生产隔离。
 
 ### 集成烟雾测试
 
