@@ -104,6 +104,13 @@ class PathFollower:
         self.max_linear = self._positive_param("~max_linear", 0.25)
         self.max_angular = self._positive_param("~max_angular", 0.8)
         self.goal_tolerance = self._positive_param("~goal_tolerance", 0.2)
+        # A pair of consecutive same-position poses is an explicit
+        # rotation-only waypoint used by Planning's bounded visual scan.  The
+        # ordinary navigation path remains position-driven and does not use
+        # this tolerance for its final pose.
+        self.orientation_tolerance = self._positive_param(
+            "~orientation_tolerance", 0.15
+        )
         # Minimum forward speed commanded while actively driving to a
         # waypoint outside goal_tolerance.  The RL locomotion policy cannot
         # execute arbitrarily small speeds: below ~0.2 m/s it stands still,
@@ -887,11 +894,23 @@ class PathFollower:
         robot_yaw = yaw_from_quaternion(odom.pose.pose.orientation)
 
         while target_index < len(path):
+            target_pose = path[target_index].pose
             distance = self._distance_to_target(
-                path[target_index].pose,
+                target_pose,
                 robot_x,
                 robot_y,
             )
+            rotation_only = self._is_rotation_only_target(
+                path,
+                target_index,
+            )
+            if rotation_only:
+                target_yaw = yaw_from_quaternion(target_pose.orientation)
+                yaw_error = normalize_angle(target_yaw - robot_yaw)
+                if abs(yaw_error) <= self.orientation_tolerance:
+                    target_index += 1
+                    continue
+                break
             if distance >= self.goal_tolerance:
                 break
             target_index += 1
@@ -904,7 +923,12 @@ class PathFollower:
         dy = target_pose.position.y - robot_y
 
         distance = math.hypot(dx, dy)
-        target_yaw = math.atan2(dy, dx)
+        rotation_only = self._is_rotation_only_target(path, target_index)
+        target_yaw = (
+            yaw_from_quaternion(target_pose.orientation)
+            if rotation_only
+            else math.atan2(dy, dx)
+        )
         yaw_error = normalize_angle(target_yaw - robot_yaw)
 
         if not all(
@@ -922,7 +946,7 @@ class PathFollower:
             self.max_angular,
         )
 
-        if abs(yaw_error) < 0.8:
+        if not rotation_only and abs(yaw_error) < 0.8:
             cmd.linear.x = clamp(
                 0.6 * distance,
                 self.min_linear,
@@ -1161,12 +1185,27 @@ class PathFollower:
         ):
             return 0
 
+        try:
+            robot_yaw = yaw_from_quaternion(self.odom.pose.pose.orientation)
+        except ValueError:
+            return 0
+
         for index, pose_stamped in enumerate(self.path):
             distance = self._distance_to_target(
                 pose_stamped.pose,
                 robot.x,
                 robot.y,
             )
+            if self._is_rotation_only_target(self.path, index):
+                target_yaw = yaw_from_quaternion(
+                    pose_stamped.pose.orientation
+                )
+                if (
+                    abs(normalize_angle(target_yaw - robot_yaw))
+                    > self.orientation_tolerance
+                ):
+                    return index
+                continue
             if distance >= self.goal_tolerance:
                 return index
 
@@ -1183,6 +1222,18 @@ class PathFollower:
             raise ValueError("target distance is not finite")
 
         return distance
+
+    @staticmethod
+    def _is_rotation_only_target(path, index):
+        """Identify the explicit same-position orientation waypoint form."""
+        if index <= 0 or index >= len(path):
+            return False
+        previous = path[index - 1].pose.position
+        current = path[index].pose.position
+        return math.hypot(
+            current.x - previous.x,
+            current.y - previous.y,
+        ) <= 1.0e-6
 
     @staticmethod
     def _positive_param(name, default):

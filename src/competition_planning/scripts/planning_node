@@ -31,6 +31,18 @@ from planning_core import (
     plan_to_heading_goal_with_status,
     plan_to_frontier_with_status,
 )
+from visual_coverage import (
+    SCAN_COMPLETE,
+    SCAN_COOLDOWN,
+    SCAN_HEADING_REACHED,
+    SCAN_HEADING_TIMEOUT,
+    SCAN_NEXT_HEADING,
+    SCAN_RETRY_HEADING,
+    SCAN_SKIPPED,
+    SCAN_STARTED,
+    SCAN_TIMEOUT,
+    VisualCoverageTracker,
+)
 
 
 WORLD_FRAME = "world"
@@ -109,8 +121,36 @@ class PlanningNode:
         self._return_recommit_used_epoch = -1
         self.initial_forward_anchor = None
         self.initial_forward_complete = False
+        self.active_exploration_target = None
+        # Once a visual checkpoint is selected, keep the route prefix that
+        # reaches that checkpoint stable across ordinary map replans.  The
+        # path is still refreshed with current timestamps, but changing its
+        # geometry every cycle would reset the follower's waypoint progress
+        # and can leave the robot rotating toward a moving first segment.
+        self.visual_scan_checkpoint_path = None
+        self.visual_scan_checkpoint_goal = None
+        # The route checkpoint is a visual-coverage obligation.  Remember
+        # where it was assigned so a controller/localization detour cannot
+        # leave that obligation pending forever after the robot has made
+        # bounded real progress away from it.
+        self.visual_scan_checkpoint_origin = None
+        self.visual_scan_final_pending = False
+        self._exploration_complete_streak = 0
+        self._exploration_complete_active = False
 
         self._load_parameters()
+
+        self.visual_coverage = VisualCoverageTracker(
+            enabled=self.visual_scan_enabled,
+            yaw_step=self.visual_scan_yaw_step,
+            yaw_tolerance=self.visual_scan_yaw_tolerance,
+            dwell=self.visual_scan_dwell,
+            heading_timeout=self.visual_scan_heading_timeout,
+            scan_timeout=self.visual_scan_timeout,
+            position_dedup_radius=self.visual_scan_position_dedup_radius,
+            max_heading_retries=self.visual_scan_max_heading_retries,
+            failure_cooldown=self.visual_scan_failure_cooldown,
+        )
 
         self.status_pub = rospy.Publisher(
             "/competition/planning/status",
@@ -127,6 +167,12 @@ class PlanningNode:
         self.path_pub = rospy.Publisher(
             "/competition/path",
             Path,
+            queue_size=1,
+            latch=True,
+        )
+        self.exploration_complete_pub = rospy.Publisher(
+            "/competition/planning/exploration_complete",
+            Bool,
             queue_size=1,
             latch=True,
         )
@@ -176,12 +222,17 @@ class PlanningNode:
             rospy.Duration(self.status_heartbeat_interval),
             self.heartbeat_callback,
         )
+        self.visual_scan_timer = rospy.Timer(
+            rospy.Duration(self.visual_scan_update_interval),
+            self.visual_scan_callback,
+        )
 
         self.invalidate_plan(
             ModuleStatus.STARTING,
             0.0,
             "waiting for upstream status and current-generation data",
         )
+        self._publish_exploration_complete(False)
 
         rospy.loginfo(
             "planning_node started: waiting for mapping/localization "
@@ -237,6 +288,61 @@ class PlanningNode:
                 rospy.get_param(
                     "~exploration_blocked_nudge_distance", 2.0
                 )
+            )
+            # Active visual coverage is a planner-local sub-state.  The
+            # default heading step is 45 degrees: it overlaps a roughly
+            # 60-degree RGB-D horizontal FoV while keeping each episode
+            # bounded to eight headings.
+            self.visual_scan_enabled = bool(
+                rospy.get_param("~visual_scan_enabled", True)
+            )
+            self.visual_scan_yaw_step = float(
+                rospy.get_param("~visual_scan_yaw_step", 0.7853981634)
+            )
+            self.visual_scan_yaw_tolerance = float(
+                rospy.get_param("~visual_scan_yaw_tolerance", 0.15)
+            )
+            self.visual_scan_dwell = float(
+                rospy.get_param("~visual_scan_dwell", 0.6)
+            )
+            self.visual_scan_heading_timeout = float(
+                rospy.get_param("~visual_scan_heading_timeout", 4.0)
+            )
+            self.visual_scan_timeout = float(
+                rospy.get_param("~visual_scan_timeout", 45.0)
+            )
+            self.visual_scan_failure_cooldown = float(
+                rospy.get_param(
+                    "~visual_scan_failure_cooldown",
+                    5.0,
+                )
+            )
+            self.visual_scan_position_dedup_radius = float(
+                rospy.get_param(
+                    "~visual_scan_position_dedup_radius", 1.0
+                )
+            )
+            self.visual_scan_route_spacing = float(
+                rospy.get_param("~visual_scan_route_spacing", 2.0)
+            )
+            self.visual_scan_target_tolerance = float(
+                rospy.get_param("~visual_scan_target_tolerance", 0.35)
+            )
+            self.visual_scan_max_heading_retries = int(
+                rospy.get_param("~visual_scan_max_heading_retries", 1)
+            )
+            self.visual_scan_update_interval = float(
+                rospy.get_param("~visual_scan_update_interval", 0.1)
+            )
+            self.visual_scan_final_before_complete = bool(
+                rospy.get_param(
+                    "~visual_scan_final_before_complete", True
+                )
+            )
+            # Keep the existing same-generation NO_FRONTIER debounce.  The
+            # visual scan gate below only delays when that debounce may start.
+            self.exploration_complete_confirmations = int(
+                rospy.get_param("~exploration_complete_confirmations", 3)
             )
             self.size_weight = float(
                 rospy.get_param("~size_weight", 1.0)
@@ -302,6 +408,31 @@ class PlanningNode:
                 self.localization_status_timeout,
             ),
             ("future_stamp_tolerance", self.future_stamp_tolerance),
+            ("visual_scan_yaw_step", self.visual_scan_yaw_step),
+            ("visual_scan_yaw_tolerance", self.visual_scan_yaw_tolerance),
+            ("visual_scan_dwell", self.visual_scan_dwell),
+            (
+                "visual_scan_heading_timeout",
+                self.visual_scan_heading_timeout,
+            ),
+            ("visual_scan_timeout", self.visual_scan_timeout),
+            (
+                "visual_scan_failure_cooldown",
+                self.visual_scan_failure_cooldown,
+            ),
+            (
+                "visual_scan_position_dedup_radius",
+                self.visual_scan_position_dedup_radius,
+            ),
+            ("visual_scan_route_spacing", self.visual_scan_route_spacing),
+            (
+                "visual_scan_target_tolerance",
+                self.visual_scan_target_tolerance,
+            ),
+            (
+                "visual_scan_update_interval",
+                self.visual_scan_update_interval,
+            ),
             (
                 "status_heartbeat_interval",
                 self.status_heartbeat_interval,
@@ -315,6 +446,18 @@ class PlanningNode:
         if self.exploration_blocked_nudge_distance < 0.0:
             raise ValueError(
                 "exploration_blocked_nudge_distance must not be negative"
+            )
+        if self.exploration_complete_confirmations < 1:
+            raise ValueError(
+                "exploration_complete_confirmations must be at least 1"
+            )
+        if self.visual_scan_max_heading_retries < 0:
+            raise ValueError(
+                "visual_scan_max_heading_retries must not be negative"
+            )
+        if self.visual_scan_failure_cooldown < 0.0:
+            raise ValueError(
+                "visual_scan_failure_cooldown must not be negative"
             )
         if self.frontier_min_size < 1:
             raise ValueError("frontier_min_size must be at least 1")
@@ -363,6 +506,17 @@ class PlanningNode:
         for name, value in positive_parameters:
             if value <= 0.0:
                 raise ValueError("{} must be positive".format(name))
+
+        if self.visual_scan_update_interval <= 0.0:
+            raise ValueError("visual_scan_update_interval must be positive")
+        if self.visual_scan_target_tolerance < 0.0:
+            raise ValueError(
+                "visual_scan_target_tolerance must not be negative"
+            )
+        if self.visual_scan_route_spacing <= 0.0:
+            raise ValueError(
+                "visual_scan_route_spacing must be positive"
+            )
 
         if self.future_stamp_tolerance < 0.0:
             raise ValueError(
@@ -462,27 +616,497 @@ class PlanningNode:
             self.active_faults.add(fault_name)
             self.generation += 1
             self.generation_start_stamp = now
+            completion_was_active = (
+                self._exploration_complete_active
+                or self._exploration_complete_streak > 0
+            )
+            self._reset_visual_coverage_locked()
             self.map_msg = None
             self.odom_msg = None
             self.map_generation = None
             self.odom_generation = None
             self.map_received_at = None
             self.odom_received_at = None
+            if completion_was_active:
+                self._publish_exploration_complete(False)
             return True
 
     def _clear_fault(self, fault_name):
         with self.lock:
             self.active_faults.discard(fault_name)
 
+    def _reset_visual_coverage_locked(self):
+        """Reset all scan bookkeeping at a mission/generation boundary."""
+        self.visual_coverage.reset()
+        self.active_exploration_target = None
+        self.visual_scan_checkpoint_path = None
+        self.visual_scan_checkpoint_goal = None
+        self.visual_scan_checkpoint_origin = None
+        self.visual_scan_final_pending = False
+        self._exploration_complete_streak = 0
+        self._exploration_complete_active = False
+
+    def _select_visual_scan_checkpoint(
+        self,
+        path_msg,
+        robot_position,
+        now,
+    ):
+        """Choose a progress checkpoint on a newly planned route.
+
+        Frontier replanning can replace a distant frontier goal before the
+        robot reaches it.  A route checkpoint keeps visual exposure tied to
+        actual motion while avoiding a scan on every grid cell.  The caller
+        preserves an existing checkpoint across ordinary replans, then
+        re-anchors it only after bounded physical progress shows that the
+        pending station was missed.  Failed scan positions are skipped while
+        their tracker-owned cooldown is active so a failed starting station
+        cannot pin the robot to the same place.
+        """
+        if not self.visual_scan_enabled or not path_msg.poses:
+            return None
+
+        # The starting station is a useful coverage point even when the
+        # first frontier route is later invalidated by map updates.  It also
+        # makes the first visual exposure independent of a long initial
+        # navigation segment.  Subsequent stations are selected by route
+        # spacing below because the tracker records this position when the
+        # episode finishes.
+        first_pose = path_msg.poses[0].pose.position
+        first_position = (float(first_pose.x), float(first_pose.y))
+        if not self.visual_coverage.scanned_positions:
+            if not self.visual_coverage.position_is_cooling_down(
+                first_position,
+                now,
+            ):
+                return first_position
+
+        previous_x = float(robot_position.x)
+        previous_y = float(robot_position.y)
+        travelled = 0.0
+        fallback = None
+        for pose_stamped in path_msg.poses:
+            current_x = float(pose_stamped.pose.position.x)
+            current_y = float(pose_stamped.pose.position.y)
+            travelled += hypot(
+                current_x - previous_x,
+                current_y - previous_y,
+            )
+            previous_x = current_x
+            previous_y = current_y
+            current = (current_x, current_y)
+            if self.visual_coverage.position_is_cooling_down(
+                current,
+                now,
+            ):
+                continue
+
+            fallback = current
+            if travelled >= self.visual_scan_route_spacing:
+                return current
+        return fallback
+
+    def _visual_checkpoint_should_reanchor_locked(self, robot_position):
+        """Return whether a missed checkpoint should be re-anchored.
+
+        A pending checkpoint is kept across ordinary map replans so route
+        vertices do not chase the robot.  If the robot has nevertheless
+        travelled one configured station spacing from the point where that
+        checkpoint was assigned, and is still not near the checkpoint, the
+        old obligation has been passed or invalidated.  Re-anchoring lets the
+        next plan establish a new, bounded visual station without treating
+        the old station as scanned.
+        """
+        if (
+            not self.visual_scan_enabled
+            or self.active_exploration_target is None
+            or self.visual_scan_checkpoint_origin is None
+        ):
+            return False
+
+        origin_x, origin_y = self.visual_scan_checkpoint_origin
+        progress = hypot(
+            float(robot_position.x) - origin_x,
+            float(robot_position.y) - origin_y,
+        )
+        distance_to_checkpoint = hypot(
+            float(robot_position.x) - self.active_exploration_target[0],
+            float(robot_position.y) - self.active_exploration_target[1],
+        )
+        return (
+            progress >= self.visual_scan_route_spacing
+            and distance_to_checkpoint > self.visual_scan_target_tolerance
+        )
+
+    @staticmethod
+    def _checkpoint_route(path_msg, checkpoint):
+        """Return a route prefix ending at the selected scan checkpoint.
+
+        The checkpoint is selected from ``path_msg`` itself, so the nearest
+        pose is the route vertex the planner intended to use.  Truncating the
+        route makes the follower stop at the station instead of driving past
+        it while the planner waits for its next timer tick.
+        """
+        if not path_msg.poses or checkpoint is None:
+            return None, None
+
+        checkpoint_x, checkpoint_y = checkpoint
+        checkpoint_index = min(
+            range(len(path_msg.poses)),
+            key=lambda index: hypot(
+                path_msg.poses[index].pose.position.x - checkpoint_x,
+                path_msg.poses[index].pose.position.y - checkpoint_y,
+            ),
+        )
+        route = copy.deepcopy(path_msg)
+        route.poses = route.poses[: checkpoint_index + 1]
+        if not route.poses:
+            return None, None
+        goal = copy.deepcopy(route.poses[-1])
+        return route, goal
+
+    @staticmethod
+    def _restamp_path_and_goal(path_msg, goal_msg, stamp):
+        """Refresh a held route without changing its geometry."""
+        path = copy.deepcopy(path_msg)
+        goal = copy.deepcopy(goal_msg)
+        path.header.stamp = stamp
+        goal.header.stamp = stamp
+        for pose in path.poses:
+            pose.header.stamp = stamp
+        return path, goal
+
+    def _exploration_target_reached_locked(self, robot_position):
+        """Return whether the current planner target is within scan range."""
+        if self.active_exploration_target is None:
+            return False
+        return (
+            hypot(
+                robot_position.x - self.active_exploration_target[0],
+                robot_position.y - self.active_exploration_target[1],
+            )
+            <= self.visual_scan_target_tolerance
+        )
+
+    def _handle_reached_exploration_target(self, odom_msg):
+        """Start one scan when the current frontier target was reached."""
+        with self.lock:
+            if self.visual_coverage.active:
+                return True
+            if self.active_exploration_target is None:
+                return False
+
+            robot = odom_msg.pose.pose.position
+            if not self._exploration_target_reached_locked(robot):
+                return False
+
+            event = self.visual_coverage.start(
+                (robot.x, robot.y),
+                quaternion_to_yaw(odom_msg.pose.pose.orientation),
+                rospy.Time.now().to_sec(),
+            )
+            if event.kind == SCAN_COOLDOWN:
+                rospy.loginfo_throttle(
+                    5.0,
+                    "planning_node: visual scan retry cooldown active at "
+                    "(%.2f, %.2f); continuing frontier exploration",
+                    robot.x,
+                    robot.y,
+                )
+                self.active_exploration_target = None
+                self.visual_scan_checkpoint_path = None
+                self.visual_scan_checkpoint_goal = None
+                self.visual_scan_checkpoint_origin = None
+                return False
+
+            if event.kind == SCAN_SKIPPED:
+                rospy.loginfo(
+                    "planning_node: visual scan skipped at nearby covered "
+                    "target (%.2f, %.2f)",
+                    robot.x,
+                    robot.y,
+                )
+                self.active_exploration_target = None
+                self.visual_scan_checkpoint_path = None
+                self.visual_scan_checkpoint_goal = None
+                self.visual_scan_checkpoint_origin = None
+                return False
+
+            self.visual_scan_checkpoint_origin = None
+            self.visual_scan_checkpoint_path = None
+            self.visual_scan_checkpoint_goal = None
+            self.visual_scan_final_pending = False
+            self._clear_exploration_complete()
+            self._publish_visual_scan_heading_locked(event, odom_msg)
+            return True
+
+    def _start_final_visual_scan_if_needed(
+        self,
+        odom_msg,
+        expected_generation=None,
+        mission_epoch=None,
+    ):
+        """Start a last bounded scan before accepting no-frontier completion."""
+        if not self.visual_scan_final_before_complete:
+            return False
+
+        with self.lock:
+            if self.visual_coverage.active:
+                return True
+            if (
+                expected_generation is not None
+                and (
+                    self.generation != expected_generation
+                    or self.map_generation != expected_generation
+                    or self.odom_generation != expected_generation
+                    or (
+                        mission_epoch is not None
+                        and self.mission_epoch != mission_epoch
+                    )
+                )
+            ):
+                return False
+
+            robot = odom_msg.pose.pose.position
+            if self.active_exploration_target is not None:
+                distance = hypot(
+                    robot.x - self.active_exploration_target[0],
+                    robot.y - self.active_exploration_target[1],
+                )
+                if distance > self.visual_scan_target_tolerance:
+                    rospy.loginfo(
+                        "planning_node: no frontier before route visual "
+                        "checkpoint (%.2f m away); using final scan at "
+                        "current position",
+                        distance,
+                    )
+
+            event = self.visual_coverage.start(
+                (robot.x, robot.y),
+                quaternion_to_yaw(odom_msg.pose.pose.orientation),
+                rospy.Time.now().to_sec(),
+            )
+            if event.kind == SCAN_COOLDOWN:
+                self.active_exploration_target = None
+                self.visual_scan_checkpoint_path = None
+                self.visual_scan_checkpoint_goal = None
+                self.visual_scan_checkpoint_origin = None
+                self.visual_scan_final_pending = True
+                self._clear_exploration_complete()
+
+                detail = (
+                    "final visual scan retry cooldown active; "
+                    "coverage remains pending"
+                )
+                rospy.logwarn_throttle(
+                    5.0,
+                    "planning_node: %s",
+                    detail,
+                )
+                self._invalidate_plan_locked(
+                    ModuleStatus.BLOCKED,
+                    0.0,
+                    detail,
+                )
+                return True
+
+            if event.kind == SCAN_SKIPPED:
+                self.active_exploration_target = None
+                self.visual_scan_checkpoint_path = None
+                self.visual_scan_checkpoint_goal = None
+                self.visual_scan_checkpoint_origin = None
+                return False
+
+            self.active_exploration_target = None
+            self.visual_scan_checkpoint_path = None
+            self.visual_scan_checkpoint_goal = None
+            self.visual_scan_checkpoint_origin = None
+            self.visual_scan_final_pending = True
+            self._clear_exploration_complete()
+            self._publish_visual_scan_heading_locked(event, odom_msg)
+            return True
+
+    def visual_scan_callback(self, _event):
+        """Advance an active scan without blocking the planner timer."""
+        with self.lock:
+            if not self.visual_coverage.active or self.returning:
+                return
+            if self.odom_msg is None:
+                return
+
+            odom_msg = self.odom_msg
+            current_yaw = quaternion_to_yaw(odom_msg.pose.pose.orientation)
+
+            # Remember whether this is the mandatory final scan used to gate
+            # exploration_complete.  The tracker becomes inactive when an
+            # episode ends, so this obligation must be captured beforehand.
+            final_scan_was_pending = self.visual_scan_final_pending
+
+            event = self.visual_coverage.update(
+                current_yaw,
+                rospy.Time.now().to_sec(),
+            )
+
+            if event.kind in (
+                SCAN_STARTED,
+                SCAN_NEXT_HEADING,
+                SCAN_RETRY_HEADING,
+            ) and self.visual_coverage.active:
+                self._publish_visual_scan_heading_locked(event, odom_msg)
+                return
+
+            if event.kind == SCAN_HEADING_REACHED:
+                rospy.loginfo(
+                    "planning_node: visual scan heading %d/%d reached; "
+                    "dwelling %.2f s",
+                    event.heading_index + 1,
+                    event.heading_count,
+                    self.visual_scan_dwell,
+                )
+                return
+
+            heading_timeout = event.kind == SCAN_HEADING_TIMEOUT
+
+            self.active_exploration_target = None
+            self.visual_scan_checkpoint_path = None
+            self.visual_scan_checkpoint_goal = None
+            self.visual_scan_checkpoint_origin = None
+
+            if event.kind == SCAN_COMPLETE:
+                # Only an explicitly completed episode satisfies the final
+                # visual-coverage gate.
+                self.visual_scan_final_pending = False
+                rospy.loginfo(
+                    "planning_node: visual scan complete (%d headings); "
+                    "resuming frontier exploration",
+                    event.heading_count,
+                )
+                detail = (
+                    "visual scan complete; resuming frontier exploration"
+                )
+                self.last_status = (
+                    ModuleStatus.RUNNING,
+                    True,
+                    0.8,
+                    detail,
+                )
+                self._publish_status_message_locked(
+                    ModuleStatus.RUNNING,
+                    True,
+                    0.8,
+                    detail,
+                )
+                return
+
+            if event.kind == SCAN_TIMEOUT or heading_timeout:
+                # A failed scan must never be converted into coverage.  If it
+                # was the mandatory final scan, retain the pending obligation
+                # so the no-frontier debounce cannot publish completion.
+                self.visual_scan_final_pending = final_scan_was_pending
+                self._clear_exploration_complete()
+
+                if event.kind == SCAN_TIMEOUT:
+                    state = ModuleStatus.TIMEOUT
+                    reason = "visual scan timed out"
+                else:
+                    state = ModuleStatus.BLOCKED
+                    reason = "visual scan heading timed out"
+
+                detail = (
+                    "{}; coverage was not recorded; "
+                    "a new scan is required"
+                ).format(reason)
+
+                rospy.logwarn("planning_node: %s", detail)
+                self._invalidate_plan_locked(
+                    state,
+                    0.0,
+                    detail,
+                )
+                return
+
+    def _publish_visual_scan_heading_locked(self, event, odom_msg):
+        """Publish a stationary two-pose path for the current scan heading."""
+        target_yaw = self.visual_coverage.current_heading
+        if target_yaw is None:
+            return
+
+        robot = odom_msg.pose.pose.position
+        current_yaw = quaternion_to_yaw(odom_msg.pose.pose.orientation)
+        stamp = rospy.Time.now()
+        first_pose = self.make_world_pose(
+            robot.x,
+            robot.y,
+            current_yaw,
+            stamp,
+        )
+        target_pose = self.make_world_pose(
+            robot.x,
+            robot.y,
+            target_yaw,
+            stamp,
+        )
+        path_msg = Path()
+        path_msg.header.stamp = stamp
+        path_msg.header.frame_id = WORLD_FRAME
+        path_msg.poses = [first_pose, target_pose]
+        goal_msg = copy.deepcopy(target_pose)
+
+        self.goal_pub.publish(goal_msg)
+        self.path_pub.publish(path_msg)
+        # The tracker may advance to the next heading when a previous one
+        # times out. Use the tracker state for the published/logged target,
+        # rather than the transition event's old heading index.
+        heading_index = self.visual_coverage.heading_index
+        heading_count = self.visual_coverage.heading_count
+        detail = (
+            "visual scan heading {}/{}; target_yaw={:.3f}; "
+            "position=({:.2f}, {:.2f}); event={}"
+        ).format(
+            heading_index + 1,
+            heading_count,
+            target_yaw,
+            robot.x,
+            robot.y,
+            event.kind,
+        )
+        self.last_status = (ModuleStatus.RUNNING, True, 0.8, detail)
+        self._publish_status_message_locked(
+            ModuleStatus.RUNNING,
+            True,
+            0.8,
+            detail,
+            stamp=stamp,
+        )
+
+    @staticmethod
+    def make_world_pose(x, y, pose_yaw, stamp):
+        """Create a world-frame pose without snapping to a map cell."""
+        pose = PoseStamped()
+        pose.header.stamp = stamp
+        pose.header.frame_id = WORLD_FRAME
+        pose.pose.position.x = x
+        pose.pose.position.y = y
+        pose.pose.position.z = 0.0
+        pose.pose.orientation.z = sin(pose_yaw / 2.0)
+        pose.pose.orientation.w = cos(pose_yaw / 2.0)
+        return pose
+
     def competition_state_callback(self, msg):
         """Switch planner mode using the existing competition state topic."""
         target_returning = msg.state == CompetitionStateMsg.RETURNING
+        completion_was_active = False
         with self.lock:
             if target_returning == self.returning:
                 return
             self.returning = target_returning
             self.mission_state = msg.state
             self.mission_epoch += 1
+            completion_was_active = (
+                self._exploration_complete_active
+                or self._exploration_complete_streak > 0
+            )
+            self._reset_visual_coverage_locked()
             if target_returning:
                 self._load_return_start_pose_locked()
                 self.return_committed_path = None
@@ -504,6 +1128,8 @@ class PlanningNode:
                     0.0,
                     "mission state changed; waiting for exploration plan",
                 )
+        if completion_was_active:
+            self._publish_exploration_complete(False)
 
     def stuck_callback(self, msg):
         """Drop the committed RETURNING route once when the follower is wedged.
@@ -1254,6 +1880,19 @@ class PlanningNode:
                     "got {!r}".format(child_frame)
                 )
 
+            # A successful frontier route is followed by a planner-local
+            # visual scan at the reached target.  While a scan is active its
+            # dedicated timer owns the path; normal frontier replanning must
+            # not replace an in-progress heading sequence.
+            if not returning:
+                if self._handle_reached_exploration_target(
+                    odom_msg,
+                ):
+                    return
+                with self.lock:
+                    if self.visual_coverage.active:
+                        return
+
             self.plan_and_publish(
                 map_msg,
                 odom_msg,
@@ -1391,6 +2030,32 @@ class PlanningNode:
             )
 
         if result["status"] == PLAN_NO_FRONTIER:
+            if not returning:
+                # A no-frontier snapshot is not enough to finish while the
+                # current location still needs its final visual exposure.
+                # The scan is started before the normal negative result is
+                # committed, so the active rotation path remains available
+                # to Control.
+                if self._start_final_visual_scan_if_needed(
+                    odom_msg,
+                    expected_generation=expected_generation,
+                    mission_epoch=mission_epoch,
+                ):
+                    return
+                with self.lock:
+                    target_pending = (
+                        self.active_exploration_target is not None
+                        and not self._exploration_target_reached_locked(
+                            odom_msg.pose.pose.position
+                        )
+                    )
+                if target_pending:
+                    rospy.logwarn_throttle(
+                        5.0,
+                        "planning_node: delaying no-frontier completion "
+                        "until the active exploration target is reached",
+                    )
+                    return
             if returning:
                 detail = "RETURNING: no return frontier/map goal available"
             else:
@@ -1405,6 +2070,11 @@ class PlanningNode:
             )
             if committed:
                 rospy.loginfo_throttle(5.0, detail)
+                if not returning:
+                    self._record_exploration_complete(
+                        expected_generation,
+                        mission_epoch,
+                    )
             return
 
         if result["status"] == PLAN_UNREACHABLE:
@@ -1463,6 +2133,9 @@ class PlanningNode:
             raise ValueError(
                 "unknown planning status: {}".format(result["status"])
             )
+
+        if not returning:
+            self._clear_exploration_complete()
 
         output_path = (
             compress_collinear_path(result["path"])
@@ -1560,11 +2233,127 @@ class PlanningNode:
                     )
                     return
 
-                # The final check and all three output publications are one
+                # The final check and all output publications are one
                 # lock-protected commit. An invalidating callback can only
                 # publish after this block, so an old path cannot revive.
-                self.goal_pub.publish(goal_msg)
-                self.path_pub.publish(path_msg)
+                published_path = path_msg
+                published_goal = goal_msg
+                published_stamp = stamp
+                if not returning:
+                    # A checkpoint is a visual-coverage obligation for this
+                    # generation, not a copy of the latest frontier route.
+                    # Map replanning can move nearby route vertices by more
+                    # than target tolerance while the robot is still
+                    # approaching the same area.  Replacing the obligation on
+                    # every such update makes the target chase the robot and
+                    # prevents the scan from ever starting.  Keep it until
+                    # the robot reaches it, a scan handles it, or reset()
+                    # clears the generation.
+                    reanchored_checkpoint = False
+                    if self._visual_checkpoint_should_reanchor_locked(
+                        robot_position
+                    ):
+                        previous_checkpoint = (
+                            self.active_exploration_target
+                        )
+                        self.active_exploration_target = None
+                        self.visual_scan_checkpoint_path = None
+                        self.visual_scan_checkpoint_goal = None
+                        self.visual_scan_checkpoint_origin = None
+                        reanchored_checkpoint = True
+                        rospy.logwarn(
+                            "planning_node: re-anchoring missed visual "
+                            "scan checkpoint (%.2f, %.2f) after %.2f m "
+                            "of progress",
+                            previous_checkpoint[0],
+                            previous_checkpoint[1],
+                            self.visual_scan_route_spacing,
+                        )
+
+                    # If a checkpoint is pending, keep the planner-generated
+                    # route prefix that reaches it.  Refreshing the same
+                    # geometry keeps path_follower's progress monotonic while
+                    # still allowing the normal map/localization watchdogs to
+                    # invalidate the route.  The prefix is deliberately
+                    # bounded by the checkpoint, so the robot cannot pass a
+                    # station before the next planner tick can start its
+                    # scan.
+                    if (
+                        self.active_exploration_target is not None
+                        and self.visual_scan_checkpoint_path is not None
+                    ):
+                        (
+                            published_path,
+                            published_goal,
+                        ) = self._restamp_path_and_goal(
+                            self.visual_scan_checkpoint_path,
+                            self.visual_scan_checkpoint_goal,
+                            commit_now,
+                        )
+                        published_stamp = commit_now
+                        detail += " visual_scan_checkpoint_path_held"
+                    else:
+                        if reanchored_checkpoint:
+                            # The robot has made real bounded progress but
+                            # missed the old route vertex.  Use its current
+                            # formal odometry pose as the next visual station
+                            # instead of selecting another possibly stale
+                            # route vertex behind the robot.
+                            self.active_exploration_target = (
+                                float(robot_position.x),
+                                float(robot_position.y),
+                            )
+                            self.visual_scan_checkpoint_origin = (
+                                float(robot_position.x),
+                                float(robot_position.y),
+                            )
+                        elif self.active_exploration_target is None:
+                            self.active_exploration_target = (
+                                self._select_visual_scan_checkpoint(
+                                    path_msg,
+                                    robot_position,
+                                    commit_now.to_sec(),
+                                )
+                            )
+                            if self.active_exploration_target is not None:
+                                self.visual_scan_checkpoint_origin = (
+                                    float(robot_position.x),
+                                    float(robot_position.y),
+                                )
+
+                        if self.active_exploration_target is not None:
+                            (
+                                self.visual_scan_checkpoint_path,
+                                self.visual_scan_checkpoint_goal,
+                            ) = self._checkpoint_route(
+                                path_msg,
+                                self.active_exploration_target,
+                            )
+                            if self.visual_scan_checkpoint_path is not None:
+                                published_path = (
+                                    self.visual_scan_checkpoint_path
+                                )
+                                published_goal = (
+                                    self.visual_scan_checkpoint_goal
+                                )
+                                detail += (
+                                    " visual_scan_checkpoint_path={};"
+                                ).format(
+                                    len(published_path.poses),
+                                )
+                    if self.active_exploration_target is not None:
+                        detail += (
+                            " visual_scan_checkpoint=({}, {})"
+                        ).format(
+                            round(self.active_exploration_target[0], 2),
+                            round(self.active_exploration_target[1], 2),
+                        )
+                    if reanchored_checkpoint:
+                        detail += " visual_scan_checkpoint_reanchored"
+                    self.visual_scan_final_pending = False
+
+                self.goal_pub.publish(published_goal)
+                self.path_pub.publish(published_path)
                 self.last_status = (
                     ModuleStatus.RUNNING,
                     True,
@@ -1576,7 +2365,7 @@ class PlanningNode:
                     True,
                     1.0,
                     detail,
-                    stamp=stamp,
+                    stamp=published_stamp,
                 )
                 if (
                     returning
@@ -1809,6 +2598,61 @@ class PlanningNode:
             stamp=stamp,
         )
         return detail
+
+    # ------------------------------------------------------------------
+    # Structured exploration-complete signal
+    # ------------------------------------------------------------------
+
+    def _publish_exploration_complete(self, value):
+        """Publish the planner-owned exploration-complete condition."""
+        msg = Bool()
+        msg.data = bool(value)
+        self.exploration_complete_pub.publish(msg)
+
+    def _record_exploration_complete(self, expected_generation, mission_epoch):
+        """Confirm consecutive current no-frontier results after all scans."""
+        should_publish = False
+        with self.lock:
+            if (
+                self.returning
+                or self.visual_coverage.active
+                or self.visual_scan_final_pending
+                or self.generation != expected_generation
+                or self.map_generation != expected_generation
+                or self.odom_generation != expected_generation
+                or (
+                    mission_epoch is not None
+                    and self.mission_epoch != mission_epoch
+                )
+            ):
+                return
+            self._exploration_complete_streak += 1
+            if (
+                not self._exploration_complete_active
+                and self._exploration_complete_streak
+                >= self.exploration_complete_confirmations
+            ):
+                self._exploration_complete_active = True
+                should_publish = True
+        if should_publish:
+            rospy.loginfo(
+                "planning_node: exploration complete after %d consecutive "
+                "no-frontier results and completed visual coverage",
+                self.exploration_complete_confirmations,
+            )
+            self._publish_exploration_complete(True)
+
+    def _clear_exploration_complete(self):
+        """Withdraw completion evidence after progress or a pending scan."""
+        with self.lock:
+            was_active = (
+                self._exploration_complete_active
+                or self._exploration_complete_streak > 0
+            )
+            self._exploration_complete_active = False
+            self._exploration_complete_streak = 0
+        if was_active:
+            self._publish_exploration_complete(False)
 
     @staticmethod
     def make_pose(

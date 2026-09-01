@@ -105,9 +105,60 @@ Planning 分别检查：
 | `~localization_status_timeout` | `3.0` | Localization status 超时（秒） |
 | `~future_stamp_tolerance` | `0.5` | 未来时间戳容差（秒） |
 | `~status_heartbeat_interval` | `1.0` | Planning status heartbeat 周期（秒） |
+| `~exploration_complete_confirmations` | `3` | 连续同一 generation 的无 Frontier 结果确认探索完成的次数 |
+| `~visual_scan_enabled` | `true` | 是否在新探索目标处执行 bounded active visual scan |
+| `~visual_scan_yaw_step` | `0.7853981634` | 扫描 heading 间隔（弧度，默认 45°） |
+| `~visual_scan_yaw_tolerance` | `0.15` | heading 到达容差（弧度） |
+| `~visual_scan_dwell` | `0.6` | 每个 heading 到达后的观察停留时间（秒） |
+| `~visual_scan_heading_timeout` | `4.0` | 单个 heading 的到达超时（秒） |
+| `~visual_scan_timeout` | `45.0` | 整个 scan episode 的最大时间（秒） |
+| `~visual_scan_failure_cooldown` | `5.0` | 同一失败位置再次执行视觉扫描前的冷却时间（秒） |
+| `~visual_scan_position_dedup_radius` | `1.0` | 已扫描位置的 2D 去重半径（米） |
+| `~visual_scan_route_spacing` | `2.0` | 沿 frontier route 选择视觉扫描 checkpoint 的最小间距（米） |
+| `~visual_scan_target_tolerance` | `0.35` | 判断探索目标已到达的距离容差（米） |
+| `~visual_scan_max_heading_retries` | `1` | 单个 heading 的有限重试次数 |
+| `~visual_scan_update_interval` | `0.1` | 非阻塞 scan 状态机更新周期（秒） |
+| `~visual_scan_final_before_complete` | `true` | 无 Frontier 时是否先执行当前位置 final scan |
 
 `localization_timeout` 按 Localization 跟进说明暂时保留为可配置默认值 `5.0`，待真实 Mapping → Planning → Control 联调后再统一调整。
 
+## Active visual coverage
+
+Frontier 是地图覆盖信号，不代表 RGB-D 相机已经覆盖了房间内部。探索模式下，
+Planner 会先把首个 route 的首个自由位姿作为初始搜索 station；之后在新的 route 上
+选择间隔至少为 `visual_scan_route_spacing` 的 checkpoint，机器人实际到达 checkpoint
+后进入内部 `VISUAL_SCAN` 子状态；若后续 route 短于该间隔则使用 route 终点。
+checkpoint 一旦为当前 generation 选定，就保持到机器人实际到达并处理该位置，或
+generation/reset 清除它；地图重规划不会用抖动的 route 顶点替换尚未完成的视觉义务。
+同时只发布到该 checkpoint 为止的 planner 路径前缀，并在重规划时刷新时间戳而保持几何
+不变，避免 follower 反复重置路径进度。若机器人已经从 checkpoint 分配位置实际前进
+至少一个 route-spacing 且仍未到达，则当前正式 odometry 位置会作为下一视觉站重新锚定，
+而旧位置不会被标记为已扫描，避免控制器/定位偏差造成永久等待。
+以当前位姿为中心发布一组同位置、不同 yaw 的短路径点。默认以 45° 间隔
+覆盖 360°，每个 heading 到达后停留 0.6 秒；状态机由 timer 驱动，不阻塞规划
+callback。每个 heading 和整个 episode 都有超时。任一必要 heading 在有限重试后
+仍未到达，或整个 episode 超时，本轮扫描立即失败且不记录该位置的视觉覆盖；后续规划
+可重新尝试该位置，避免扫描形成新的死锁或产生虚假的完整覆盖。
+
+扫描位置以 2D 半径去重，附近目标不会反复触发完整扫描。若 Frontier 突然为空，
+Planner 会先尝试一次当前位置的 final scan；只有该 scan 的全部 heading 均实际
+到达并完成 dwell，且连续达到 `exploration_complete_confirmations` 次同 generation 的 `NO_FRONTIER`
+结果后，才锁存 `/competition/planning/exploration_complete=true`。新 generation
+或任务状态切换会清空扫描位置、当前 episode 和 completion debounce。
+
+扫描期间 `/competition/planning/status` 仍为 `RUNNING, valid=true`。Planner 不
+读取危险源位置、Gazebo 真值或隐藏场景信息。Control 通过同位置连续 Path pose
+识别 rotation-only waypoint 并执行原地 yaw；普通位置路径仍使用原有跟踪规则。
+
+
+失败位置冷却语义：任何必需 heading 未完成时，该位置不会被记录为已覆盖。
+同一位置在 `visual_scan_failure_cooldown` 时间内不会立即重复旋转。普通
+checkpoint 选择时会跳过仍在冷却区域内的首个 pose 和后续 route candidate，
+优先沿 Frontier route 选择更远的视觉站；若整条当前 route 都没有合适的
+checkpoint，则暂时不设置视觉站，直接继续发布正常 Frontier path。强制
+final scan 则保持空 Path、`planning/status.valid=false` 和未完成状态，冷却
+结束后才允许重新扫描。该机制避免普通扫描失败造成原地重复重试，也防止失败
+的 final scan 被误判为探索完成。
 ## 当前已实现
 
 - [x] 四个正式输入话题接入
@@ -129,13 +180,16 @@ Planning 分别检查：
 - [x] 障碍物膨胀与机器人起点安全恢复
 - [x] 路径方向四元数计算
 - [x] 区分探索完成与暂时不可达
+- [x] 新探索目标处的 bounded active visual scan
+- [x] 扫描位置去重、heading dwell、有限超时和 generation reset
+- [x] final visual scan gate 与去抖后的 exploration_complete
 
 ## 状态语义
 
 | 场景 | state | valid | Path |
 |---|---:|---:|---|
 | 等待 status 或当前 generation 数据 | `STARTING` | `false` | 空 |
-| 生成当前可执行路径 | `RUNNING` | `true` | 非空 |
+| 生成当前可执行路径或执行 visual scan | `RUNNING` | `true` | 非空 |
 | 没有 Frontier、探索完成 | `SUCCEEDED` | `false` | 空 |
 | 上游 invalid 或 Frontier 不可达 | `BLOCKED` | `false` | 空 |
 | status、Map 或 Odometry 超时 | `TIMEOUT` | `false` | 空 |
@@ -146,7 +200,7 @@ Planning 分别检查：
 ### 无 ROS 单元测试
 
 ```text
-Ran 68 tests
+Ran 140 tests
 OK
 ```
 
@@ -157,7 +211,9 @@ python3 -m unittest discover \
   -v
 ```
 
-覆盖 Frontier、坐标转换、单源 BFS、多候选回退、障碍膨胀、状态区分、路径方向以及 20×36 m 和 400×400 地图性能。
+覆盖 Frontier、坐标转换、单源 BFS、多候选回退、障碍膨胀、状态区分、路径方向、
+active visual coverage 的 heading/dwell/timeout/去重/route checkpoint/completion gate，以及 20×36 m
+和 400×400 地图性能。
 
 ### ROS 契约集成测试
 
@@ -187,7 +243,7 @@ rostest competition_planning planning_node_ros.test --text
 - [ ] 与 Control 验证 Path 替换、空 Path 和 `valid=false` 停车
 - [ ] 验证定位跳变、短时丢失和动态重规划
 - [ ] 验证真实 ROS `/clock` 回退场景
-- [ ] 验证 20×36 m 场景覆盖率
+- [ ] 验证 20×36 m 场景覆盖率和真实 RGB-D 视觉覆盖率
 - [ ] 实现多楼层、电梯和返回起点策略
 
 ## 禁止事项

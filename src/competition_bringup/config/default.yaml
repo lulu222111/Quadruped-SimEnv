@@ -44,6 +44,21 @@ planning:
   localization_status_timeout: 3.0
   future_stamp_tolerance: 0.5
   status_heartbeat_interval: 1.0
+  exploration_complete_confirmations: 3
+  # Bounded active visual coverage at each newly reached exploration target.
+  visual_scan_enabled: true
+  visual_scan_yaw_step: 0.7853981634       # 45 deg; overlap for ~60 deg RGB-D FoV
+  visual_scan_yaw_tolerance: 0.15          # radians
+  visual_scan_dwell: 0.6                   # seconds per heading
+  visual_scan_heading_timeout: 4.0         # seconds, before one retry/skip
+  visual_scan_timeout: 45.0                # whole scan bound
+  visual_scan_failure_cooldown: 5.0        # seconds before retry at failed position
+  visual_scan_position_dedup_radius: 1.0   # metres
+  visual_scan_route_spacing: 2.0            # route checkpoint spacing (m)
+  visual_scan_target_tolerance: 0.35       # metres
+  visual_scan_max_heading_retries: 1
+  visual_scan_update_interval: 0.1
+  visual_scan_final_before_complete: true
 
 # --- Localization ---
 localization:

@@ -110,6 +110,12 @@ control_enabled     emergency_stop
 * 收到新 Path 时先使旧 Path 失效，再校验和缓存新 Path。
 * 新 Path 合法后，根据机器人当前位置跳过已经处于
   `goal_tolerance` 内的起始航点。
+* Planning 的 active visual scan 使用两个连续的同位置 Pose：第一个是当前
+  朝向，第二个只改变 `PoseStamped.orientation`。该显式 rotation-only waypoint
+  不要求前进，PathFollower 只发布有界角速度，达到
+  `orientation_tolerance` 后再继续下一个航点。
+* 普通位置路径仍按位置误差计算目标朝向，不因 Pose orientation 存在而改变原有
+  前进跟踪语义。
 * 正常跟踪时报告 `RUNNING, valid=true`。
 * 到达全部航点后输出零速度并报告
   `SUCCEEDED, valid=true`。
@@ -230,6 +236,7 @@ Guard 同时维护本地 generation 与 raw/status generation。PathFollower
 | `~max_linear`                  | `0.25` | 最大前进速度（m/s）                 |
 | `~max_angular`                 |  `0.8` | 最大角速度（rad/s）                |
 | `~goal_tolerance`              |  `0.2` | 航点到达容差（m）                   |
+| `~orientation_tolerance`       | `0.15` | rotation-only waypoint 的 yaw 到达容差（弧度） |
 | `~path_timeout`                |  `5.0` | Path 接收超时（s）                |
 | `~odom_timeout`                |  `1.0` | Odom 接收超时（s）                |
 | `~planning_status_timeout`     |  `3.0` | Planning status 接收超时（s）     |

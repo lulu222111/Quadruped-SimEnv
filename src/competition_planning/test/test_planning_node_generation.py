@@ -12,6 +12,7 @@ directory next to this file.
 import importlib.machinery
 import importlib.util
 import json
+import math
 import sys
 import tempfile
 import types
@@ -362,6 +363,23 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
         return msg
 
     @staticmethod
+    def _make_fully_known_map(stamp):
+        msg = FakeOccupancyGrid()
+        msg.header.stamp = FakeTime(stamp)
+        msg.header.frame_id = "world"
+        msg.info.resolution = 1.0
+        msg.info.width = 5
+        msg.info.height = 5
+        msg.data = [0] * 25
+        return msg
+
+    @staticmethod
+    def _set_odom_yaw(msg, yaw):
+        msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        return msg
+
+    @staticmethod
     def _make_status(valid, stamp, detail="test"):
         msg = FakeModuleStatus()
         msg.header.stamp = FakeTime(stamp)
@@ -401,6 +419,666 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
 
     def test_start_recovery_parameter_defaults_disabled(self):
         self.assertEqual(self.node.start_recovery_radius_cells, 0)
+
+    def test_new_reached_target_starts_stationary_visual_scan(self):
+        self.node.active_exploration_target = (2.5, 2.5)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+
+        self.assertTrue(self.node._handle_reached_exploration_target(odom))
+        self.assertTrue(self.node.visual_coverage.active)
+        path = self._last_path()
+        self.assertEqual(len(path.poses), 2)
+        self.assertAlmostEqual(path.poses[0].pose.position.x, 2.5)
+        self.assertAlmostEqual(path.poses[1].pose.position.x, 2.5)
+        self.assertAlmostEqual(path.poses[0].pose.position.y, 2.5)
+        self.assertAlmostEqual(path.poses[1].pose.position.y, 2.5)
+        self.assertEqual(self._last_status_msg().state, FakeModuleStatus.RUNNING)
+        self.assertTrue(self._last_status_msg().valid)
+
+    def test_planner_target_reached_via_callback_starts_scan(self):
+        """The real plan callback, rather than a helper call, owns the trigger."""
+        self._publish_healthy_generation(100.0)
+        initial_path = self._last_path()
+        self.assertIsNotNone(initial_path)
+        self.assertGreater(len(initial_path.poses), 0)
+
+        checkpoint = self.node.active_exploration_target
+        self.assertIsNotNone(checkpoint)
+        odom = self._make_odom(100.3)
+        odom.pose.pose.position.x = checkpoint[0]
+        odom.pose.pose.position.y = checkpoint[1]
+        set_clock(100.4)
+        self.node.odom_callback(odom)
+        self.node.plan_callback(None)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        scan_path = self._last_path()
+        self.assertEqual(len(scan_path.poses), 2)
+        self.assertAlmostEqual(
+            scan_path.poses[0].pose.position.x,
+            scan_path.poses[1].pose.position.x,
+        )
+        self.assertAlmostEqual(
+            scan_path.poses[0].pose.position.y,
+            scan_path.poses[1].pose.position.y,
+        )
+
+    def test_route_checkpoint_uses_spacing_not_every_grid_cell(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5, 4.0, 4.5):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        robot = self._make_odom(100.1).pose.pose.position
+        self.node.visual_scan_route_spacing = 2.0
+        self.node.visual_coverage.scanned_positions = [(0.0, 0.0)]
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            100.1,
+        )
+        self.assertEqual(checkpoint, (4.5, 2.5))
+
+    def test_first_route_checkpoint_anchors_initial_search_station(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5, 4.0):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        robot = self._make_odom(100.1).pose.pose.position
+        self.node.visual_scan_route_spacing = 2.0
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            100.1,
+        )
+        self.assertEqual(checkpoint, (2.5, 2.5))
+
+    def test_checkpoint_selector_skips_cooling_down_start_pose(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5, 4.0, 4.5):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        now = 100.1
+        robot = self._make_odom(now).pose.pose.position
+        self.node.visual_coverage.failed_position = (2.5, 2.5)
+        self.node.visual_coverage.retry_not_before = now + 5.0
+
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            now,
+        )
+
+        self.assertIsNotNone(checkpoint)
+        self.assertNotEqual(checkpoint, (2.5, 2.5))
+        self.assertFalse(
+            self.node.visual_coverage.position_is_cooling_down(
+                checkpoint,
+                now,
+            )
+        )
+        self.assertGreater(checkpoint[0], 2.5)
+
+    def test_checkpoint_selector_returns_none_when_route_is_inside_cooldown(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.4):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        now = 100.1
+        robot = self._make_odom(now).pose.pose.position
+        self.node.visual_coverage.failed_position = (2.5, 2.5)
+        self.node.visual_coverage.retry_not_before = now + 5.0
+
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            now,
+        )
+
+        self.assertIsNone(checkpoint)
+
+    def test_short_route_checkpoint_falls_back_to_route_endpoint(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        robot = self._make_odom(100.1).pose.pose.position
+        self.node.visual_scan_route_spacing = 2.0
+        self.node.visual_coverage.scanned_positions = [(0.0, 0.0)]
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            100.1,
+        )
+        self.assertEqual(checkpoint, (3.5, 2.5))
+
+    def test_failed_initial_checkpoint_cooldown_allows_frontier_progress(self):
+        self.node.visual_coverage = PLANNING_NODE.VisualCoverageTracker(
+            enabled=True,
+            yaw_step=math.pi / 2.0,
+            yaw_tolerance=0.05,
+            dwell=0.0,
+            heading_timeout=0.05,
+            scan_timeout=20.0,
+            position_dedup_radius=1.0,
+            max_heading_retries=0,
+            failure_cooldown=5.0,
+        )
+        self.node.visual_scan_dwell = 0.0
+
+        self._publish_healthy_generation(100.0)
+        initial_path = self._last_path()
+        self.assertIsNotNone(initial_path)
+        self.assertGreater(len(initial_path.poses), 0)
+        failed_checkpoint = self.node.active_exploration_target
+        self.assertEqual(failed_checkpoint, (2.5, 2.5))
+
+        # The real planning callback reaches the initially selected station
+        # and starts a normal (non-final) visual scan.
+        reached = self._make_odom(100.3)
+        reached.pose.pose.position.x = failed_checkpoint[0]
+        reached.pose.pose.position.y = failed_checkpoint[1]
+        set_clock(100.4)
+        self.node.odom_callback(reached)
+        self.node.plan_callback(None)
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertFalse(self.node.visual_scan_final_pending)
+
+        # Keep the first required heading unreached so the tracker itself
+        # records a failed position and starts its cooldown.
+        failure_time = 100.46
+        set_clock(failure_time)
+        failed_odom = self._set_odom_yaw(
+            self._make_odom(failure_time),
+            0.7,
+        )
+        self.node.odom_callback(failed_odom)
+        self.node.visual_scan_callback(None)
+
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertEqual(self.node.visual_coverage.scanned_positions, [])
+        self.assertEqual(
+            self.node.visual_coverage.failed_position,
+            failed_checkpoint,
+        )
+        self.assertGreater(
+            self.node.visual_coverage.retry_not_before,
+            failure_time,
+        )
+        self.assertFalse(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+
+        # During the cooldown, feed a fresh healthy map/odom pair and run
+        # the real planner again.  The failed start pose must not become a
+        # new normal visual checkpoint or a rotation-only path.
+        resume_time = failure_time + 0.1
+        set_clock(resume_time)
+        self.node.map_callback(self._make_map(resume_time))
+        self.node.odom_callback(self._make_odom(resume_time))
+        self.node.plan_callback(None)
+
+        resumed_path = self._last_path()
+        self.assertIsNotNone(resumed_path)
+        self.assertGreater(len(resumed_path.poses), 0)
+        self.assertFalse(
+            self.node.visual_coverage.active,
+            "normal cooldown recovery must not restart a scan",
+        )
+        self.assertFalse(
+            len(resumed_path.poses) == 2
+            and resumed_path.poses[0].pose.position.x
+            == resumed_path.poses[1].pose.position.x
+            and resumed_path.poses[0].pose.position.y
+            == resumed_path.poses[1].pose.position.y,
+            "frontier progress must not be replaced by a scan-only path",
+        )
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertFalse(
+            self._published(
+                "/competition/planning/exploration_complete"
+            )[-1].data
+        )
+
+        active_target = self.node.active_exploration_target
+        if active_target is not None:
+            self.assertFalse(
+                self.node.visual_coverage.position_is_cooling_down(
+                    active_target,
+                    resume_time,
+                )
+            )
+        final_pose = resumed_path.poses[-1].pose.position
+        self.assertGreater(
+            math.hypot(
+                final_pose.x - failed_checkpoint[0],
+                final_pose.y - failed_checkpoint[1],
+            ),
+            self.node.visual_scan_target_tolerance,
+        )
+
+    def test_route_checkpoint_is_preserved_across_replans(self):
+        self._publish_healthy_generation(100.0)
+        checkpoint = self.node.active_exploration_target
+        self.assertIsNotNone(checkpoint)
+        first_path = self._last_path()
+        first_geometry = [
+            (
+                pose.pose.position.x,
+                pose.pose.position.y,
+                pose.pose.orientation.z,
+                pose.pose.orientation.w,
+            )
+            for pose in first_path.poses
+        ]
+        first_stamp = first_path.header.stamp.to_sec()
+
+        set_clock(100.4)
+        self.node.plan_and_publish(
+            self.node.map_msg,
+            self.node.odom_msg,
+            self.node.generation,
+            mission_epoch=self.node.mission_epoch,
+            returning=False,
+        )
+        self.assertEqual(self.node.active_exploration_target, checkpoint)
+        held_path = self._last_path()
+        held_geometry = [
+            (
+                pose.pose.position.x,
+                pose.pose.position.y,
+                pose.pose.orientation.z,
+                pose.pose.orientation.w,
+            )
+            for pose in held_path.poses
+        ]
+        self.assertEqual(held_geometry, first_geometry)
+        self.assertGreater(held_path.header.stamp.to_sec(), first_stamp)
+        self.assertIn(
+            "visual_scan_checkpoint_path_held",
+            self._last_status_msg().detail,
+        )
+
+    def test_checkpoint_route_is_bounded_at_selected_station(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5, 4.0):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        route, goal = self.node._checkpoint_route(path, (3.5, 2.5))
+
+        self.assertEqual(len(route.poses), 3)
+        self.assertAlmostEqual(route.poses[-1].pose.position.x, 3.5)
+        self.assertAlmostEqual(goal.pose.position.x, 3.5)
+
+    def test_route_checkpoint_is_kept_when_replan_drops_it(self):
+        self._publish_healthy_generation(100.0)
+        checkpoint = self.node.active_exploration_target
+        self.assertIsNotNone(checkpoint)
+
+        path = FakePath()
+        for x, y in ((8.0, 8.0), (8.0, 10.0), (10.0, 10.0)):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = y
+            path.poses.append(pose)
+
+        set_clock(100.4)
+        self.node.plan_and_publish(
+            self.node.map_msg,
+            self.node.odom_msg,
+            self.node.generation,
+            mission_epoch=self.node.mission_epoch,
+            returning=False,
+        )
+
+        self.assertEqual(
+            self.node.active_exploration_target,
+            checkpoint,
+        )
+
+    def test_missed_checkpoint_reanchors_after_bounded_progress(self):
+        self._publish_healthy_generation(100.0)
+        checkpoint = self.node.active_exploration_target
+        self.assertIsNotNone(checkpoint)
+        self.assertEqual(
+            self.node.visual_scan_checkpoint_origin,
+            (2.5, 2.5),
+        )
+
+        robot = self._make_odom(100.5).pose.pose.position
+        robot.x = 3.5
+        robot.y = 2.5
+        self.node.visual_scan_route_spacing = 1.0
+        self.assertTrue(
+            self.node._visual_checkpoint_should_reanchor_locked(robot)
+        )
+
+        self.node.active_exploration_target = checkpoint
+        self.node.visual_scan_checkpoint_origin = (2.5, 2.5)
+        robot_msg = self._make_odom(100.5)
+        robot_msg.pose.pose.position.x = 3.5
+        robot_msg.pose.pose.position.y = 2.5
+        self.node.plan_and_publish(
+            self.node.map_msg,
+            robot_msg,
+            self.node.generation,
+            mission_epoch=self.node.mission_epoch,
+            returning=False,
+        )
+        # Re-anchoring must not mark the old point as scanned or start a scan
+        # by itself; the next odometry callback owns the actual trigger.
+        self.assertEqual(self.node.visual_coverage.scanned_positions, [])
+        self.assertEqual(
+            self.node.active_exploration_target,
+            (3.5, 2.5),
+        )
+        self.assertEqual(
+            self.node.visual_scan_checkpoint_origin,
+            (3.5, 2.5),
+        )
+        self.assertIn(
+            "visual_scan_checkpoint_reanchored",
+            self._last_status_msg().detail,
+        )
+
+
+    def test_target_not_reached_does_not_start_scan(self):
+        self.node.active_exploration_target = (10.0, 10.0)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+
+        self.assertFalse(self.node._handle_reached_exploration_target(odom))
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertEqual(self.node.active_exploration_target, (10.0, 10.0))
+
+    def test_nearby_scanned_target_is_deduplicated(self):
+        self.node.visual_coverage.scanned_positions = [(2.5, 2.5)]
+        self.node.active_exploration_target = (2.6, 2.5)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+
+        self.assertFalse(self.node._handle_reached_exploration_target(odom))
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertIsNone(self.node.active_exploration_target)
+
+    def test_visual_scan_disabled_preserves_normal_planner_path(self):
+        self.node.visual_coverage.enabled = False
+        self.node.active_exploration_target = (2.5, 2.5)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+
+        self.assertFalse(self.node._handle_reached_exploration_target(odom))
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertIsNone(self.node.active_exploration_target)
+
+    def test_no_frontier_waits_for_final_scan_before_completion(self):
+        self.node.visual_coverage = PLANNING_NODE.VisualCoverageTracker(
+            enabled=True,
+            yaw_step=math.pi / 2.0,
+            yaw_tolerance=0.1,
+            dwell=0.0,
+            heading_timeout=2.0,
+            scan_timeout=20.0,
+            position_dedup_radius=1.0,
+            max_heading_retries=0,
+        )
+        self.node.visual_scan_dwell = 0.0
+        set_clock(100.0)
+        self.node.mapping_status_callback(self._make_status(True, 100.0))
+        self.node.localization_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.map_callback(self._make_fully_known_map(100.1))
+        self.node.odom_callback(self._make_odom(100.1))
+        set_clock(100.2)
+        self.node.plan_callback(None)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertFalse(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+        self.assertTrue(self._last_status_msg().valid)
+        self.assertIn("visual scan heading", self._last_status_msg().detail)
+
+        now = 100.3
+        while self.node.visual_coverage.active:
+            target_yaw = self.node.visual_coverage.current_heading
+            set_clock(now)
+            odom = self._set_odom_yaw(self._make_odom(now), target_yaw)
+            self.node.odom_callback(odom)
+            self.node.visual_scan_callback(None)
+            now += 0.01
+
+            if self.node.visual_coverage.active:
+                set_clock(now)
+                odom = self._set_odom_yaw(
+                    self._make_odom(now),
+                    self.node.visual_coverage.current_heading,
+                )
+                self.node.odom_callback(odom)
+                self.node.visual_scan_callback(None)
+                now += 0.01
+
+        self.assertEqual(
+            len(self.node.visual_coverage.scanned_positions),
+            1,
+        )
+        self.assertFalse(self.node.visual_scan_final_pending)
+
+        # Completion debounce starts only after the final scan ended.
+        for _ in range(3):
+            now += 0.05
+            set_clock(now)
+            self.node.plan_callback(None)
+        self.assertTrue(self.node._exploration_complete_active)
+        self.assertTrue(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+        true_messages = [
+            message.data
+            for message in self._published(
+                "/competition/planning/exploration_complete"
+            )
+            if message.data
+        ]
+        self.assertEqual(len(true_messages), 1)
+
+    def test_final_scan_timeout_does_not_allow_completion(self):
+        self.node.visual_coverage = PLANNING_NODE.VisualCoverageTracker(
+            enabled=True,
+            yaw_step=math.pi / 2.0,
+            yaw_tolerance=0.1,
+            dwell=0.0,
+            heading_timeout=2.0,
+            scan_timeout=0.05,
+            position_dedup_radius=1.0,
+            max_heading_retries=0,
+            failure_cooldown=0.5,
+        )
+        self.node.visual_scan_dwell = 0.0
+
+        set_clock(100.0)
+        self.node.mapping_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.localization_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.map_callback(self._make_fully_known_map(100.1))
+        self.node.odom_callback(self._make_odom(100.1))
+
+        set_clock(100.2)
+        self.node.plan_callback(None)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+
+        set_clock(100.3)
+        self.node.odom_msg = self._make_odom(100.3)
+        self.node.visual_scan_callback(None)
+
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertEqual(
+            self.node.visual_coverage.scanned_positions,
+            [],
+        )
+        self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertFalse(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+        self.assertFalse(self._last_status_msg().valid)
+        self.assertEqual(len(self._last_path().poses), 0)
+        self.assertIn(
+            "coverage was not recorded",
+            self._last_status_msg().detail,
+        )
+
+        # Even repeated no-frontier evidence cannot bypass the pending
+        # mandatory final scan.
+        for _ in range(
+            self.node.exploration_complete_confirmations
+        ):
+            self.node._record_exploration_complete(
+                self.node.generation,
+                self.node.mission_epoch,
+            )
+
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertFalse(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+
+        # An immediate planning cycle must not restart the failed scan.
+        set_clock(100.31)
+        self.node.plan_callback(None)
+
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertFalse(self._last_status_msg().valid)
+        self.assertEqual(len(self._last_path().poses), 0)
+        self.assertIn(
+            "retry cooldown",
+            self._last_status_msg().detail,
+        )
+
+        # Once the bounded cooldown expires, the uncovered position may
+        # start a fresh final scan.
+        set_clock(100.81)
+        self.node.plan_callback(None)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+
+    def test_any_heading_timeout_does_not_allow_completion(self):
+        self.node.visual_coverage = PLANNING_NODE.VisualCoverageTracker(
+            enabled=True,
+            yaw_step=math.pi / 2.0,
+            yaw_tolerance=0.05,
+            dwell=0.0,
+            heading_timeout=0.05,
+            scan_timeout=20.0,
+            position_dedup_radius=1.0,
+            max_heading_retries=0,
+        )
+        self.node.visual_scan_dwell = 0.0
+
+        set_clock(100.0)
+        self.node.mapping_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.localization_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.map_callback(self._make_fully_known_map(100.1))
+        self.node.odom_callback(self._make_odom(100.1))
+
+        set_clock(100.2)
+        self.node.plan_callback(None)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+
+        # The very first required heading cannot be reached.  Exhausting
+        # its retry budget must terminate the entire scan immediately.
+        now = 100.3
+        set_clock(now)
+        odom = self._set_odom_yaw(
+            self._make_odom(now),
+            0.7,
+        )
+        self.node.odom_msg = odom
+        self.node.visual_scan_callback(None)
+
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertEqual(
+            self.node.visual_coverage.scanned_positions,
+            [],
+        )
+        self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertFalse(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+        self.assertFalse(self._last_status_msg().valid)
+        self.assertEqual(len(self._last_path().poses), 0)
+        self.assertIn(
+            "heading timed out",
+            self._last_status_msg().detail,
+        )
+
+    def test_generation_reset_clears_visual_coverage(self):
+        self.node.active_exploration_target = (2.5, 2.5)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+        self.assertTrue(self.node._handle_reached_exploration_target(odom))
+        self.node.visual_coverage.scanned_positions.append((4.0, 4.0))
+        self.node.visual_scan_checkpoint_path = FakePath()
+        self.node.visual_scan_checkpoint_goal = FakePoseStamped()
+
+        self.node._enter_new_generation("test_reset", FakeTime(101.0))
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertEqual(self.node.visual_coverage.scanned_positions, [])
+        self.assertIsNone(self.node.active_exploration_target)
+        self.assertIsNone(self.node.visual_scan_checkpoint_path)
+        self.assertIsNone(self.node.visual_scan_checkpoint_goal)
+        self.assertFalse(self.node.visual_scan_final_pending)
+
+    def test_planning_status_stays_running_during_scan_progress(self):
+        self.node.active_exploration_target = (2.5, 2.5)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+        self.node._handle_reached_exploration_target(odom)
+        self.node.visual_scan_callback(None)
+
+        status = self._last_status_msg()
+        self.assertEqual(status.state, FakeModuleStatus.RUNNING)
+        self.assertTrue(status.valid)
 
     def test_returning_state_loads_public_start_and_uses_goal_planner(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -941,6 +1619,12 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
     def test_stale_no_frontier_result_is_discarded(self):
         node = self.node
 
+        # This boundary test exercises the asynchronous planner result, not
+        # the planner-local visual checkpoint trigger.  Disable the optional
+        # scan so a reached initial checkpoint cannot short-circuit the
+        # deliberately stale plan computation below.
+        node.visual_scan_enabled = False
+        node.visual_coverage.enabled = False
         self._publish_healthy_generation(100.0)
         self.assertTrue(node.last_status[1])
         self.assertEqual(node.generation, 0)
@@ -980,6 +1664,10 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
     def test_stale_unreachable_result_is_discarded(self):
         node = self.node
 
+        # Keep this generation-boundary test focused on stale planner
+        # results; visual coverage has its own callback/timeout tests.
+        node.visual_scan_enabled = False
+        node.visual_coverage.enabled = False
         self._publish_healthy_generation(100.0)
         self.assertTrue(node.last_status[1])
         self.assertEqual(node.generation, 0)

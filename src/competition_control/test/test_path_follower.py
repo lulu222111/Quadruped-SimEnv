@@ -149,9 +149,18 @@ class _Pose:
 
 
 class _PoseStamped:
-    def __init__(self, frame_id="world", x=0.0, y=0.0, stamp=None):
+    def __init__(
+        self,
+        frame_id="world",
+        x=0.0,
+        y=0.0,
+        stamp=None,
+        yaw=0.0,
+    ):
         self.header = _Header(frame_id, stamp)
         self.pose = _Pose(x, y)
+        self.pose.orientation.z = math.sin(yaw / 2.0)
+        self.pose.orientation.w = math.cos(yaw / 2.0)
 
 
 class _Path:
@@ -291,6 +300,7 @@ class TestPathFollower(unittest.TestCase):
         self.follower.max_linear = 0.25
         self.follower.max_angular = 0.8
         self.follower.goal_tolerance = 0.2
+        self.follower.orientation_tolerance = 0.15
         self.follower.min_linear = 0.0
         self.follower.stuck_duration_sec = 0.0
         self.follower.stuck_progress_epsilon = 0.05
@@ -346,9 +356,33 @@ class TestPathFollower(unittest.TestCase):
         x=0.0,
         y=0.0,
         stamp=None,
+        yaw=0.0,
     ):
         msg = _Odometry(frame, child, x, y, stamp)
+        msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
         self.follower.on_odom(msg)
+        return msg
+
+    def _rotation_path(self, target_yaw, current_yaw=0.0, stamp=None):
+        poses = [
+            _PoseStamped(
+                "world",
+                0.0,
+                0.0,
+                stamp,
+                yaw=current_yaw,
+            ),
+            _PoseStamped(
+                "world",
+                0.0,
+                0.0,
+                stamp,
+                yaw=target_yaw,
+            ),
+        ]
+        msg = _Path("world", poses, stamp)
+        self.follower.on_path(msg)
         return msg
 
     def _path(
@@ -456,6 +490,51 @@ class TestPathFollower(unittest.TestCase):
         self.follower.step()
         self.assertEqual(self._last_cmd().linear.x, 0.0)
         self.assertNotEqual(self._last_cmd().angular.z, 0.0)
+
+    def test_same_position_orientation_waypoint_commands_in_place_turn(self):
+        self._planning(True)
+        self._localization(True)
+        self._odom(yaw=0.0)
+        self._rotation_path(math.pi / 2.0, current_yaw=0.0)
+
+        self.follower.step()
+        self.assertEqual(self._last_cmd().linear.x, 0.0)
+        self.assertNotEqual(self._last_cmd().angular.z, 0.0)
+        self.assertEqual(self._last_status().state, _ModuleStatus.RUNNING)
+
+    def test_rotation_waypoint_finishes_after_yaw_reached(self):
+        self._planning(True)
+        self._localization(True)
+        self._odom(yaw=0.0)
+        self._rotation_path(math.pi / 2.0, current_yaw=0.0)
+        self.follower.step()
+        self.assertNotEqual(self._last_cmd().angular.z, 0.0)
+
+        _MockTime.set(10.1)
+        self._odom(yaw=math.pi / 2.0, stamp=10.1)
+        self.follower.step()
+        self._assert_zero()
+        self.assertEqual(self._last_status().state, _ModuleStatus.SUCCEEDED)
+        self.assertTrue(self._last_status().valid)
+
+    def test_rotation_waypoint_does_not_inherit_minimum_forward_speed(self):
+        self.follower.min_linear = 0.25
+        self._planning(True)
+        self._localization(True)
+        self._odom(yaw=0.0)
+        self._rotation_path(-math.pi / 2.0, current_yaw=0.0)
+        self.follower.step()
+        self.assertEqual(self._last_cmd().linear.x, 0.0)
+        self.assertNotEqual(self._last_cmd().angular.z, 0.0)
+
+    def test_normal_path_still_uses_position_heading(self):
+        self._arm(points=[(1.0, 0.0)])
+        # Deliberately make the pose orientation disagree with the travel
+        # direction.  Normal navigation remains position-driven.
+        self.follower.path[0].pose.orientation.z = math.sin(math.pi / 4.0)
+        self.follower.path[0].pose.orientation.w = math.cos(math.pi / 4.0)
+        self.follower.step()
+        self.assertGreater(self._last_cmd().linear.x, 0.0)
 
     # ------------------------------------------------------------------
     # Stuck detection (advisory notice to planner)

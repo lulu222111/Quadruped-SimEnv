@@ -36,9 +36,23 @@
   <arg name="planning_initial_forward_distance" default="0.0" />
   <arg name="planning_initial_forward_lookahead" default="2.0" />
   <arg name="planning_path_compression_enabled" default="false" />
+  <arg name="planning_exploration_complete_confirmations" default="3" />
+  <arg name="planning_visual_scan_enabled" default="true" />
+  <arg name="planning_visual_scan_yaw_step" default="0.7853981634" />
+  <arg name="planning_visual_scan_yaw_tolerance" default="0.15" />
+  <arg name="planning_visual_scan_dwell" default="0.6" />
+  <arg name="planning_visual_scan_heading_timeout" default="4.0" />
+  <arg name="planning_visual_scan_timeout" default="45.0" />
+  <arg name="planning_visual_scan_position_dedup_radius" default="1.0" />
+  <arg name="planning_visual_scan_route_spacing" default="2.0" />
+  <arg name="planning_visual_scan_target_tolerance" default="0.35" />
+  <arg name="planning_visual_scan_max_heading_retries" default="1" />
+  <arg name="planning_visual_scan_update_interval" default="0.1" />
+  <arg name="planning_visual_scan_final_before_complete" default="true" />
   <arg name="planning_enabled" default="true" />
   <arg name="planning_path_topic" default="/competition/path" />
   <arg name="path_follower_max_angular" default="0.8" />
+  <arg name="path_follower_orientation_tolerance" default="0.15" />
   <!-- Minimum forward speed while driving to a waypoint. The RL locomotion
        policy stands still below ~0.2 m/s, which deadlocks the proportional
        slowdown just outside goal_tolerance (R24 RETURNING stall). Floor the
@@ -153,6 +167,32 @@
                value="$(arg planning_initial_forward_lookahead)" />
         <param name="path_compression_enabled"
                value="$(arg planning_path_compression_enabled)" />
+        <param name="exploration_complete_confirmations"
+               value="$(arg planning_exploration_complete_confirmations)" />
+        <param name="visual_scan_enabled"
+               value="$(arg planning_visual_scan_enabled)" />
+        <param name="visual_scan_yaw_step"
+               value="$(arg planning_visual_scan_yaw_step)" />
+        <param name="visual_scan_yaw_tolerance"
+               value="$(arg planning_visual_scan_yaw_tolerance)" />
+        <param name="visual_scan_dwell"
+               value="$(arg planning_visual_scan_dwell)" />
+        <param name="visual_scan_heading_timeout"
+               value="$(arg planning_visual_scan_heading_timeout)" />
+        <param name="visual_scan_timeout"
+               value="$(arg planning_visual_scan_timeout)" />
+        <param name="visual_scan_position_dedup_radius"
+               value="$(arg planning_visual_scan_position_dedup_radius)" />
+        <param name="visual_scan_route_spacing"
+               value="$(arg planning_visual_scan_route_spacing)" />
+        <param name="visual_scan_target_tolerance"
+               value="$(arg planning_visual_scan_target_tolerance)" />
+        <param name="visual_scan_max_heading_retries"
+               value="$(arg planning_visual_scan_max_heading_retries)" />
+        <param name="visual_scan_update_interval"
+               value="$(arg planning_visual_scan_update_interval)" />
+        <param name="visual_scan_final_before_complete"
+               value="$(arg planning_visual_scan_final_before_complete)" />
         <param name="start_recovery_radius_cells"
                value="$(arg planning_start_recovery_radius_cells)" />
       </node>
@@ -162,6 +202,8 @@
     <node pkg="competition_control" type="path_follower_node" name="path_follower"
           output="screen" respawn="true">
       <param name="max_angular" value="$(arg path_follower_max_angular)" />
+      <param name="orientation_tolerance"
+             value="$(arg path_follower_orientation_tolerance)" />
       <param name="min_linear" value="$(arg path_follower_min_linear)" />
       <param name="stuck_duration_sec" value="$(arg path_follower_stuck_duration_sec)" />
       <param name="stuck_progress_epsilon" value="$(arg path_follower_stuck_progress_epsilon)" />
