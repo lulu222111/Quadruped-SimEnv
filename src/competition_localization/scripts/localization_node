@@ -347,6 +347,20 @@ class LocalizationAdapter:
         self.correction_child_frame_id = rospy.get_param(
             "~correction_child_frame_id", "c2r28_base"
         )
+        # Correction is a required input whenever enabled.  These limits are
+        # deliberately independent from the FAST-LIO watchdog: a healthy raw
+        # source must never hide a stopped or temporally mismatched correction
+        # source.
+        self.correction_timeout = float(
+            rospy.get_param("~correction_timeout", 0.5)
+        )
+        self.max_correction_skew = float(
+            rospy.get_param("~max_correction_skew", 0.20)
+        )
+        if self.correction_timeout <= 0.0:
+            raise ValueError("~correction_timeout must be > 0")
+        if self.max_correction_skew < 0.0:
+            raise ValueError("~max_correction_skew must be >= 0")
         # Future-timestamp tolerance: stamps ahead of now() by more than this
         # are rejected (clock skew / simulator glitch guard).
         self._max_future_stamp_skew = rospy.get_param("~max_future_stamp_skew", 1.0)
@@ -372,11 +386,16 @@ class LocalizationAdapter:
         self._T_base_to_imu: Optional[Transform] = None
         self._latest_raw_world_to_base: Optional[Transform] = None
         self._T_world_to_correction: Optional[Transform] = None
+        self._latest_correction_world_to_base: Optional[Transform] = None
         self._world_correction_yaw_offset: Optional[float] = None
         self._latest_correction_world_yaw: Optional[float] = None
         self._world_correction_xy_offset: Optional[Tuple[float, float]] = None
         self._latest_correction_world_xy: Optional[Tuple[float, float]] = None
         self._last_correction_stamp: Optional[rospy.Time] = None
+        self._last_correction_receive_time: Optional[rospy.Time] = None
+        self._correction_ever_received = False
+        self._correction_timed_out = False
+        self._last_ros_time: Optional[rospy.Time] = None
         self._state = ModuleStatus.STARTING
         self._valid = False
         self._detail = "waiting for first FAST-LIO odometry"
@@ -420,9 +439,11 @@ class LocalizationAdapter:
         self._load_base_to_imu_extrinsic()
 
         rospy.loginfo(
-            "localization_node: adapter ready. input=%s, publish_tf=%s, timeout=%.2f s, correction=%s",
+            "localization_node: adapter ready. input=%s, publish_tf=%s, "
+            "timeout=%.2f s, correction=%s (timeout=%.2f s, max_skew=%.2f s)",
             self.odom_input_topic, self.publish_tf_enabled, self.input_timeout,
-            self.correction_enabled,
+            self.correction_enabled, self.correction_timeout,
+            self.max_correction_skew,
         )
 
     # --- initialization ---------------------------------------------------------
@@ -619,6 +640,143 @@ class LocalizationAdapter:
         )
         self._T_base_to_imu = _identity_transform()
 
+    # --- correction safety -----------------------------------------------------
+
+    def _invalidate_correction_measurement(self) -> None:
+        """Make the current correction unconsumable without losing alignment.
+
+        A short source interruption may retain the relative alignment offsets,
+        but it must never retain a pose measurement that could be applied to a
+        newer FAST-LIO frame.
+        """
+        self._latest_correction_world_to_base = None
+        self._latest_correction_world_yaw = None
+        self._latest_correction_world_xy = None
+
+    def _reset_correction_state(self, reset_alignment: bool) -> None:
+        """Invalidate correction state, optionally crossing a new generation."""
+        self._invalidate_correction_measurement()
+        self._last_correction_stamp = None
+        self._last_correction_receive_time = None
+        self._correction_ever_received = False
+        self._correction_timed_out = False
+        if reset_alignment:
+            self._T_world_to_correction = None
+            self._world_correction_yaw_offset = None
+            self._world_correction_xy_offset = None
+
+    def _check_ros_time_rollback(self, now) -> bool:
+        """Reset source-generation state after a global ROS time rollback."""
+        if (
+            self._last_ros_time is not None
+            and now.to_sec() < self._last_ros_time.to_sec()
+        ):
+            self._last_input_stamp = None
+            self._last_odom_time = None
+            self._latest_raw_world_to_base = None
+            self._reset_correction_state(reset_alignment=True)
+            self._state = ModuleStatus.STARTING
+            self._valid = False
+            self._detail = "waiting for fresh inputs after ROS time rollback"
+            rospy.logwarn(
+                "localization_node: correction state reset after ROS time rollback"
+            )
+            self._last_ros_time = now
+            return True
+        self._last_ros_time = now
+        return False
+
+    def _correction_measurement_available(self) -> bool:
+        if self.correction_mode == "full_pose":
+            return self._latest_correction_world_to_base is not None
+        if self.correction_mode == "yaw_only":
+            return self._latest_correction_world_yaw is not None
+        return (
+            self._latest_correction_world_yaw is not None
+            and self._latest_correction_world_xy is not None
+        )
+
+    def _require_fresh_correction(self, fastlio_stamp, now) -> bool:
+        """Fail closed unless the required correction is fresh and aligned."""
+        if not self.correction_enabled:
+            return True
+
+        if (
+            self._state in (ModuleStatus.FAILED, ModuleStatus.BLOCKED)
+            and not self._correction_measurement_available()
+        ):
+            self._valid = False
+            return False
+
+        if not self._correction_ever_received:
+            self._state = ModuleStatus.STARTING
+            self._valid = False
+            self._detail = "waiting for correction odometry"
+            return False
+
+        if (
+            self._last_correction_stamp is None
+            or self._last_correction_receive_time is None
+            or not self._correction_measurement_available()
+        ):
+            self._state = (
+                ModuleStatus.TIMEOUT
+                if self._correction_timed_out
+                else ModuleStatus.STARTING
+            )
+            self._valid = False
+            self._detail = (
+                "correction odometry timeout; waiting for fresh correction"
+                if self._correction_timed_out
+                else "waiting for correction odometry alignment"
+            )
+            return False
+
+        receive_age = (now - self._last_correction_receive_time).to_sec()
+        if receive_age < 0.0:
+            self._reset_correction_state(reset_alignment=True)
+            self._state = ModuleStatus.STARTING
+            self._valid = False
+            self._detail = "waiting for fresh correction after ROS time rollback"
+            rospy.logwarn(
+                "localization_node: correction state reset after ROS time rollback"
+            )
+            return False
+        if receive_age > self.correction_timeout:
+            self._correction_timed_out = True
+            self._invalidate_correction_measurement()
+            self._state = ModuleStatus.TIMEOUT
+            self._valid = False
+            self._detail = (
+                f"correction odometry timeout ({receive_age:.2f} s); "
+                "waiting for fresh correction"
+            )
+            rospy.logwarn_throttle(
+                1.0,
+                "localization_node: correction timeout (%.2f s); output blocked",
+                receive_age,
+            )
+            return False
+
+        source_skew = abs(
+            fastlio_stamp.to_sec() - self._last_correction_stamp.to_sec()
+        )
+        if source_skew > self.max_correction_skew:
+            self._state = ModuleStatus.BLOCKED
+            self._valid = False
+            self._detail = (
+                f"FAST-LIO/correction timestamp skew {source_skew:.3f} s "
+                f"exceeds {self.max_correction_skew:.3f} s"
+            )
+            rospy.logwarn_throttle(
+                1.0,
+                "localization_node: correction timestamp skew %.3f s; output blocked",
+                source_skew,
+            )
+            return False
+
+        return True
+
     # --- odometry callback ------------------------------------------------------
 
     def _odom_callback(self, msg: Odometry) -> None:
@@ -630,6 +788,7 @@ class LocalizationAdapter:
                 return
 
             now = rospy.Time.now()
+            self._check_ros_time_rollback(now)
 
             # Validate input message
             if not is_finite_pose(msg.pose.pose):
@@ -655,9 +814,14 @@ class LocalizationAdapter:
                 rospy.logwarn_throttle(1.0, "localization_node: zero input timestamp")
                 return
             if self._last_input_stamp is not None and stamp.to_sec() < self._last_input_stamp.to_sec():
+                self._last_input_stamp = None
+                self._reset_correction_state(reset_alignment=True)
                 self._state = ModuleStatus.FAILED
                 self._valid = False
-                self._detail = "input odometry timestamp jumped backwards"
+                self._detail = (
+                    "input odometry timestamp jumped backwards; "
+                    "correction generation reset"
+                )
                 rospy.logwarn_throttle(1.0, "localization_node: input timestamp jumped backwards")
                 return
             # Reject timestamps significantly in the future (clock skew guard).
@@ -730,25 +894,12 @@ class LocalizationAdapter:
                 )
                 T_world_to_base = compose_world_to_base(T_world_to_body, T_base_to_imu)
                 self._latest_raw_world_to_base = T_world_to_base
-                if (
-                    getattr(self, "correction_enabled", False)
-                    and self.correction_mode == "full_pose"
-                ):
-                    if self._T_world_to_correction is None:
-                        self._state = ModuleStatus.STARTING
-                        self._valid = False
-                        self._detail = "waiting for proprio-FastLIO correction alignment"
+                if not self._require_fresh_correction(stamp, now):
                     return
-                if (
-                    getattr(self, "correction_enabled", False)
-                    and getattr(self, "correction_mode", "full_pose")
-                    in ("yaw_only", "planar_relative")
-                    and getattr(self, "_latest_correction_world_yaw", None) is not None
-                ):
-                    if (
-                        self.correction_mode == "planar_relative"
-                        and self._latest_correction_world_xy is not None
-                    ):
+                if self.correction_enabled:
+                    if self.correction_mode == "full_pose":
+                        T_world_to_base = self._latest_correction_world_to_base
+                    elif self.correction_mode == "planar_relative":
                         T_world_to_base = self._replace_transform_planar(
                             T_world_to_base,
                             self._latest_correction_world_xy,
@@ -770,16 +921,15 @@ class LocalizationAdapter:
                 self._odom_msg = out
                 self._state = ModuleStatus.RUNNING
                 self._valid = True
-                if (
-                    getattr(self, "correction_enabled", False)
-                    and getattr(self, "correction_mode", "full_pose")
-                    in ("yaw_only", "planar_relative")
-                    and getattr(self, "_latest_correction_world_yaw", None) is not None
-                ):
+                if self.correction_enabled:
                     self._detail = (
                         "FAST-LIO z/attitude + proprio planar correction active"
                         if self.correction_mode == "planar_relative"
-                        else "FAST-LIO translation + proprio yaw correction active"
+                        else (
+                            "FAST-LIO translation + proprio yaw correction active"
+                            if self.correction_mode == "yaw_only"
+                            else "proprio-FastLIO full-pose correction active"
+                        )
                     )
                 else:
                     self._detail = "FAST-LIO odometry valid"
@@ -793,28 +943,35 @@ class LocalizationAdapter:
                 self._detail = "aligning FAST-LIO frame to world (t0 pose latched)"
 
     def _correction_callback(self, msg: Odometry) -> None:
-        """Apply an optional relative correction trajectory.
+        """Validate and cache a required correction measurement.
 
-        The correction source remains in its isolated frame and never
-        publishes TF.  This adapter latches one world alignment against the
-        already validated FAST-LIO start alignment, then remains the sole
-        publisher of the competition odometry and world->base TF contracts.
-        The feature is disabled by default.
+        Correction callbacks never publish competition odometry or TF.  The
+        canonical FAST-LIO callback owns the output clock and can consume this
+        cache only after freshness and source-stamp skew checks pass.
         """
         if not self.correction_enabled:
             return
         with self._lock:
             if not self._start_pose_valid:
                 return
+            now = rospy.Time.now()
+            if self._check_ros_time_rollback(now):
+                return
+
             if not is_finite_pose(msg.pose.pose) or not is_valid_quaternion(msg.pose.pose):
+                self._invalidate_correction_measurement()
                 self._state = ModuleStatus.FAILED
                 self._valid = False
                 self._detail = "received invalid correction odometry pose"
+                rospy.logwarn_throttle(
+                    1.0, "localization_node: invalid correction odometry pose"
+                )
                 return
             if (
                 msg.header.frame_id != self.correction_frame_id
                 or msg.child_frame_id != self.correction_child_frame_id
             ):
+                self._invalidate_correction_measurement()
                 self._state = ModuleStatus.BLOCKED
                 self._valid = False
                 self._detail = (
@@ -828,6 +985,7 @@ class LocalizationAdapter:
                 return
             stamp = msg.header.stamp
             if stamp is None or stamp.to_sec() <= 0.0:
+                self._invalidate_correction_measurement()
                 self._state = ModuleStatus.FAILED
                 self._valid = False
                 self._detail = "correction odometry has invalid timestamp"
@@ -836,11 +994,30 @@ class LocalizationAdapter:
                 self._last_correction_stamp is not None
                 and stamp.to_sec() < self._last_correction_stamp.to_sec()
             ):
+                self._reset_correction_state(reset_alignment=True)
                 self._state = ModuleStatus.FAILED
                 self._valid = False
                 self._detail = "correction odometry timestamp jumped backwards"
+                rospy.logwarn(
+                    "localization_node: correction timestamp rollback; "
+                    "alignment generation reset"
+                )
                 return
+            stamp_age = (now - stamp).to_sec()
+            if stamp_age < -self._max_future_stamp_skew:
+                self._invalidate_correction_measurement()
+                self._state = ModuleStatus.FAILED
+                self._valid = False
+                self._detail = (
+                    f"correction odometry timestamp is {abs(stamp_age):.2f} s "
+                    f"in the future (max allowed: {self._max_future_stamp_skew:.2f} s)"
+                )
+                return
+
             self._last_correction_stamp = stamp
+            self._last_correction_receive_time = now
+            self._correction_ever_received = True
+            self._correction_timed_out = False
             if not self._aligned or self._latest_raw_world_to_base is None:
                 self._state = ModuleStatus.STARTING
                 self._valid = False
@@ -886,11 +1063,6 @@ class LocalizationAdapter:
                         self._world_correction_xy_offset[0] + correction_translation[0],
                         self._world_correction_xy_offset[1] + correction_translation[1],
                     )
-                # Do not publish from the 50 Hz correction callback.  The
-                # canonical FAST-LIO callback remains the single 10 Hz odom/
-                # TF publisher and applies this cached yaw to its own stamp;
-                # this guarantees monotonic timestamps for mapping/planning.
-                return
             else:
                 if self._T_world_to_correction is None:
                     self._T_world_to_correction = _transform_multiply(
@@ -901,22 +1073,17 @@ class LocalizationAdapter:
                         "localization_node: latched proprio-FastLIO correction alignment"
                     )
 
-                T_world_to_base = _transform_multiply(
+                self._latest_correction_world_to_base = _transform_multiply(
                     self._T_world_to_correction, T_correction_to_base
                 )
-                detail = "proprio-FastLIO correction active"
-            out = odom_from_transform(
-                T_world_to_base, stamp, "world", "base"
-            )
-            out.pose.covariance = [0.0] * 36
-            self._last_odom_time = rospy.Time.now()
-            self._odom_msg = out
-            self._state = ModuleStatus.RUNNING
-            self._valid = True
-            self._detail = detail
-            self._odom_pub.publish(out)
-            if self.publish_tf_enabled and self._br is not None:
-                self._publish_tf(out)
+
+            # Do not publish from the higher-rate correction callback.  The
+            # next legal FAST-LIO frame performs the freshness/skew checks and
+            # publishes with the original FAST-LIO source stamp.
+            if self._state != ModuleStatus.RUNNING:
+                self._state = ModuleStatus.STARTING
+                self._valid = False
+                self._detail = "fresh correction received; waiting for FAST-LIO frame"
 
     @staticmethod
     def _replace_transform_yaw(transform: Transform, yaw: float) -> Transform:
@@ -999,7 +1166,7 @@ class LocalizationAdapter:
         self._check_timeout()
 
     def _check_timeout(self) -> None:
-        """Update state if FAST-LIO input has timed out (watchdog)."""
+        """Update state if either required input has timed out."""
         with self._lock:
             # Fail-safe: scene config invalid -> module stays FAILED.
             if not self._start_pose_valid:
@@ -1007,8 +1174,8 @@ class LocalizationAdapter:
                 self._valid = False
                 return
 
-            # Hard/terminal states are not overridden by the watchdog.
-            if self._state in (ModuleStatus.FAILED, ModuleStatus.BLOCKED):
+            now = rospy.Time.now()
+            if self._check_ros_time_rollback(now):
                 return
 
             if self._last_odom_time is None:
@@ -1017,7 +1184,7 @@ class LocalizationAdapter:
                 self._detail = "waiting for first FAST-LIO odometry"
                 return
 
-            elapsed = (rospy.Time.now() - self._last_odom_time).to_sec()
+            elapsed = (now - self._last_odom_time).to_sec()
             if elapsed > self.input_timeout:
                 if self._state != ModuleStatus.TIMEOUT:
                     rospy.logwarn(
@@ -1026,6 +1193,33 @@ class LocalizationAdapter:
                 self._state = ModuleStatus.TIMEOUT
                 self._valid = False
                 self._detail = f"FAST-LIO input timeout ({elapsed:.2f} s)"
+                return
+
+            if self.correction_enabled:
+                # Invalid-message states are recovered only by callbacks
+                # carrying new legal source data, never by the watchdog.
+                if self._state in (ModuleStatus.FAILED, ModuleStatus.BLOCKED):
+                    return
+                if not self._correction_ever_received:
+                    self._state = ModuleStatus.STARTING
+                    self._valid = False
+                    self._detail = "waiting for correction odometry"
+                    return
+                if self._last_correction_receive_time is not None:
+                    correction_age = (
+                        now - self._last_correction_receive_time
+                    ).to_sec()
+                    if correction_age > self.correction_timeout:
+                        self._correction_timed_out = True
+                        self._invalidate_correction_measurement()
+                        self._state = ModuleStatus.TIMEOUT
+                        self._valid = False
+                        self._detail = (
+                            f"correction odometry timeout ({correction_age:.2f} s); "
+                            "waiting for fresh correction"
+                        )
+                        return
+
 
     def _publish_status(self) -> None:
         """Publish current module status."""
