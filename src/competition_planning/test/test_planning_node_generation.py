@@ -476,7 +476,11 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
         robot = self._make_odom(100.1).pose.pose.position
         self.node.visual_scan_route_spacing = 2.0
         self.node.visual_coverage.scanned_positions = [(0.0, 0.0)]
-        checkpoint = self.node._select_visual_scan_checkpoint(path, robot)
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            100.1,
+        )
         self.assertEqual(checkpoint, (4.5, 2.5))
 
     def test_first_route_checkpoint_anchors_initial_search_station(self):
@@ -489,8 +493,62 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
 
         robot = self._make_odom(100.1).pose.pose.position
         self.node.visual_scan_route_spacing = 2.0
-        checkpoint = self.node._select_visual_scan_checkpoint(path, robot)
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            100.1,
+        )
         self.assertEqual(checkpoint, (2.5, 2.5))
+
+    def test_checkpoint_selector_skips_cooling_down_start_pose(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5, 4.0, 4.5):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        now = 100.1
+        robot = self._make_odom(now).pose.pose.position
+        self.node.visual_coverage.failed_position = (2.5, 2.5)
+        self.node.visual_coverage.retry_not_before = now + 5.0
+
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            now,
+        )
+
+        self.assertIsNotNone(checkpoint)
+        self.assertNotEqual(checkpoint, (2.5, 2.5))
+        self.assertFalse(
+            self.node.visual_coverage.position_is_cooling_down(
+                checkpoint,
+                now,
+            )
+        )
+        self.assertGreater(checkpoint[0], 2.5)
+
+    def test_checkpoint_selector_returns_none_when_route_is_inside_cooldown(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.4):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        now = 100.1
+        robot = self._make_odom(now).pose.pose.position
+        self.node.visual_coverage.failed_position = (2.5, 2.5)
+        self.node.visual_coverage.retry_not_before = now + 5.0
+
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            now,
+        )
+
+        self.assertIsNone(checkpoint)
 
     def test_short_route_checkpoint_falls_back_to_route_endpoint(self):
         path = FakePath()
@@ -503,8 +561,116 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
         robot = self._make_odom(100.1).pose.pose.position
         self.node.visual_scan_route_spacing = 2.0
         self.node.visual_coverage.scanned_positions = [(0.0, 0.0)]
-        checkpoint = self.node._select_visual_scan_checkpoint(path, robot)
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            100.1,
+        )
         self.assertEqual(checkpoint, (3.5, 2.5))
+
+    def test_failed_initial_checkpoint_cooldown_allows_frontier_progress(self):
+        self.node.visual_coverage = PLANNING_NODE.VisualCoverageTracker(
+            enabled=True,
+            yaw_step=math.pi / 2.0,
+            yaw_tolerance=0.05,
+            dwell=0.0,
+            heading_timeout=0.05,
+            scan_timeout=20.0,
+            position_dedup_radius=1.0,
+            max_heading_retries=0,
+            failure_cooldown=5.0,
+        )
+        self.node.visual_scan_dwell = 0.0
+
+        self._publish_healthy_generation(100.0)
+        initial_path = self._last_path()
+        self.assertIsNotNone(initial_path)
+        self.assertGreater(len(initial_path.poses), 0)
+        failed_checkpoint = self.node.active_exploration_target
+        self.assertEqual(failed_checkpoint, (2.5, 2.5))
+
+        # The real planning callback reaches the initially selected station
+        # and starts a normal (non-final) visual scan.
+        reached = self._make_odom(100.3)
+        reached.pose.pose.position.x = failed_checkpoint[0]
+        reached.pose.pose.position.y = failed_checkpoint[1]
+        set_clock(100.4)
+        self.node.odom_callback(reached)
+        self.node.plan_callback(None)
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertFalse(self.node.visual_scan_final_pending)
+
+        # Keep the first required heading unreached so the tracker itself
+        # records a failed position and starts its cooldown.
+        failure_time = 100.46
+        set_clock(failure_time)
+        failed_odom = self._set_odom_yaw(
+            self._make_odom(failure_time),
+            0.7,
+        )
+        self.node.odom_callback(failed_odom)
+        self.node.visual_scan_callback(None)
+
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertEqual(self.node.visual_coverage.scanned_positions, [])
+        self.assertEqual(
+            self.node.visual_coverage.failed_position,
+            failed_checkpoint,
+        )
+        self.assertGreater(
+            self.node.visual_coverage.retry_not_before,
+            failure_time,
+        )
+        self.assertFalse(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+
+        # During the cooldown, feed a fresh healthy map/odom pair and run
+        # the real planner again.  The failed start pose must not become a
+        # new normal visual checkpoint or a rotation-only path.
+        resume_time = failure_time + 0.1
+        set_clock(resume_time)
+        self.node.map_callback(self._make_map(resume_time))
+        self.node.odom_callback(self._make_odom(resume_time))
+        self.node.plan_callback(None)
+
+        resumed_path = self._last_path()
+        self.assertIsNotNone(resumed_path)
+        self.assertGreater(len(resumed_path.poses), 0)
+        self.assertFalse(
+            self.node.visual_coverage.active,
+            "normal cooldown recovery must not restart a scan",
+        )
+        self.assertFalse(
+            len(resumed_path.poses) == 2
+            and resumed_path.poses[0].pose.position.x
+            == resumed_path.poses[1].pose.position.x
+            and resumed_path.poses[0].pose.position.y
+            == resumed_path.poses[1].pose.position.y,
+            "frontier progress must not be replaced by a scan-only path",
+        )
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertFalse(
+            self._published(
+                "/competition/planning/exploration_complete"
+            )[-1].data
+        )
+
+        active_target = self.node.active_exploration_target
+        if active_target is not None:
+            self.assertFalse(
+                self.node.visual_coverage.position_is_cooling_down(
+                    active_target,
+                    resume_time,
+                )
+            )
+        final_pose = resumed_path.poses[-1].pose.position
+        self.assertGreater(
+            math.hypot(
+                final_pose.x - failed_checkpoint[0],
+                final_pose.y - failed_checkpoint[1],
+            ),
+            self.node.visual_scan_target_tolerance,
+        )
 
     def test_route_checkpoint_is_preserved_across_replans(self):
         self._publish_healthy_generation(100.0)

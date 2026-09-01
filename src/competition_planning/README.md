@@ -152,10 +152,13 @@ Planner 会先尝试一次当前位置的 final scan；只有该 scan 的全部 
 
 
 失败位置冷却语义：任何必需 heading 未完成时，该位置不会被记录为已覆盖。
-同一位置在 `visual_scan_failure_cooldown` 时间内不会立即重复旋转；普通
-checkpoint 可继续 Frontier 探索，强制 final scan 则保持空 Path、
-`planning/status.valid=false` 和未完成状态，冷却结束后才允许重新扫描。
-该机制避免扫描失败造成高频重试，也防止失败的 final scan 被误判为探索完成。
+同一位置在 `visual_scan_failure_cooldown` 时间内不会立即重复旋转。普通
+checkpoint 选择时会跳过仍在冷却区域内的首个 pose 和后续 route candidate，
+优先沿 Frontier route 选择更远的视觉站；若整条当前 route 都没有合适的
+checkpoint，则暂时不设置视觉站，直接继续发布正常 Frontier path。强制
+final scan 则保持空 Path、`planning/status.valid=false` 和未完成状态，冷却
+结束后才允许重新扫描。该机制避免普通扫描失败造成原地重复重试，也防止失败
+的 final scan 被误判为探索完成。
 ## 当前已实现
 
 - [x] 四个正式输入话题接入
@@ -197,7 +200,7 @@ checkpoint 可继续 Frontier 探索，强制 final scan 则保持空 Path、
 ### 无 ROS 单元测试
 
 ```text
-Ran 137 tests
+Ran 140 tests
 OK
 ```
 

@@ -646,7 +646,12 @@ class PlanningNode:
         self._exploration_complete_streak = 0
         self._exploration_complete_active = False
 
-    def _select_visual_scan_checkpoint(self, path_msg, robot_position):
+    def _select_visual_scan_checkpoint(
+        self,
+        path_msg,
+        robot_position,
+        now,
+    ):
         """Choose a progress checkpoint on a newly planned route.
 
         Frontier replanning can replace a distant frontier goal before the
@@ -654,7 +659,9 @@ class PlanningNode:
         actual motion while avoiding a scan on every grid cell.  The caller
         preserves an existing checkpoint across ordinary replans, then
         re-anchors it only after bounded physical progress shows that the
-        pending station was missed.
+        pending station was missed.  Failed scan positions are skipped while
+        their tracker-owned cooldown is active so a failed starting station
+        cannot pin the robot to the same place.
         """
         if not self.visual_scan_enabled or not path_msg.poses:
             return None
@@ -665,14 +672,19 @@ class PlanningNode:
         # navigation segment.  Subsequent stations are selected by route
         # spacing below because the tracker records this position when the
         # episode finishes.
+        first_pose = path_msg.poses[0].pose.position
+        first_position = (float(first_pose.x), float(first_pose.y))
         if not self.visual_coverage.scanned_positions:
-            first_pose = path_msg.poses[0].pose.position
-            return (float(first_pose.x), float(first_pose.y))
+            if not self.visual_coverage.position_is_cooling_down(
+                first_position,
+                now,
+            ):
+                return first_position
 
         previous_x = float(robot_position.x)
         previous_y = float(robot_position.y)
         travelled = 0.0
-        selected = None
+        fallback = None
         for pose_stamped in path_msg.poses:
             current_x = float(pose_stamped.pose.position.x)
             current_y = float(pose_stamped.pose.position.y)
@@ -680,12 +692,19 @@ class PlanningNode:
                 current_x - previous_x,
                 current_y - previous_y,
             )
-            selected = (current_x, current_y)
             previous_x = current_x
             previous_y = current_y
+            current = (current_x, current_y)
+            if self.visual_coverage.position_is_cooling_down(
+                current,
+                now,
+            ):
+                continue
+
+            fallback = current
             if travelled >= self.visual_scan_route_spacing:
-                break
-        return selected
+                return current
+        return fallback
 
     def _visual_checkpoint_should_reanchor_locked(self, robot_position):
         """Return whether a missed checkpoint should be re-anchored.
@@ -2293,6 +2312,7 @@ class PlanningNode:
                                 self._select_visual_scan_checkpoint(
                                     path_msg,
                                     robot_position,
+                                    commit_now.to_sec(),
                                 )
                             )
                             if self.active_exploration_target is not None:
