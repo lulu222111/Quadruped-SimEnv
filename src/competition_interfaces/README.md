@@ -13,6 +13,8 @@
 | `HazardCandidate` | [msg/HazardCandidate.msg](msg/HazardCandidate.msg) | 单个危险源候选 |
 | `HazardCandidateArray` | [msg/HazardCandidateArray.msg](msg/HazardCandidateArray.msg) | 危险源候选批量 |
 | `CompetitionState` | [msg/CompetitionState.msg](msg/CompetitionState.msg) | 全局比赛状态 |
+| `ElevatorMission` | [msg/ElevatorMission.msg](msg/ElevatorMission.msg) | 不可变的跨楼层电梯任务描述 |
+| `ElevatorStatus` | [msg/ElevatorStatus.msg](msg/ElevatorStatus.msg) | 电梯 transit executor 的阶段状态 |
 
 ## 当前状态
 
@@ -53,6 +55,8 @@ rosmsg show competition_interfaces/ModuleStatus
 rosmsg show competition_interfaces/HazardCandidate
 rosmsg show competition_interfaces/HazardCandidateArray
 rosmsg show competition_interfaces/CompetitionState
+rosmsg show competition_interfaces/ElevatorMission
+rosmsg show competition_interfaces/ElevatorStatus
 ```
 
 ## 需要向上下游成员交付的内容
@@ -63,3 +67,5 @@ rosmsg show competition_interfaces/CompetitionState
 - 马跃（competition_mapping）：ModuleStatus 用于地图状态
 - 闫雨萱（competition_planning）：ModuleStatus 用于规划状态
 - 杨渊浩（competition_control）：ModuleStatus 用于控制状态
+- Planning / Control：ElevatorMission、ElevatorStatus 的 V1 接口冻结见
+  [MULTI_FLOOR_ELEVATOR_INTERFACE_FREEZE_V1.md](../../docs/team/MULTI_FLOOR_ELEVATOR_INTERFACE_FREEZE_V1.md)
