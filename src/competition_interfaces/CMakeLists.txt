@@ -13,6 +13,8 @@ add_message_files(
   HazardCandidate.msg
   HazardCandidateArray.msg
   CompetitionState.msg
+  ElevatorMission.msg
+  ElevatorStatus.msg
 )
 
 generate_messages(
