@@ -2024,7 +2024,17 @@ class PlanningNode:
                 ),
                 size_weight=self.size_weight,
                 distance_weight=self.distance_weight,
-                heading_yaw=robot_yaw - origin_yaw,
+                # Inward-biased exploration reference: once the initial-forward
+                # anchor is latched (robot facing the building entrance), keep
+                # using that FIXED inward direction as the frontier heading
+                # reference instead of the ever-changing current yaw.  Otherwise
+                # an unbounded exterior cluster (behind the start pose) keeps
+                # re-capturing the robot whenever it happens to face outward.
+                heading_yaw=(
+                    self.initial_forward_anchor["yaw"]
+                    if self.initial_forward_anchor is not None
+                    else robot_yaw
+                ) - origin_yaw,
                 heading_weight=self.heading_weight,
                 obstacle_threshold=self.obstacle_threshold,
             )

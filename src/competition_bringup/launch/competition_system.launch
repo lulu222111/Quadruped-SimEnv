@@ -31,9 +31,22 @@
   <arg name="planning_frontier_goal_search_radius_cells" default="0" />
   <arg name="planning_return_goal_search_radius_cells" default="2" />
   <arg name="planning_return_path_commit_enabled" default="false" />
-  <arg name="planning_frontier_size_weight" default="1.0" />
-  <arg name="planning_heading_weight_cells" default="0.0" />
-  <arg name="planning_initial_forward_distance" default="0.0" />
+  <!-- Exterior-trap countermeasures (see planning_heading_weight_cells note):
+       size_weight is dropped so an unbounded exterior cluster (thousands of
+       cells) no longer out-scores the nearby rooms; heading_weight (grid-cell
+       units) then dominates toward the fixed inward reference direction. -->
+  <arg name="planning_frontier_size_weight" default="0.1" />
+  <!-- Entry-first exploration (no-truth fix for open-world exterior trap).
+       The robot starts outside, facing the main entrance (~3.2 m ahead in the
+       generated layout).  initial_forward_distance drives it straight through
+       the doorway into the lobby before frontier exploration starts, instead
+       of being captured by the unbounded exterior unknown space (the score
+       size*cluster - dist* + heading* never out-weights an unbounded exterior
+       cluster).  Falls back to frontier safely when the heading is blocked.
+       heading_weight (grid-cell units) then biases frontier choice toward the
+       corridor/rooms ahead after entry. -->
+  <arg name="planning_heading_weight_cells" default="300.0" />
+  <arg name="planning_initial_forward_distance" default="4.0" />
   <arg name="planning_initial_forward_lookahead" default="2.0" />
   <arg name="planning_path_compression_enabled" default="false" />
   <arg name="planning_exploration_complete_confirmations" default="3" />
