@@ -627,6 +627,7 @@ def plan_to_frontier_with_status(
     minimum_standoff_path_length_cells=0,
     obstacle_threshold=50,
     preferred_frontier_cell=None,
+    room_bias_weight=0.0,
 ):
     """
     Select a reachable frontier and report an explicit planning status.
@@ -657,6 +658,28 @@ def plan_to_frontier_with_status(
             "cluster": None,
             "frontier_count": len(frontier_cells),
         }
+
+    # Room-bias distance field (only when requested): distance to nearest
+    # wall for every free/unknown cell.  Frontiers inside wide rooms sit far
+    # from walls (high value) while corridor / elevator-shaft / stairwell
+    # frontiers sit close to walls (low value).  Keyed by each cluster's
+    # first cell (clusters are sorted internally) so the selector can look
+    # up the room distance for whichever subset it is asked about.
+    cluster_room_dist = None
+    if room_bias_weight > 0.0:
+        from room_access import distance_to_wall
+
+        dist_field = distance_to_wall(
+            data, width, height, occ_thresh=obstacle_threshold
+        )
+        cluster_room_dist = {}
+        for cluster in clusters:
+            if not cluster:
+                continue
+            rep = select_frontier_representative(cluster)
+            cluster_room_dist[cluster[0]] = float(
+                dist_field[rep[1], rep[0]]
+            )
 
     planning_grid = inflate_obstacles(
         data,
@@ -789,6 +812,8 @@ def plan_to_frontier_with_status(
             distance_weight=distance_weight,
             heading_yaw=heading_yaw,
             heading_weight=heading_weight,
+            room_bias_weight=room_bias_weight,
+            cluster_room_dist=cluster_room_dist,
         )
 
         if selected_cluster is None:

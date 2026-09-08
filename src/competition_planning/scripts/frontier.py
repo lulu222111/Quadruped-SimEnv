@@ -160,12 +160,24 @@ def select_best_frontier_cluster(
     distance_weight=1.0,
     heading_yaw=None,
     heading_weight=0.0,
+    room_bias_weight=0.0,
+    cluster_room_dist=None,
 ):
-    """Select a frontier cluster by size, distance, and optional heading.
+    """Select a frontier cluster by size, distance, heading, and room bias.
 
     ``heading_weight`` uses grid-cell score units.  Zero preserves the
     original selector; a positive value favours the robot's forward
     half-plane without using scene or hazard truth.
+
+    ``room_bias_weight`` (optional, default 0) adds a bonus proportional to
+    the cluster's distance-to-nearest-wall (cells).  ``cluster_room_dist`` is
+    an optional dict keyed by each cluster's first cell (clusters are
+    internally sorted, so the first cell is a stable per-cluster key) mapping
+    to that cluster's room distance.  Interior-unknown frontiers inside wide
+    rooms sit far from walls (high dist) while corridors / elevator shafts /
+    stairwells sit close to walls (low dist); a positive weight therefore
+    pulls the explorer toward rooms (where the hazard sources are) and away
+    from narrow false spaces.  Ignored when ``room_bias_weight`` is 0.
     """
     if size_weight < 0.0:
         raise ValueError("size_weight must not be negative")
@@ -173,6 +185,8 @@ def select_best_frontier_cluster(
         raise ValueError("distance_weight must not be negative")
     if heading_weight < 0.0:
         raise ValueError("heading_weight must not be negative")
+    if room_bias_weight < 0.0:
+        raise ValueError("room_bias_weight must not be negative")
     if not clusters:
         return None
 
@@ -196,10 +210,16 @@ def select_best_frontier_cluster(
                 cos(heading_yaw) * (representative[0] - robot_x)
                 + sin(heading_yaw) * (representative[1] - robot_y)
             ) / distance
+        room_bonus = 0.0
+        if room_bias_weight > 0.0 and cluster_room_dist is not None:
+            room_bonus = room_bias_weight * cluster_room_dist.get(
+                cluster[0], 0.0
+            )
         score = (
             size_weight * len(cluster)
             - distance_weight * distance
             + heading_weight * heading_alignment
+            + room_bonus
         )
 
         candidates.append(

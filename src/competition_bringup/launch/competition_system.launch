@@ -52,6 +52,13 @@
        heading_weight (grid-cell units) then biases frontier choice toward the
        corridor/rooms ahead after entry. -->
   <arg name="planning_heading_weight_cells" default="300.0" />
+  <!-- Room-bias frontier preference (units = grid-cell distance to the
+       nearest wall at the frontier).  Frontiers deep inside rooms sit far
+       from walls (high value); corridor / elevator-shaft / stairwell
+       frontiers sit close to walls (low value).  A positive weight pulls
+       exploration toward rooms where hazard sources spawn and away from
+       narrow false spaces. -->
+  <arg name="planning_room_bias_weight" default="0.0" />
   <arg name="planning_initial_forward_distance" default="4.0" />
   <arg name="planning_initial_forward_lookahead" default="2.0" />
   <arg name="planning_path_compression_enabled" default="false" />
@@ -187,6 +194,7 @@
                value="$(arg planning_exploration_blocked_nudge_distance)" />
         <param name="size_weight" value="$(arg planning_frontier_size_weight)" />
         <param name="heading_weight" value="$(arg planning_heading_weight_cells)" />
+        <param name="room_bias_weight" value="$(arg planning_room_bias_weight)" />
         <param name="initial_forward_distance"
                value="$(arg planning_initial_forward_distance)" />
         <param name="initial_forward_lookahead"
