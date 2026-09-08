@@ -129,6 +129,27 @@ class LegOdometry:
         self.R_bw = np.eye(3)
         self.last_t = None
 
+        # --- ZUPT (zero-velocity update) ---
+        # Freeze the integrated position while the robot is genuinely
+        # stationary (all joints below a velocity threshold for a sustained
+        # hold time), instead of letting the low-pass residual / joint noise
+        # keep drifting the pose while parked.  Released as soon as a joint
+        # moves above zupt_release_qd.  Purely proprioceptive; no extra input.
+        self.zupt_enabled = bool(rospy.get_param("~zupt_enabled", True))
+        self.stationary_qd_thresh = float(
+            rospy.get_param("~stationary_qd_thresh", 0.05)
+        )
+        self.zupt_release_qd = float(
+            rospy.get_param("~zupt_release_qd", 0.10)
+        )
+        self.zupt_hold_time = float(
+            rospy.get_param("~zupt_hold_time", 0.3)
+        )
+        self._still_since = None
+        self._zupt_active = False
+        if not self.zupt_enabled:
+            self._zupt_active = False
+
         # Explicit input readiness and source/receive timestamps.
         self.imu_ready = False
         self.joint_state_ready = False
@@ -313,12 +334,37 @@ class LegOdometry:
             return
 
         candidates.sort(key=lambda candidate: candidate[0])
-        velocity_raw = candidates[0][1]
-        if all(np.allclose(self.qd[leg], 0.0, atol=1e-3) for leg in range(4)):
-            velocity_raw = np.zeros(3)
-        self.vel_world = self.lp_alpha * velocity_raw + (1.0 - self.lp_alpha) * self.vel_world
-        self.pos[0] += self.vel_scale * self.vel_world[0] * dt
-        self.pos[1] += self.vel_scale * self.vel_world[1] * dt
+        max_qd = max(
+            abs(self.qd[leg][j]) for leg in range(4) for j in range(3)
+        )
+
+        # ZUPT state machine: freeze while truly parked.
+        if self.zupt_enabled:
+            if max_qd >= self.zupt_release_qd:
+                self._still_since = None
+                self._zupt_active = False
+            elif max_qd < self.stationary_qd_thresh:
+                if self._still_since is None:
+                    self._still_since = sample_time
+                elif sample_time - self._still_since >= self.zupt_hold_time:
+                    self._zupt_active = True
+            else:
+                self._still_since = None
+        else:
+            self._still_since = None
+            self._zupt_active = False
+
+        if self._zupt_active:
+            # Parked: zero velocity, freeze integrated planar position.
+            self.vel_world = np.zeros(3)
+        else:
+            velocity_raw = candidates[0][1]
+            self.vel_world = (
+                self.lp_alpha * velocity_raw
+                + (1.0 - self.lp_alpha) * self.vel_world
+            )
+            self.pos[0] += self.vel_scale * self.vel_world[0] * dt
+            self.pos[1] += self.vel_scale * self.vel_world[1] * dt
         self.pos[2] = 0.0
         self._publish(stamp)
 
