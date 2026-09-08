@@ -123,6 +123,14 @@ class PlanningNode:
         self._return_recommit_used_epoch = -1
         self.initial_forward_anchor = None
         self.initial_forward_complete = False
+        # Wedged-target cooldown: a frontier cluster the robot keeps
+        # re-planning to without making progress is temporarily excluded from
+        # selection so the explorer can pick a different reachable target
+        # instead of being stuck on a reachable-but-untraversable false space.
+        self.frontier_cooldowns = {}        # first-cell -> expiry (sim s)
+        self.active_frontier_cell = None
+        self.active_frontier_still_since = None
+        self.active_frontier_last_pos = None
         self.active_exploration_target = None
         # Once a visual checkpoint is selected, keep the route prefix that
         # reaches that checkpoint stable across ordinary map replans.  The
@@ -374,6 +382,12 @@ class PlanningNode:
             self.room_bias_weight = float(
                 rospy.get_param("~room_bias_weight", 0.0)
             )
+            self.frontier_stuck_hold = float(
+                rospy.get_param("~frontier_stuck_hold", 10.0)
+            )
+            self.frontier_stuck_cooldown = float(
+                rospy.get_param("~frontier_stuck_cooldown", 30.0)
+            )
             self.initial_forward_distance = float(
                 rospy.get_param("~initial_forward_distance", 0.0)
             )
@@ -515,6 +529,10 @@ class PlanningNode:
             raise ValueError("initial_forward_distance must not be negative")
         if self.initial_forward_lookahead <= 0.0:
             raise ValueError("initial_forward_lookahead must be positive")
+        if self.frontier_stuck_hold <= 0.0:
+            raise ValueError("frontier_stuck_hold must be positive")
+        if self.frontier_stuck_cooldown <= 0.0:
+            raise ValueError("frontier_stuck_cooldown must be positive")
         if not 1 <= self.obstacle_threshold <= 100:
             raise ValueError("obstacle_threshold must be in [1, 100]")
 
@@ -674,6 +692,11 @@ class PlanningNode:
         self._clear_frontier_continuation_locked()
         self._exploration_complete_streak = 0
         self._exploration_complete_active = False
+        # Fresh mission/generation: drop any wedged-target cooldowns.
+        self.frontier_cooldowns = {}
+        self.active_frontier_cell = None
+        self.active_frontier_still_since = None
+        self.active_frontier_last_pos = None
 
     def _clear_frontier_continuation_locked(self):
         """Drop the unfinished frontier route and its visual final marker."""
@@ -682,6 +705,87 @@ class PlanningNode:
         self.frontier_continuation_frontier_count = 0
         self.frontier_continuation_goal_offset_used = False
         self.frontier_continuation_final_pending = False
+
+    def _note_frontier_plan(self, cluster, robot_position):
+        """Track no-progress wedging on the active frontier cluster.
+
+        Called after every successful non-returning frontier plan.  While the
+        planner keeps selecting the same cluster (same first cell) the robot
+        is expected to move toward it; if it stays put for more than
+        ``frontier_stuck_hold`` seconds the cluster is added to
+        ``frontier_cooldowns`` so later plans exclude it and pick a
+        different reachable objective instead of looping forever on a
+        reachable-but-untraversable false space (e.g. an open stairwell /
+        elevator mouth the grid sees as free).
+        """
+        if not cluster:
+            return
+        now = rospy.Time.now().to_sec()
+        x = robot_position.x
+        y = robot_position.y
+        with self.lock:
+            key = cluster[0]
+            if (
+                key == self.active_frontier_cell
+                and self.active_frontier_last_pos is not None
+            ):
+                dx = x - self.active_frontier_last_pos[0]
+                dy = y - self.active_frontier_last_pos[1]
+                moved = (dx * dx + dy * dy) ** 0.5
+                if moved >= 0.25:
+                    self.active_frontier_still_since = None
+                elif self.active_frontier_still_since is None:
+                    self.active_frontier_still_since = now
+                elif (
+                    now - self.active_frontier_still_since
+                    > self.frontier_stuck_hold
+                ):
+                    rospy.logwarn(
+                        "planning_node: wedged on frontier cluster %s for "
+                        "%.0fs; cooling down for %.0fs",
+                        key,
+                        now - self.active_frontier_still_since,
+                        self.frontier_stuck_cooldown,
+                    )
+                    expiry = now + self.frontier_stuck_cooldown
+                    self.frontier_cooldowns[key] = expiry
+                    # Also record the active continuation arrival cell (when
+                    # present): it belongs to the same cluster and the
+                    # continuation release check keys on it.
+                    continuation_cell = (
+                        self.frontier_continuation_frontier_cell
+                    )
+                    if (
+                        continuation_cell is not None
+                        and continuation_cell != key
+                    ):
+                        self.frontier_cooldowns[continuation_cell] = expiry
+                    self.active_frontier_cell = None
+                    self.active_frontier_still_since = None
+                self.active_frontier_last_pos = (x, y)
+            else:
+                self.active_frontier_cell = key
+                self.active_frontier_last_pos = (x, y)
+                self.active_frontier_still_since = None
+
+    def _cooldown_frontier_cells(self):
+        """Return the set of cooldown first-cells that are still active."""
+        now = rospy.Time.now().to_sec()
+        with self.lock:
+            return {
+                cell
+                for cell, expiry in self.frontier_cooldowns.items()
+                if expiry > now
+            }
+
+    def _continuation_frontier_cell_cooldowned(self):
+        """True if the saved continuation arrival cell is in cooldown."""
+        now = rospy.Time.now().to_sec()
+        with self.lock:
+            cell = self.frontier_continuation_frontier_cell
+            if cell is None:
+                return False
+            return self.frontier_cooldowns.get(cell, 0.0) > now
 
     def _plan_frontier_continuation(
         self,
@@ -2200,6 +2304,16 @@ class PlanningNode:
                 continuation_goal_cell = (
                     self.frontier_continuation_goal_cell
                 )
+            if (
+                continuation_goal_cell is not None
+                and self._continuation_frontier_cell_cooldowned()
+            ):
+                # The continuation target is wedged and cooling down: drop
+                # the fixed-arrival route and let the normal selector choose
+                # a different (non-cooldown) frontier cluster.
+                with self.lock:
+                    self._clear_frontier_continuation_locked()
+                continuation_goal_cell = None
             if continuation_goal_cell is not None:
                 result = self._plan_frontier_continuation(
                     map_msg,
@@ -2233,11 +2347,26 @@ class PlanningNode:
                     heading_yaw=frontier_heading_yaw,
                     heading_weight=self.heading_weight,
                     room_bias_weight=self.room_bias_weight,
+                    exclude_frontier_cells=(
+                        self._cooldown_frontier_cells()
+                    ),
                     minimum_standoff_path_length_cells=(
                         self.minimum_standoff_path_length_cells
                     ),
                     obstacle_threshold=self.obstacle_threshold,
                 )
+
+        if (
+            not returning
+            and not initial_forward
+            and result is not None
+            and result.get("status") == PLAN_SUCCESS
+            and result.get("cluster")
+        ):
+            self._note_frontier_plan(
+                result["cluster"],
+                odom_msg.pose.pose.position,
+            )
 
         if result["status"] == PLAN_NO_FRONTIER:
             if not returning:

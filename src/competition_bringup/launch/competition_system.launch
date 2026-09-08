@@ -59,6 +59,14 @@
        exploration toward rooms where hazard sources spawn and away from
        narrow false spaces. -->
   <arg name="planning_room_bias_weight" default="0.0" />
+  <!-- Wedged-target cooldown: if the robot keeps re-planning to the same
+       frontier cluster without making progress for frontier_stuck_hold
+       seconds, exclude that cluster from selection for
+       frontier_stuck_cooldown seconds so the explorer can pick a different
+       reachable objective (escapes reachable-but-untraversable false
+       spaces like open stairwell/elevator mouths). -->
+  <arg name="planning_frontier_stuck_hold" default="10.0" />
+  <arg name="planning_frontier_stuck_cooldown" default="30.0" />
   <arg name="planning_initial_forward_distance" default="4.0" />
   <arg name="planning_initial_forward_lookahead" default="2.0" />
   <arg name="planning_path_compression_enabled" default="false" />
@@ -195,6 +203,10 @@
         <param name="size_weight" value="$(arg planning_frontier_size_weight)" />
         <param name="heading_weight" value="$(arg planning_heading_weight_cells)" />
         <param name="room_bias_weight" value="$(arg planning_room_bias_weight)" />
+        <param name="frontier_stuck_hold"
+               value="$(arg planning_frontier_stuck_hold)" />
+        <param name="frontier_stuck_cooldown"
+               value="$(arg planning_frontier_stuck_cooldown)" />
         <param name="initial_forward_distance"
                value="$(arg planning_initial_forward_distance)" />
         <param name="initial_forward_lookahead"

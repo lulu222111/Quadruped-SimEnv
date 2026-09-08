@@ -628,9 +628,17 @@ def plan_to_frontier_with_status(
     obstacle_threshold=50,
     preferred_frontier_cell=None,
     room_bias_weight=0.0,
+    exclude_frontier_cells=None,
 ):
     """
     Select a reachable frontier and report an explicit planning status.
+
+    ``exclude_frontier_cells`` (optional iterable of ``(x, y)`` cells)
+    marks frontier clusters to SKIP: any cluster containing at least one of
+    these cells is dropped from selection.  Used as a cooldown for targets
+    the robot is physically stuck on (it keeps re-planning to a reachable-
+    but-untraversable frontier).  When exclusion would remove every cluster
+    the cooldown is ignored so the robot never loses its only objective.
 
     Returns:
         A dictionary whose ``status`` is one of:
@@ -805,6 +813,20 @@ def plan_to_frontier_with_status(
     }
 
     while remaining_clusters:
+        if exclude_frontier_cells is not None and len(
+            exclude_frontier_cells
+        ) > 0:
+            usable = [
+                cluster
+                for cluster in remaining_clusters
+                if not any(
+                    cell in exclude_frontier_cells for cell in cluster
+                )
+            ]
+            # Never drop every objective: cooldowns only re-rank, they must
+            # not empty the candidate set entirely.
+            if usable:
+                remaining_clusters = usable
         selected_cluster = select_best_frontier_cluster(
             remaining_clusters,
             robot_cell=robot_cell,

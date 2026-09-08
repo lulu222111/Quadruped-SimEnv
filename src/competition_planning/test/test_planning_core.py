@@ -290,6 +290,62 @@ class PlanToFrontierTest(unittest.TestCase):
         self.assertEqual(result["cluster"], preferred_cluster)
         self.assertIn(result["goal_cell"], preferred_cluster)
 
+    def test_exclude_frontier_cells_skips_cooldowned_cluster(self):
+        cluster_a = [(3, 1), (3, 2), (3, 3), (3, 4), (3, 5)]
+        cluster_b = [(1, 1), (1, 2), (1, 3)]
+        parents = {
+            (0, 2): None,
+            (1, 1): (0, 2),
+            (1, 2): (0, 2),
+            (1, 3): (0, 2),
+            (3, 1): (2, 2),
+            (3, 2): (2, 2),
+            (3, 3): (2, 2),
+            (3, 4): (2, 2),
+            (3, 5): (2, 2),
+            (2, 2): (1, 2),
+        }
+        with patch(
+            "planning_core.extract_frontier_cells",
+            return_value=cluster_a + cluster_b,
+        ):
+            with patch(
+                "planning_core.cluster_frontier_cells",
+                return_value=[cluster_a, cluster_b],
+            ):
+                with patch(
+                    "planning_core.inflate_obstacles",
+                    return_value=[0] * 30,
+                ):
+                    with patch(
+                        "planning_core._bfs_reachability",
+                        return_value=parents,
+                    ):
+                        # Without exclusion the larger cluster_a wins.
+                        picked = plan_to_frontier_with_status(
+                            [0] * 30,
+                            width=6,
+                            height=5,
+                            robot_cell=(0, 2),
+                            min_frontier_size=1,
+                            size_weight=3.0,
+                            distance_weight=1.0,
+                        )
+                        self.assertEqual(picked["cluster"], cluster_a)
+                        # With cluster_a excluded only cluster_b remains.
+                        picked = plan_to_frontier_with_status(
+                            [0] * 30,
+                            width=6,
+                            height=5,
+                            robot_cell=(0, 2),
+                            min_frontier_size=1,
+                            size_weight=3.0,
+                            distance_weight=1.0,
+                            exclude_frontier_cells=set(cluster_a),
+                        )
+                        self.assertEqual(picked["status"], "success")
+                        self.assertEqual(picked["cluster"], cluster_b)
+
     def test_clears_inflation_from_free_robot_start_cell(
         self,
     ):
