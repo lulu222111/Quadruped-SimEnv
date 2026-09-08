@@ -161,6 +161,7 @@ def select_best_frontier_cluster(
     heading_yaw=None,
     heading_weight=0.0,
     room_bias_weight=0.0,
+    room_bias_center_cells=0.0,
     cluster_room_dist=None,
 ):
     """Select a frontier cluster by size, distance, heading, and room bias.
@@ -169,15 +170,21 @@ def select_best_frontier_cluster(
     original selector; a positive value favours the robot's forward
     half-plane without using scene or hazard truth.
 
-    ``room_bias_weight`` (optional, default 0) adds a bonus proportional to
-    the cluster's distance-to-nearest-wall (cells).  ``cluster_room_dist`` is
-    an optional dict keyed by each cluster's first cell (clusters are
-    internally sorted, so the first cell is a stable per-cluster key) mapping
-    to that cluster's room distance.  Interior-unknown frontiers inside wide
-    rooms sit far from walls (high dist) while corridors / elevator shafts /
-    stairwells sit close to walls (low dist); a positive weight therefore
-    pulls the explorer toward rooms (where the hazard sources are) and away
-    from narrow false spaces.  Ignored when ``room_bias_weight`` is 0.
+    ``room_bias_weight`` adds a bonus that is CENTRED on
+    ``room_bias_center_cells``:
+
+        bonus = room_bias_weight * (dist_from_wall - room_bias_center_cells)
+
+    ``cluster_room_dist`` is an optional dict keyed by each cluster's first
+    cell (clusters are internally sorted, so the first cell is a stable
+    per-cluster key) mapping to that cluster's distance to the nearest wall
+    (cells).  Frontiers whose rep sits far from walls (wide rooms / lobby
+    interiors, e.g. dist ~ 40+ cells at 0.1 m) get a POSITIVE bonus, while
+    frontiers in narrow false spaces (corridors / elevator shafts /
+    stairwells, e.g. dist ~ 11-16 cells at 0.1 m) get a NEGATIVE bonus when
+    their dist is below the centre.  With ``room_bias_center_cells = 0`` the
+    term reduces to the original linear ``weight * dist`` behaviour.
+    Ignored when ``room_bias_weight`` is 0 or ``cluster_room_dist`` is None.
     """
     if size_weight < 0.0:
         raise ValueError("size_weight must not be negative")
@@ -187,6 +194,8 @@ def select_best_frontier_cluster(
         raise ValueError("heading_weight must not be negative")
     if room_bias_weight < 0.0:
         raise ValueError("room_bias_weight must not be negative")
+    if room_bias_center_cells < 0.0:
+        raise ValueError("room_bias_center_cells must not be negative")
     if not clusters:
         return None
 
@@ -212,8 +221,9 @@ def select_best_frontier_cluster(
             ) / distance
         room_bonus = 0.0
         if room_bias_weight > 0.0 and cluster_room_dist is not None:
-            room_bonus = room_bias_weight * cluster_room_dist.get(
-                cluster[0], 0.0
+            dist_from_wall = cluster_room_dist.get(cluster[0], 0.0)
+            room_bonus = room_bias_weight * (
+                dist_from_wall - room_bias_center_cells
             )
         score = (
             size_weight * len(cluster)

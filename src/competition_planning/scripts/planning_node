@@ -374,6 +374,9 @@ class PlanningNode:
             self.room_bias_weight = float(
                 rospy.get_param("~room_bias_weight", 0.0)
             )
+            self.room_bias_center_m = float(
+                rospy.get_param("~room_bias_center_m", 1.9)
+            )
             self.initial_forward_distance = float(
                 rospy.get_param("~initial_forward_distance", 0.0)
             )
@@ -420,6 +423,7 @@ class PlanningNode:
             ("distance_weight", self.distance_weight),
             ("heading_weight", self.heading_weight),
             ("room_bias_weight", self.room_bias_weight),
+            ("room_bias_center_m", self.room_bias_center_m),
             ("initial_forward_distance", self.initial_forward_distance),
             ("initial_forward_lookahead", self.initial_forward_lookahead),
             ("map_timeout", self.map_timeout),
@@ -511,6 +515,8 @@ class PlanningNode:
             raise ValueError("heading_weight must not be negative")
         if self.room_bias_weight < 0.0:
             raise ValueError("room_bias_weight must not be negative")
+        if self.room_bias_center_m < 0.0:
+            raise ValueError("room_bias_center_m must not be negative")
         if self.initial_forward_distance < 0.0:
             raise ValueError("initial_forward_distance must not be negative")
         if self.initial_forward_lookahead <= 0.0:
@@ -683,6 +689,13 @@ class PlanningNode:
         self.frontier_continuation_goal_offset_used = False
         self.frontier_continuation_final_pending = False
 
+    def _room_bias_center_cells(self, resolution):
+        """Centre (in metres) of the room-bias dist term, in grid cells."""
+        return max(
+            0.0,
+            self.room_bias_center_m / max(resolution, 1e-9),
+        )
+
     def _plan_frontier_continuation(
         self,
         map_msg,
@@ -752,6 +765,9 @@ class PlanningNode:
                 heading_yaw=heading_yaw,
                 heading_weight=self.heading_weight,
                 room_bias_weight=self.room_bias_weight,
+                room_bias_center_cells=self._room_bias_center_cells(
+                    map_msg.info.resolution
+                ),
                 minimum_standoff_path_length_cells=(
                     self.minimum_standoff_path_length_cells
                 ),
@@ -2233,6 +2249,9 @@ class PlanningNode:
                     heading_yaw=frontier_heading_yaw,
                     heading_weight=self.heading_weight,
                     room_bias_weight=self.room_bias_weight,
+                    room_bias_center_cells=self._room_bias_center_cells(
+                        info.resolution
+                    ),
                     minimum_standoff_path_length_cells=(
                         self.minimum_standoff_path_length_cells
                     ),
