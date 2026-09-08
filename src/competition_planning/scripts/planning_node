@@ -104,6 +104,8 @@ class PlanningNode:
         )
         self.mission_state = CompetitionStateMsg.WAITING
         self.mission_epoch = 0
+        self.exploration_task_id = ''
+        self.floor_exploration_active = True
         self.returning = False
         self.return_start_pose = None
         self.return_start_pose_error = None
@@ -135,6 +137,17 @@ class PlanningNode:
         # bounded real progress away from it.
         self.visual_scan_checkpoint_origin = None
         self.visual_scan_final_pending = False
+        # Preserve the selected frontier's final arrival cell while visual
+        # checkpoints are handled on the way there.  Re-planning a fresh
+        # frontier after each checkpoint can select a nearby already-covered
+        # pocket and discard an unfinished remote route.  The continuation
+        # stores only a planner-selected free cell; every publication still
+        # comes from a fresh map-validated plan.
+        self.frontier_continuation_goal_cell = None
+        self.frontier_continuation_frontier_cell = None
+        self.frontier_continuation_frontier_count = 0
+        self.frontier_continuation_goal_offset_used = False
+        self.frontier_continuation_final_pending = False
         self._exploration_complete_streak = 0
         self._exploration_complete_active = False
 
@@ -255,6 +268,11 @@ class PlanningNode:
             )
             self.frontier_goal_search_radius_cells = int(
                 rospy.get_param("~frontier_goal_search_radius_cells", 0)
+            )
+            self.minimum_standoff_path_length_cells = int(
+                rospy.get_param(
+                    "~minimum_standoff_path_length_cells", 0
+                )
             )
             self.return_goal_search_radius_cells = int(
                 rospy.get_param("~return_goal_search_radius_cells", 2)
@@ -473,6 +491,10 @@ class PlanningNode:
             raise ValueError(
                 "frontier_goal_search_radius_cells must not be negative"
             )
+        if self.minimum_standoff_path_length_cells < 0:
+            raise ValueError(
+                "minimum_standoff_path_length_cells must not be negative"
+            )
         if self.return_goal_search_radius_cells < 0:
             raise ValueError(
                 "return_goal_search_radius_cells must not be negative"
@@ -643,8 +665,111 @@ class PlanningNode:
         self.visual_scan_checkpoint_goal = None
         self.visual_scan_checkpoint_origin = None
         self.visual_scan_final_pending = False
+        self._clear_frontier_continuation_locked()
         self._exploration_complete_streak = 0
         self._exploration_complete_active = False
+
+    def _clear_frontier_continuation_locked(self):
+        """Drop the unfinished frontier route and its visual final marker."""
+        self.frontier_continuation_goal_cell = None
+        self.frontier_continuation_frontier_cell = None
+        self.frontier_continuation_frontier_count = 0
+        self.frontier_continuation_goal_offset_used = False
+        self.frontier_continuation_final_pending = False
+
+    def _plan_frontier_continuation(
+        self,
+        map_msg,
+        robot_cell,
+        inflation_radius_cells,
+        heading_yaw=0.0,
+    ):
+        """Re-plan to the still-unfinished frontier arrival cell.
+
+        This is deliberately a fixed-goal bridge between visual stations. It
+        does not reuse stale path geometry: the current occupancy grid and
+        the normal inflated-grid goal planner validate every new route. If
+        the saved arrival cell is no longer legal/reachable, release it and
+        let the normal frontier selector choose a new target.
+        """
+        if not self.visual_scan_enabled or not self.visual_coverage.enabled:
+            return None
+
+        with self.lock:
+            goal_cell = self.frontier_continuation_goal_cell
+            frontier_cell = self.frontier_continuation_frontier_cell
+            frontier_count = self.frontier_continuation_frontier_count
+            goal_offset_used = self.frontier_continuation_goal_offset_used
+
+        if goal_cell is None:
+            return None
+
+        result = plan_to_goal_with_status(
+            list(map_msg.data),
+            width=map_msg.info.width,
+            height=map_msg.info.height,
+            robot_cell=robot_cell,
+            goal_cell=goal_cell,
+            inflation_radius_cells=inflation_radius_cells,
+            start_recovery_radius_cells=self.start_recovery_radius_cells,
+            obstacle_threshold=self.obstacle_threshold,
+        )
+        retargeted = False
+        if result["status"] != PLAN_SUCCESS:
+            # The map may invalidate one arrival/standoff cell while leaving
+            # the selected frontier region reachable.  Preserve that
+            # frontier objective and let the ordinary candidate/standoff
+            # contract choose a current legal cell from its cluster.  The
+            # preferred-cluster argument deliberately returns UNREACHABLE if
+            # the recorded frontier itself is gone, which is the point at
+            # which releasing the continuation is justified.
+            if frontier_cell is None:
+                with self.lock:
+                    if self.frontier_continuation_goal_cell == goal_cell:
+                        self._clear_frontier_continuation_locked()
+                return None
+            result = plan_to_frontier_with_status(
+                list(map_msg.data),
+                width=map_msg.info.width,
+                height=map_msg.info.height,
+                robot_cell=robot_cell,
+                min_frontier_size=self.frontier_min_size,
+                inflation_radius_cells=inflation_radius_cells,
+                start_recovery_radius_cells=(
+                    self.start_recovery_radius_cells
+                ),
+                frontier_goal_search_radius_cells=(
+                    self.frontier_goal_search_radius_cells
+                ),
+                size_weight=self.size_weight,
+                distance_weight=self.distance_weight,
+                heading_yaw=heading_yaw,
+                heading_weight=self.heading_weight,
+                minimum_standoff_path_length_cells=(
+                    self.minimum_standoff_path_length_cells
+                ),
+                obstacle_threshold=self.obstacle_threshold,
+                preferred_frontier_cell=frontier_cell,
+            )
+            if result["status"] != PLAN_SUCCESS:
+                with self.lock:
+                    if self.frontier_continuation_goal_cell == goal_cell:
+                        self._clear_frontier_continuation_locked()
+                return None
+            retargeted = result["goal_cell"] != goal_cell
+
+        if not retargeted:
+            result["frontier_count"] = frontier_count
+            result["frontier_goal_cell"] = (
+                frontier_cell if frontier_cell is not None else goal_cell
+            )
+            result["frontier_goal_offset_used"] = goal_offset_used
+        result["frontier_continuation"] = True
+        result["frontier_continuation_retargeted"] = retargeted
+        # The commit path uses this to reject a result if a final scan
+        # released the continuation while planning was in flight.
+        result["continuation_goal_cell"] = goal_cell
+        return result
 
     def _select_visual_scan_checkpoint(
         self,
@@ -695,6 +820,13 @@ class PlanningNode:
             previous_x = current_x
             previous_y = current_y
             current = (current_x, current_y)
+            # A covered pose cannot become a new scan station.  Returning a
+            # covered endpoint as the short-route fallback makes the caller
+            # reach it, receive SCAN_SKIPPED, and replan the same frontier
+            # route indefinitely.  If every pose is already covered, return
+            # no checkpoint so the full frontier route remains executable.
+            if self.visual_coverage.position_is_covered(current):
+                continue
             if self.visual_coverage.position_is_cooling_down(
                 current,
                 now,
@@ -830,6 +962,10 @@ class PlanningNode:
                 self.visual_scan_checkpoint_path = None
                 self.visual_scan_checkpoint_goal = None
                 self.visual_scan_checkpoint_origin = None
+                if self.frontier_continuation_final_pending:
+                    self._clear_frontier_continuation_locked()
+                else:
+                    self.frontier_continuation_final_pending = False
                 return False
 
             self.visual_scan_checkpoint_origin = None
@@ -967,6 +1103,10 @@ class PlanningNode:
 
             heading_timeout = event.kind == SCAN_HEADING_TIMEOUT
 
+            frontier_scan_was_final = (
+                self.frontier_continuation_final_pending
+            )
+
             self.active_exploration_target = None
             self.visual_scan_checkpoint_path = None
             self.visual_scan_checkpoint_goal = None
@@ -976,6 +1116,10 @@ class PlanningNode:
                 # Only an explicitly completed episode satisfies the final
                 # visual-coverage gate.
                 self.visual_scan_final_pending = False
+                if frontier_scan_was_final:
+                    self._clear_frontier_continuation_locked()
+                else:
+                    self.frontier_continuation_final_pending = False
                 rospy.loginfo(
                     "planning_node: visual scan complete (%d headings); "
                     "resuming frontier exploration",
@@ -1003,6 +1147,12 @@ class PlanningNode:
                 # was the mandatory final scan, retain the pending obligation
                 # so the no-frontier debounce cannot publish completion.
                 self.visual_scan_final_pending = final_scan_was_pending
+                # Keep an unfinished frontier target across a failed scan;
+                # the tracker-owned cooldown will prevent an immediate retry,
+                # while the next route still continues toward the same goal.
+                self.frontier_continuation_final_pending = (
+                    frontier_scan_was_final
+                )
                 self._clear_exploration_complete()
 
                 if event.kind == SCAN_TIMEOUT:
@@ -1097,8 +1247,15 @@ class PlanningNode:
         target_returning = msg.state == CompetitionStateMsg.RETURNING
         completion_was_active = False
         with self.lock:
-            if target_returning == self.returning:
+            task_id = getattr(msg, 'exploration_task_id', '')
+            first_task = not getattr(self, 'exploration_task_id', '')
+            active = getattr(msg, 'floor_exploration_active', True) if task_id else True
+            task_changed = task_id != getattr(self, 'exploration_task_id', '')
+            lifecycle_changed = task_changed or active != getattr(self, 'floor_exploration_active', True)
+            if target_returning == self.returning and not lifecycle_changed:
                 return
+            self.exploration_task_id = task_id
+            self.floor_exploration_active = active
             self.returning = target_returning
             self.mission_state = msg.state
             self.mission_epoch += 1
@@ -1107,6 +1264,13 @@ class PlanningNode:
                 or self._exploration_complete_streak > 0
             )
             self._reset_visual_coverage_locked()
+            if task_changed:
+                self.initial_forward_anchor = None
+                # Entry-first behavior applies on the initial floor only.
+                self.initial_forward_complete = not first_task
+            if lifecycle_changed:
+                self._enter_new_generation('floor_task', rospy.Time.now(), force=True)
+                self._clear_fault('floor_task')
             if target_returning:
                 self._load_return_start_pose_locked()
                 self.return_committed_path = None
@@ -1128,7 +1292,7 @@ class PlanningNode:
                     0.0,
                     "mission state changed; waiting for exploration plan",
                 )
-        if completion_was_active:
+        if completion_was_active or task_changed:
             self._publish_exploration_complete(False)
 
     def stuck_callback(self, msg):
@@ -1394,6 +1558,11 @@ class PlanningNode:
         msg.valid = valid
         msg.confidence = confidence
         msg.detail = detail
+        msg.exploration_task_id = getattr(self, 'exploration_task_id', '')
+        msg.exploration_complete = bool(
+            getattr(self, '_exploration_complete_active', False)
+            and getattr(self, 'floor_exploration_active', True)
+            and state == ModuleStatus.SUCCEEDED)
         self.status_pub.publish(msg)
 
     def heartbeat_callback(self, _event):
@@ -1681,6 +1850,10 @@ class PlanningNode:
             return
 
         with self.lock:
+            if not getattr(self, 'floor_exploration_active', True) and not self.returning:
+                self._invalidate_plan_locked(ModuleStatus.STARTING, 0.0,
+                                             'floor exploration suspended')
+                return
             generation = self.generation
             map_msg = self.map_msg
             odom_msg = self.odom_msg
@@ -1952,6 +2125,11 @@ class PlanningNode:
         origin_yaw = quaternion_to_yaw(origin.orientation)
         robot_position = odom_msg.pose.pose.position
         robot_yaw = quaternion_to_yaw(odom_msg.pose.pose.orientation)
+        frontier_heading_yaw = (
+            self.initial_forward_anchor["yaw"]
+            if self.initial_forward_anchor is not None
+            else robot_yaw
+        ) - origin_yaw
 
         finite_pose_values = (
             origin.position.x,
@@ -1978,6 +2156,8 @@ class PlanningNode:
         )
 
         initial_forward = False
+        frontier_continuation = False
+        continuation_goal_cell = None
         if returning:
             return_cell = world_to_grid_cell(
                 (return_start_pose["x"], return_start_pose["y"]),
@@ -2009,35 +2189,47 @@ class PlanningNode:
             )
             initial_forward = result is not None
         if not returning and not initial_forward:
-            result = plan_to_frontier_with_status(
-                list(map_msg.data),
-                width=info.width,
-                height=info.height,
-                robot_cell=robot_cell,
-                min_frontier_size=self.frontier_min_size,
-                inflation_radius_cells=inflation_radius_cells,
-                start_recovery_radius_cells=(
-                    self.start_recovery_radius_cells
-                ),
-                frontier_goal_search_radius_cells=(
-                    self.frontier_goal_search_radius_cells
-                ),
-                size_weight=self.size_weight,
-                distance_weight=self.distance_weight,
-                # Inward-biased exploration reference: once the initial-forward
-                # anchor is latched (robot facing the building entrance), keep
-                # using that FIXED inward direction as the frontier heading
-                # reference instead of the ever-changing current yaw.  Otherwise
-                # an unbounded exterior cluster (behind the start pose) keeps
-                # re-capturing the robot whenever it happens to face outward.
-                heading_yaw=(
-                    self.initial_forward_anchor["yaw"]
-                    if self.initial_forward_anchor is not None
-                    else robot_yaw
-                ) - origin_yaw,
-                heading_weight=self.heading_weight,
-                obstacle_threshold=self.obstacle_threshold,
-            )
+            with self.lock:
+                continuation_goal_cell = (
+                    self.frontier_continuation_goal_cell
+                )
+            if continuation_goal_cell is not None:
+                result = self._plan_frontier_continuation(
+                    map_msg,
+                    robot_cell,
+                    inflation_radius_cells,
+                    frontier_heading_yaw,
+                )
+                frontier_continuation = result is not None
+            if not frontier_continuation:
+                result = plan_to_frontier_with_status(
+                    list(map_msg.data),
+                    width=info.width,
+                    height=info.height,
+                    robot_cell=robot_cell,
+                    min_frontier_size=self.frontier_min_size,
+                    inflation_radius_cells=inflation_radius_cells,
+                    start_recovery_radius_cells=(
+                        self.start_recovery_radius_cells
+                    ),
+                    frontier_goal_search_radius_cells=(
+                        self.frontier_goal_search_radius_cells
+                    ),
+                    size_weight=self.size_weight,
+                    distance_weight=self.distance_weight,
+                    # Inward-biased exploration reference: once the initial-forward
+                    # anchor is latched (robot facing the building entrance), keep
+                    # using that FIXED inward direction as the frontier heading
+                    # reference instead of the ever-changing current yaw.  Otherwise
+                    # an unbounded exterior cluster (behind the start pose) keeps
+                    # re-capturing the robot whenever it happens to face outward.
+                    heading_yaw=frontier_heading_yaw,
+                    heading_weight=self.heading_weight,
+                    minimum_standoff_path_length_cells=(
+                        self.minimum_standoff_path_length_cells
+                    ),
+                    obstacle_threshold=self.obstacle_threshold,
+                )
 
         if result["status"] == PLAN_NO_FRONTIER:
             if not returning:
@@ -2202,6 +2394,8 @@ class PlanningNode:
             )
             if result.get("frontier_goal_offset_used", False):
                 detail += "safe standoff goal {}; ".format(result["goal_cell"])
+            if frontier_continuation:
+                detail += "frontier continuation; "
         detail += (
             "{} frontier cells detected; robot_cell={}; "
             "robot_cell_raw_value={}; "
@@ -2228,6 +2422,13 @@ class PlanningNode:
                 and (mission_epoch is None or self.mission_epoch == mission_epoch)
                 and self.returning == returning
             )
+            if (
+                result_is_current
+                and frontier_continuation
+                and self.frontier_continuation_goal_cell
+                != continuation_goal_cell
+            ):
+                result_is_current = False
             if result_is_current:
                 commit_now = rospy.Time.now()
                 watchdog_failure = self._watchdog_failure_locked(
@@ -2243,6 +2444,30 @@ class PlanningNode:
                     )
                     return
 
+                if (
+                    frontier_continuation
+                    and result.get("frontier_continuation_retargeted", False)
+                    and self.frontier_continuation_goal_cell
+                    == continuation_goal_cell
+                ):
+                    # A current-map alternate in the same frontier cluster
+                    # replaces only the invalid arrival cell.  Keep the
+                    # continuation identity stable for this commit, then
+                    # carry the new planner-selected arrival forward.
+                    self.frontier_continuation_goal_cell = tuple(
+                        result["goal_cell"]
+                    )
+                    self.frontier_continuation_frontier_cell = tuple(
+                        result["frontier_goal_cell"]
+                    )
+                    self.frontier_continuation_frontier_count = int(
+                        result.get("frontier_count", 0)
+                    )
+                    self.frontier_continuation_goal_offset_used = bool(
+                        result.get("frontier_goal_offset_used", False)
+                    )
+                    self.frontier_continuation_final_pending = False
+
                 # The final check and all output publications are one
                 # lock-protected commit. An invalidating callback can only
                 # publish after this block, so an old path cannot revive.
@@ -2250,6 +2475,32 @@ class PlanningNode:
                 published_goal = goal_msg
                 published_stamp = stamp
                 if not returning:
+                    if (
+                        not initial_forward
+                        and not frontier_continuation
+                        and self.visual_scan_enabled
+                        and self.visual_coverage.enabled
+                    ):
+                        # The selected standoff/arrival cell is a logical
+                        # continuation target.  It is retained only until
+                        # that route reaches its final visual station or the
+                        # current map proves the cell invalid.
+                        self.frontier_continuation_goal_cell = tuple(
+                            result["goal_cell"]
+                        )
+                        frontier_goal_cell = result.get(
+                            "frontier_goal_cell",
+                            result["goal_cell"],
+                        )
+                        self.frontier_continuation_frontier_cell = tuple(
+                            frontier_goal_cell
+                        )
+                        self.frontier_continuation_frontier_count = int(
+                            result.get("frontier_count", 0)
+                        )
+                        self.frontier_continuation_goal_offset_used = bool(
+                            result.get("frontier_goal_offset_used", False)
+                        )
                     # A checkpoint is a visual-coverage obligation for this
                     # generation, not a copy of the latest frontier route.
                     # Map replanning can move nearby route vertices by more
@@ -2358,6 +2609,43 @@ class PlanningNode:
                             round(self.active_exploration_target[0], 2),
                             round(self.active_exploration_target[1], 2),
                         )
+                        if (
+                            not initial_forward
+                            and self.frontier_continuation_goal_cell
+                            is not None
+                            and self.visual_scan_checkpoint_goal is not None
+                        ):
+                            checkpoint_position = (
+                                self.visual_scan_checkpoint_goal.pose.position
+                            )
+                            final_goal_position = goal_msg.pose.position
+                            self.frontier_continuation_final_pending = (
+                                hypot(
+                                    checkpoint_position.x
+                                    - final_goal_position.x,
+                                    checkpoint_position.y
+                                    - final_goal_position.y,
+                                )
+                                <= self.visual_scan_target_tolerance
+                            )
+                    elif (
+                        not initial_forward
+                        and self.frontier_continuation_goal_cell is not None
+                        and not self.frontier_continuation_final_pending
+                        and not self.visual_coverage.position_is_cooling_down(
+                            (robot_position.x, robot_position.y),
+                            commit_now.to_sec(),
+                        )
+                        and hypot(
+                            robot_position.x - goal_msg.pose.position.x,
+                            robot_position.y - goal_msg.pose.position.y,
+                        )
+                        <= self.visual_scan_target_tolerance
+                    ):
+                        # If every pose of a completed route is already
+                        # covered, there is no pending visual station.  Do not
+                        # retain a zero-length continuation forever.
+                        self._clear_frontier_continuation_locked()
                     if reanchored_checkpoint:
                         detail += " visual_scan_checkpoint_reanchored"
                     self.visual_scan_final_pending = False
@@ -2513,14 +2801,28 @@ class PlanningNode:
             self.initial_forward_lookahead,
             self.initial_forward_distance - progress,
         )
+        anchor_cell = world_to_grid_cell(
+            (anchor["x"], anchor["y"]),
+            resolution=map_msg.info.resolution,
+            origin_x=map_msg.info.origin.position.x,
+            origin_y=map_msg.info.origin.position.y,
+            origin_yaw=quaternion_to_yaw(map_msg.info.origin.orientation),
+        )
+        minimum_step = max(0.5, map_msg.info.resolution)
         candidate = plan_to_heading_goal_with_status(
             list(map_msg.data),
             width=map_msg.info.width,
             height=map_msg.info.height,
             robot_cell=robot_cell,
             heading_yaw=anchor["yaw"] - quaternion_to_yaw(map_msg.info.origin.orientation),
-            max_forward_cells=maximum_step / map_msg.info.resolution,
-            min_forward_cells=max(0.5, map_msg.info.resolution) / map_msg.info.resolution,
+            # Replans must keep the initial-forward corridor tied to the
+            # latched entry anchor.  Measuring it from the current robot cell
+            # lets a lateral detour move the corridor on every map refresh,
+            # so projected anchor progress can remain below the completion
+            # threshold indefinitely.
+            heading_reference_cell=anchor_cell,
+            max_forward_cells=(progress + maximum_step) / map_msg.info.resolution,
+            min_forward_cells=(progress + minimum_step) / map_msg.info.resolution,
             corridor_half_width_cells=1.0 / map_msg.info.resolution,
             inflation_radius_cells=inflation_radius_cells,
             start_recovery_radius_cells=self.start_recovery_radius_cells,

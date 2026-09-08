@@ -263,10 +263,26 @@ def _find_recovery_start(
     return candidate_x, candidate_y
 
 
-def _nearest_reachable_standoff(parent, frontier_cell, radius_cells, planning_start):
-    """Return a safe reachable cell near a frontier blocked by inflation."""
+def _nearest_reachable_standoff(
+    parent,
+    frontier_cell,
+    radius_cells,
+    planning_start,
+    minimum_path_length_cells=0,
+):
+    """Return a safe reachable cell near a frontier blocked by inflation.
+
+    A standoff can be geometrically valid while being so close to the current
+    start that the path follower treats every pose as already reached.  The
+    optional minimum path length lets the caller express that controller
+    contract without changing the ordinary exact-frontier planner.
+    """
     if radius_cells < 1:
         return None
+    if minimum_path_length_cells < 0:
+        raise ValueError(
+            "minimum_path_length_cells must not be negative"
+        )
     frontier_x, frontier_y = frontier_cell
     candidates = []
     for dy in range(-radius_cells, radius_cells + 1):
@@ -277,10 +293,18 @@ def _nearest_reachable_standoff(parent, frontier_cell, radius_cells, planning_st
             candidate = (frontier_x + dx, frontier_y + dy)
             if candidate in parent and candidate != planning_start:
                 candidates.append((distance, candidate[1], candidate[0]))
-    if not candidates:
-        return None
-    _, candidate_y, candidate_x = min(candidates)
-    return candidate_x, candidate_y
+    for _, candidate_y, candidate_x in sorted(candidates):
+        candidate = candidate_x, candidate_y
+        path_length_cells = 0
+        cell = candidate
+        while cell is not None:
+            path_length_cells += 1
+            cell = parent[cell]
+        path_length_cells -= 1
+        if path_length_cells < minimum_path_length_cells:
+            continue
+        return candidate
+    return None
 
 
 def plan_to_goal_with_status(
@@ -466,8 +490,16 @@ def plan_to_heading_goal_with_status(
     inflation_radius_cells=0,
     start_recovery_radius_cells=0,
     obstacle_threshold=50,
+    heading_reference_cell=None,
 ):
-    """Plan to the furthest reachable free cell in a local heading corridor."""
+    """Plan to the furthest reachable free cell in a heading corridor.
+
+    By default the corridor is measured from ``robot_cell``.  A caller that
+    is maintaining a fixed heading anchor may provide
+    ``heading_reference_cell``; the BFS still starts at ``robot_cell``, but
+    candidate forward/lateral offsets are then measured from that fixed cell.
+    This keeps replanning from moving the corridor itself as the robot moves.
+    """
     if max_forward_cells <= 0.0:
         raise ValueError("max_forward_cells must be positive")
     if min_forward_cells <= 0.0:
@@ -530,10 +562,13 @@ def plan_to_heading_goal_with_status(
     )
     direction_x = cos(heading_yaw)
     direction_y = sin(heading_yaw)
+    if heading_reference_cell is None:
+        heading_reference_cell = robot_cell
+    reference_x, reference_y = heading_reference_cell
     candidates = []
     for cell in parent:
-        dx = cell[0] - robot_x
-        dy = cell[1] - robot_y
+        dx = cell[0] - reference_x
+        dy = cell[1] - reference_y
         forward = direction_x * dx + direction_y * dy
         lateral = abs(-direction_y * dx + direction_x * dy)
         if (
@@ -550,6 +585,7 @@ def plan_to_heading_goal_with_status(
         "start_recovery_cell": start_recovery_cell,
         "reachable_cell_count": len(parent),
         "inflation_radius_cells": inflation_radius_cells,
+        "heading_reference_cell": heading_reference_cell,
     }
     if not candidates:
         return {
@@ -588,7 +624,9 @@ def plan_to_frontier_with_status(
     distance_weight=1.0,
     heading_yaw=None,
     heading_weight=0.0,
+    minimum_standoff_path_length_cells=0,
     obstacle_threshold=50,
+    preferred_frontier_cell=None,
 ):
     """
     Select a reachable frontier and report an explicit planning status.
@@ -635,6 +673,10 @@ def plan_to_frontier_with_status(
     if frontier_goal_search_radius_cells < 0:
         raise ValueError(
             "frontier_goal_search_radius_cells must not be negative"
+        )
+    if minimum_standoff_path_length_cells < 0:
+        raise ValueError(
+            "minimum_standoff_path_length_cells must not be negative"
         )
 
     robot_x, robot_y = robot_cell
@@ -690,7 +732,27 @@ def plan_to_frontier_with_status(
                 planning_start = start_recovery_cell
                 start_recovery_used = True
 
-    remaining_clusters = list(clusters)
+    if preferred_frontier_cell is None:
+        remaining_clusters = list(clusters)
+    else:
+        # A visual-checkpoint continuation may need a different arrival cell
+        # after the map marks the previously chosen standoff as occupied or
+        # inflated.  Keep the frontier objective in that case: selecting a
+        # cluster that contains the recorded frontier cell lets the existing
+        # candidate/standoff logic choose another legal cell in the same
+        # frontier region.  If the recorded cell is no longer a frontier,
+        # return UNREACHABLE so the caller can release the stale objective
+        # instead of silently switching to an unrelated cluster.
+        preferred_cluster = next(
+            (
+                cluster for cluster in clusters
+                if preferred_frontier_cell in cluster
+            ),
+            None,
+        )
+        remaining_clusters = (
+            [preferred_cluster] if preferred_cluster is not None else []
+        )
 
     parent = _bfs_reachability(
         planning_grid,
@@ -714,6 +776,9 @@ def plan_to_frontier_with_status(
         "start_recovery_used": start_recovery_used,
         "start_recovery_cell": start_recovery_cell,
         "inflation_radius_cells": inflation_radius_cells,
+        "minimum_standoff_path_length_cells": (
+            minimum_standoff_path_length_cells
+        ),
     }
 
     while remaining_clusters:
@@ -764,6 +829,9 @@ def plan_to_frontier_with_status(
                 frontier_cell,
                 frontier_goal_search_radius_cells,
                 planning_start,
+                minimum_path_length_cells=(
+                    minimum_standoff_path_length_cells
+                ),
             )
             if goal_cell is None:
                 continue

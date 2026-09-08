@@ -20,3 +20,9 @@ uint32 detected_count
 
 # Human-readable detail (e.g. "max_time reached", "finish service called")
 string detail
+
+# Mission-owned floor lifecycle. Empty task id means legacy single-task mode.
+# A new opaque id is issued for each floor activation, including node restart.
+string exploration_task_id
+int32 current_floor
+bool floor_exploration_active

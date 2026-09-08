@@ -16,6 +16,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from planning_core import (  # noqa: E402
     _bfs_reachability,
+    _nearest_reachable_standoff,
     compress_collinear_path,
     order_frontier_candidates,
     path_cell_yaws,
@@ -49,6 +50,39 @@ class FrontierCandidateHeadingTest(unittest.TestCase):
         )
 
         self.assertEqual(ordered, [(1, 0)])
+
+
+class StandoffProgressContractTest(unittest.TestCase):
+    def test_skips_controller_equivalent_standoff_candidates(self):
+        width = 7
+        height = 7
+        parent = _bfs_reachability(
+            [0] * (width * height),
+            width,
+            height,
+            start=(3, 3),
+        )
+
+        nearest = _nearest_reachable_standoff(
+            parent,
+            frontier_cell=(3, 4),
+            radius_cells=2,
+            planning_start=(3, 3),
+        )
+        progressed = _nearest_reachable_standoff(
+            parent,
+            frontier_cell=(3, 4),
+            radius_cells=2,
+            planning_start=(3, 3),
+            minimum_path_length_cells=3,
+        )
+
+        self.assertEqual(nearest, (2, 4))
+        self.assertEqual(progressed, (1, 4))
+        self.assertGreaterEqual(
+            len(parent),
+            1,
+        )
 
 
 class PathCompressionTest(unittest.TestCase):
@@ -212,6 +246,49 @@ class PlanToFrontierTest(unittest.TestCase):
             bfs_mock.call_count,
             1,
         )
+
+    def test_preferred_frontier_cell_limits_selection_to_its_cluster(
+        self,
+    ):
+        preferred_cluster = [(3, 1), (3, 2), (3, 3)]
+        nearby_cluster = [(1, 1), (1, 2), (1, 3)]
+
+        with patch(
+            "planning_core.extract_frontier_cells",
+            return_value=preferred_cluster + nearby_cluster,
+        ):
+            with patch(
+                "planning_core.cluster_frontier_cells",
+                return_value=[nearby_cluster, preferred_cluster],
+            ):
+                with patch(
+                    "planning_core.inflate_obstacles",
+                    return_value=[0] * 20,
+                ):
+                    with patch(
+                        "planning_core._bfs_reachability",
+                        return_value={
+                            (0, 2): None,
+                            (1, 1): (0, 2),
+                            (1, 2): (0, 2),
+                            (1, 3): (0, 2),
+                            (3, 1): (1, 1),
+                            (3, 2): (1, 2),
+                            (3, 3): (1, 3),
+                        },
+                    ):
+                        result = plan_to_frontier_with_status(
+                            [0] * 20,
+                            width=5,
+                            height=4,
+                            robot_cell=(0, 2),
+                            min_frontier_size=1,
+                            preferred_frontier_cell=(3, 2),
+                        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["cluster"], preferred_cluster)
+        self.assertIn(result["goal_cell"], preferred_cluster)
 
     def test_clears_inflation_from_free_robot_start_cell(
         self,
@@ -750,6 +827,40 @@ class PlanToHeadingGoalTest(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["goal_cell"][0], 5)
         self.assertNotIn((3, 3), result["path"])
+
+    def test_fixed_heading_reference_keeps_replans_on_anchor_corridor(self):
+        data = [0] * 144
+
+        local_result = plan_to_heading_goal_with_status(
+            data,
+            width=12,
+            height=12,
+            robot_cell=(2, 5),
+            heading_yaw=0.0,
+            max_forward_cells=4.0,
+            min_forward_cells=1.0,
+            corridor_half_width_cells=1.0,
+        )
+        anchored_result = plan_to_heading_goal_with_status(
+            data,
+            width=12,
+            height=12,
+            robot_cell=(2, 5),
+            heading_yaw=0.0,
+            max_forward_cells=4.0,
+            min_forward_cells=1.0,
+            corridor_half_width_cells=1.0,
+            heading_reference_cell=(2, 2),
+        )
+
+        self.assertEqual(local_result["status"], "success")
+        self.assertEqual(anchored_result["status"], "success")
+        self.assertEqual(local_result["goal_cell"], (6, 5))
+        self.assertEqual(anchored_result["goal_cell"], (6, 2))
+        self.assertEqual(
+            anchored_result["heading_reference_cell"],
+            (2, 2),
+        )
 
     def test_reports_unreachable_when_forward_corridor_is_unknown(self):
         data = [-1] * 25

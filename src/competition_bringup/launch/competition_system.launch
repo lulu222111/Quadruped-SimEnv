@@ -22,6 +22,11 @@
   <arg name="auto_start" default="true" />
   <arg name="finish_on_first_detection" default="false" />
   <arg name="return_on_first_detection" default="false" />
+  <arg name="floor_lifecycle_enabled" default="false" />
+  <!-- Allow a self-contained bringup to provide the canonical localization
+       node (for example the teammate leg-odometry correction chain).  The
+       default preserves this launch's historical FAST-LIO bringup. -->
+  <arg name="localization_enabled" default="true" />
   <arg name="return_arrival_tolerance" default="0.25" />
   <arg name="return_arrival_samples" default="3" />
   <arg name="return_input_timeout" default="1.0" />
@@ -29,6 +34,7 @@
   <arg name="planning_start_recovery_radius_cells" default="0" />
   <arg name="planning_frontier_min_size" default="5" />
   <arg name="planning_frontier_goal_search_radius_cells" default="0" />
+  <arg name="planning_frontier_min_standoff_path_length_cells" default="0" />
   <arg name="planning_return_goal_search_radius_cells" default="2" />
   <arg name="planning_return_path_commit_enabled" default="false" />
   <!-- Exterior-trap countermeasures (see planning_heading_weight_cells note):
@@ -107,6 +113,7 @@
   <node pkg="competition_loop" type="competition_loop_node" name="competition_loop"
         output="screen" respawn="false">
     <param name="max_time" value="600.0" />
+    <param name="floor_lifecycle_enabled" value="$(arg floor_lifecycle_enabled)" />
     <param name="start_delay" value="5.0" />
     <param name="auto_start" value="$(arg auto_start)" />
     <param name="finish_on_first_detection" value="$(arg finish_on_first_detection)" />
@@ -135,15 +142,19 @@
 
   <!-- === Production modules (competition mode or when mocks disabled) === -->
   <group unless="$(arg use_mocks)">
-    <!-- Localization (FAST-LIO + adapter, single canonical bringup) -->
-    <include file="$(find competition_localization)/launch/localization_bringup.launch">
-      <arg name="rviz" value="false"/>
-      <arg name="filter_size_surf" value="$(arg filter_size_surf)"/>
-      <arg name="filter_size_map" value="$(arg filter_size_map)"/>
-      <arg name="correction_enabled" value="$(arg localization_correction_enabled)"/>
-      <arg name="correction_odom_topic" value="$(arg localization_correction_odom_topic)"/>
-      <arg name="correction_mode" value="$(arg localization_correction_mode)"/>
-    </include>
+    <!-- Localization (FAST-LIO + adapter, single canonical bringup).  A
+         wrapper that supplies its own adapter can disable this include so
+         exactly one /competition/localization/odom publisher exists. -->
+    <group if="$(arg localization_enabled)">
+      <include file="$(find competition_localization)/launch/localization_bringup.launch">
+        <arg name="rviz" value="false"/>
+        <arg name="filter_size_surf" value="$(arg filter_size_surf)"/>
+        <arg name="filter_size_map" value="$(arg filter_size_map)"/>
+        <arg name="correction_enabled" value="$(arg localization_correction_enabled)"/>
+        <arg name="correction_odom_topic" value="$(arg localization_correction_odom_topic)"/>
+        <arg name="correction_mode" value="$(arg localization_correction_mode)"/>
+      </include>
+    </group>
 
     <!-- Perception -->
     <node pkg="competition_perception" type="perception_node" name="perception"
@@ -162,6 +173,8 @@
         <param name="frontier_min_size" value="$(arg planning_frontier_min_size)" />
         <param name="frontier_goal_search_radius_cells"
                value="$(arg planning_frontier_goal_search_radius_cells)" />
+        <param name="minimum_standoff_path_length_cells"
+               value="$(arg planning_frontier_min_standoff_path_length_cells)" />
         <param name="return_goal_search_radius_cells"
                value="$(arg planning_return_goal_search_radius_cells)" />
         <param name="return_path_commit_enabled"

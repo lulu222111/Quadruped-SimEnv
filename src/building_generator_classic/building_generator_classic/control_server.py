@@ -37,6 +37,12 @@ def main(argv: list[str] | None = None) -> int:
     get_model_state = rospy.ServiceProxy("/gazebo/get_model_state", GetModelState)
     set_model_state = rospy.ServiceProxy("/gazebo/set_model_state", SetModelState)
     set_link_state = rospy.ServiceProxy("/gazebo/set_link_state", SetLinkState)
+    initial_open_doors = _apply_initial_open_doors(runtime, set_model_state, set_link_state)
+    if initial_open_doors:
+        rospy.loginfo(
+            "building_generator_classic_control initialized open doors: %s",
+            ", ".join(initial_open_doors),
+        )
     passenger_models = _passenger_models(args.passenger_model)
     rospy.Service(
         "call_elevator",
@@ -130,6 +136,19 @@ def _handle_set_door_state(runtime: BuildingControlRuntime, request, response_ty
         state=str(result["state"]),
         message=str(result["message"]),
     )
+
+
+def _apply_initial_open_doors(runtime: BuildingControlRuntime, set_model_state, set_link_state) -> tuple[str, ...]:
+    """Synchronize configured initial-open doors with the already spawned Gazebo models."""
+    applied_doors: list[str] = []
+    for door_id, door_state in runtime._doors.items():
+        if not door_state.is_open:
+            continue
+        result = runtime.set_door_state(door_id, True)
+        if result.get("accepted"):
+            _apply_door_result(result, set_model_state, set_link_state)
+            applied_doors.append(door_id)
+    return tuple(applied_doors)
 
 
 def _apply_door_result(result: dict, set_model_state, set_link_state) -> None:

@@ -18,6 +18,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
@@ -550,6 +551,53 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
 
         self.assertIsNone(checkpoint)
 
+    def test_checkpoint_selector_skips_covered_route_positions(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5, 4.0):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        now = 100.1
+        robot = self._make_odom(now).pose.pose.position
+        self.node.visual_scan_route_spacing = 2.0
+        self.node.visual_coverage.scanned_positions = [(2.5, 2.5)]
+
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            now,
+        )
+
+        self.assertEqual(checkpoint, (4.0, 2.5))
+        self.assertFalse(
+            self.node.visual_coverage.position_is_covered(
+                checkpoint,
+            )
+        )
+
+    def test_checkpoint_selector_returns_none_when_route_is_covered(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        now = 100.1
+        robot = self._make_odom(now).pose.pose.position
+        self.node.visual_scan_route_spacing = 2.0
+        self.node.visual_coverage.scanned_positions = [(2.5, 2.5)]
+
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            now,
+        )
+
+        self.assertIsNone(checkpoint)
+
     def test_short_route_checkpoint_falls_back_to_route_endpoint(self):
         path = FakePath()
         for x in (2.5, 3.0, 3.5):
@@ -713,6 +761,69 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
             "visual_scan_checkpoint_path_held",
             self._last_status_msg().detail,
         )
+
+    def test_frontier_continuation_replans_same_goal_on_current_map(self):
+        self.node.frontier_continuation_goal_cell = (3, 2)
+        self.node.frontier_continuation_frontier_cell = (3, 2)
+        self.node.frontier_continuation_frontier_count = 7
+
+        result = self.node._plan_frontier_continuation(
+            self._make_map(100.1),
+            robot_cell=(2, 2),
+            inflation_radius_cells=0,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["status"], PLANNING_NODE.PLAN_SUCCESS)
+        self.assertEqual(result["goal_cell"], (3, 2))
+        self.assertEqual(result["path"][-1], (3, 2))
+        self.assertEqual(result["frontier_count"], 7)
+        self.assertTrue(result["frontier_continuation"])
+
+    def test_frontier_continuation_releases_invalid_goal(self):
+        self.node.frontier_continuation_goal_cell = (4, 2)
+        self.node.frontier_continuation_frontier_cell = (4, 2)
+
+        result = self.node._plan_frontier_continuation(
+            self._make_map(100.1),
+            robot_cell=(2, 2),
+            inflation_radius_cells=0,
+        )
+
+        self.assertIsNone(result)
+        self.assertIsNone(self.node.frontier_continuation_goal_cell)
+        self.assertIsNone(self.node.frontier_continuation_frontier_cell)
+
+    def test_frontier_continuation_retargets_within_cached_cluster(self):
+        self.node.frontier_continuation_goal_cell = (4, 2)
+        self.node.frontier_continuation_frontier_cell = (3, 2)
+        self.node.frontier_continuation_frontier_count = 7
+        fallback = {
+            "status": PLANNING_NODE.PLAN_SUCCESS,
+            "goal_cell": (3, 1),
+            "path": [(2, 2), (3, 2), (3, 1)],
+            "frontier_count": 8,
+            "frontier_goal_cell": (3, 2),
+            "frontier_goal_offset_used": True,
+        }
+
+        with patch.object(
+            PLANNING_NODE,
+            "plan_to_frontier_with_status",
+            return_value=fallback,
+        ) as planner:
+            result = self.node._plan_frontier_continuation(
+                self._make_map(100.1),
+                robot_cell=(2, 2),
+                inflation_radius_cells=0,
+                heading_yaw=0.0,
+            )
+
+        self.assertEqual(planner.call_count, 1)
+        self.assertTrue(result["frontier_continuation"])
+        self.assertTrue(result["frontier_continuation_retargeted"])
+        self.assertEqual(result["continuation_goal_cell"], (4, 2))
+        self.assertEqual(result["frontier_goal_cell"], (3, 2))
 
     def test_checkpoint_route_is_bounded_at_selected_station(self):
         path = FakePath()
@@ -1079,6 +1190,47 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
         status = self._last_status_msg()
         self.assertEqual(status.state, FakeModuleStatus.RUNNING)
         self.assertTrue(status.valid)
+
+    def test_floor_task_edge_cancels_path_and_discards_old_floor_caches(self):
+        self.node._exploration_complete_active = True
+        self.node.frontier_continuation_goal_cell = (3, 4)
+        self.node.visual_coverage.scanned_positions = [(1., 2.)]
+        state = FakeCompetitionState()
+        state.state = FakeCompetitionState.RUNNING
+        state.exploration_task_id = 'floor-task-one'
+        state.floor_exploration_active = True
+        old_generation = self.node.generation
+        self.node.competition_state_callback(state)
+        self.assertGreater(self.node.generation, old_generation)
+        self.assertIsNone(self.node.map_msg)
+        self.assertIsNone(self.node.odom_msg)
+        self.assertIsNone(self.node.frontier_continuation_goal_cell)
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertEqual(self.node.visual_coverage.scanned_positions, [])
+        self.assertEqual(self._last_path().poses, [])
+        self.assertFalse(self._published('/competition/planning/exploration_complete')[-1].data)
+        generation = self.node.generation
+        self.node.competition_state_callback(state)
+        self.assertEqual(self.node.generation, generation)
+        state.floor_exploration_active = False
+        self.node.competition_state_callback(state)
+        self.node.plan_callback(None)
+        self.assertEqual(self._last_path().poses, [])
+        state.exploration_task_id = 'floor-task-two'
+        state.floor_exploration_active = True
+        self.node.competition_state_callback(state)
+        self.assertTrue(self.node.initial_forward_complete)
+
+    def test_floor_completion_status_echo_requires_existing_debounce(self):
+        self.node.exploration_task_id = 'task'
+        self.node.publish_status(FakeModuleStatus.SUCCEEDED, False, 1., 'no frontier')
+        self.assertEqual(self._last_status_msg().exploration_task_id, 'task')
+        self.assertFalse(self._last_status_msg().exploration_complete)
+        self.node._exploration_complete_active = True
+        self.node.publish_status(FakeModuleStatus.SUCCEEDED, False, 1., 'no frontier')
+        self.assertTrue(self._last_status_msg().exploration_complete)
+        self.node.publish_status(FakeModuleStatus.TIMEOUT, False, 0., 'stale map')
+        self.assertFalse(self._last_status_msg().exploration_complete)
 
     def test_returning_state_loads_public_start_and_uses_goal_planner(self):
         with tempfile.TemporaryDirectory() as temp_dir:

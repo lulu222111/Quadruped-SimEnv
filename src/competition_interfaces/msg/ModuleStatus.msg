@@ -25,3 +25,9 @@ float32 confidence
 
 # Human-readable detail string (e.g. "waiting for IMU calibration")
 string detail
+
+# Planning echoes the current CompetitionState task, never a guessed floor.
+# The flag is true only after Planning's existing visual/debounce completion.
+# Other modules leave both fields at their defaults.
+string exploration_task_id
+bool exploration_complete

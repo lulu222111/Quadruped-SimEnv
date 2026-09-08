@@ -3,11 +3,57 @@ from __future__ import annotations
 from types import SimpleNamespace
 import unittest
 
-from building_generator_classic.control_server import _compose_world_pose, _pose_inside_elevator_car
+from unittest.mock import Mock
+
+from building_generator_classic.control_server import (
+    _apply_initial_open_doors,
+    _compose_world_pose,
+    _pose_inside_elevator_car,
+)
 from building_generator_classic.control_runtime import BuildingControlRuntime
 
 
 class BuildingControlRuntimeTest(unittest.TestCase):
+    def test_applies_initial_open_doors_to_gazebo(self) -> None:
+        runtime = BuildingControlRuntime(
+            door_specs=[
+                {
+                    "id": "main_entrance",
+                    "model_name": "dynamic_main_entrance",
+                    "initial_open": True,
+                    "closed_pose": [0.0, 0.0, 1.2, 0.0, 0.0, 1.5708],
+                    "panel_poses": {
+                        "left_closed": [0.0, -0.5, 0.0, 0.0, 0.0, 0.0],
+                        "left_open": [0.0, -1.06, 0.0, 0.0, 0.0, 0.0],
+                        "right_closed": [0.0, 0.5, 0.0, 0.0, 0.0, 0.0],
+                        "right_open": [0.0, 1.06, 0.0, 0.0, 0.0, 0.0],
+                    },
+                },
+                {
+                    "id": "closed_door",
+                    "model_name": "dynamic_closed_door",
+                    "initial_open": False,
+                },
+            ],
+            elevator_specs=[],
+        )
+        set_model_state = Mock()
+        set_link_state = Mock()
+
+        applied = _apply_initial_open_doors(runtime, set_model_state, set_link_state)
+
+        self.assertEqual(applied, ("main_entrance",))
+        self.assertEqual(set_model_state.call_count, 1)
+        self.assertEqual(set_link_state.call_count, 2)
+        self.assertEqual(set_model_state.call_args.args[0].model_name, "dynamic_main_entrance")
+        self.assertEqual(
+            {call.args[0].link_name for call in set_link_state.call_args_list},
+            {
+                "dynamic_main_entrance::left_panel",
+                "dynamic_main_entrance::right_panel",
+            },
+        )
+
     def test_updates_door_and_elevator_state(self) -> None:
         runtime = BuildingControlRuntime(
             door_specs=[

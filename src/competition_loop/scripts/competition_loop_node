@@ -38,6 +38,7 @@ from interface_validator import InterfaceValidator
 from time_keeper import TimeKeeper
 from result_writer import ResultWriter
 from hazard_candidate_router import HazardCandidateRouter
+from floor_lifecycle import FloorLifecycle
 
 
 def _is_valid_finite_positive_number(value: object) -> bool:
@@ -84,6 +85,8 @@ class CompetitionLoopNode:
 
         # --- Parameters (raw) ---
         self._max_time = rospy.get_param("~max_time", 600.0)
+        self._floor_lifecycle_enabled = rospy.get_param("~floor_lifecycle_enabled", False)
+        self._floor_lifecycle = None
         self._start_delay = rospy.get_param("~start_delay", 5.0)
         self._auto_start = rospy.get_param("~auto_start", True)
         self._finish_on_first_detection = rospy.get_param(
@@ -216,8 +219,13 @@ class CompetitionLoopNode:
         )
 
         # Load scene info (the only allowed file)
-        self._validator.load_scene_info(self._workspace_root)
-        if self._return_on_first_detection:
+        scene = self._validator.load_scene_info(self._workspace_root)
+        if self._floor_lifecycle_enabled:
+            try:
+                self._floor_lifecycle = FloorLifecycle((scene or {}).get('public_scene', {}))
+            except (ValueError, TypeError, KeyError) as exc:
+                self._fsm.force_error('public floor catalog invalid: {}'.format(exc))
+        if self._return_on_first_detection or self._floor_lifecycle_enabled:
             self._return_start_pose = self._load_return_start_pose()
             if self._return_start_pose is None:
                 self._fsm.force_error("return start pose unavailable")
@@ -231,8 +239,15 @@ class CompetitionLoopNode:
         )
 
         self._setup_candidate_router()
-        if self._return_on_first_detection:
+        if self._return_on_first_detection or self._floor_lifecycle_enabled:
             self._setup_return_subscribers()
+        if self._floor_lifecycle_enabled:
+            self._floor_complete_sub = rospy.Subscriber(
+                '/competition/planning/exploration_complete', std_msgs.msg.Bool,
+                self._floor_complete_callback, queue_size=1)
+            self._floor_status_sub = rospy.Subscriber(
+                '/competition/planning/status', ModuleStatus,
+                self._floor_status_callback, queue_size=1)
 
         # Timer — created LAST so it cannot fire before all members exist
         self._tick_timer = rospy.Timer(rospy.Duration(0.1), self._tick_callback)
@@ -251,6 +266,12 @@ class CompetitionLoopNode:
         explicitly exclude bool.
         """
         ok = True
+        if not isinstance(getattr(self, '_floor_lifecycle_enabled', False), bool):
+            ok = False
+        if getattr(self, '_floor_lifecycle_enabled', False) and (
+                self._return_on_first_detection or self._finish_on_first_detection):
+            rospy.logerr('floor lifecycle cannot stop/return on first detection')
+            ok = False
 
         if not (isinstance(self._max_time, (int, float))
                 and not isinstance(self._max_time, bool)
@@ -701,8 +722,35 @@ class CompetitionLoopNode:
             self._end_competition("max_time reached")
             return
 
+        floor = getattr(self, '_floor_lifecycle', None)
+        if floor is not None:
+            if floor.consume(rospy.Time.now().to_sec()):
+                self._fsm.set_detail('CURRENT_FLOOR_COMPLETE floor={} remaining={}'.format(
+                    floor.current_floor, list(floor.remaining)))
+                self._publish_state()
+            if not floor.active:
+                if not floor.remaining and floor.current_floor == floor.home_floor:
+                    self._begin_returning()
+                else:
+                    # A15 freezes motion at the missing transit boundary. A
+                    # future executor must prove arrival before activate().
+                    self._publish_safety_signals(control_enabled=False, emergency_stop=True)
+                return
+
         # 3. Normal operation
         self._publish_safety_signals(control_enabled=True, emergency_stop=False)
+
+    def _floor_complete_callback(self, msg):
+        floor = self._floor_lifecycle
+        if floor is not None and self._fsm.is_running:
+            floor.observe_bool(bool(msg.data), rospy.Time.now().to_sec())
+
+    def _floor_status_callback(self, msg):
+        floor = self._floor_lifecycle
+        if floor is not None and self._fsm.is_running:
+            floor.observe_status(msg.exploration_task_id, msg.header.stamp.to_sec(),
+                                 msg.state == ModuleStatus.SUCCEEDED,
+                                 msg.exploration_complete, rospy.Time.now().to_sec())
 
     def _tick_returning(self):
         """Gate ARRIVED_START on fresh legal pose and follower completion."""
@@ -786,6 +834,9 @@ class CompetitionLoopNode:
         if not self._fsm.transition_to(CompetitionPhase.RUNNING, "Competition started"):
             return
         self._timer.start()
+        floor = getattr(self, '_floor_lifecycle', None)
+        if floor is not None:
+            floor.activate(floor.home_floor, rospy.Time.now().to_sec())
         self._publish_safety_signals(control_enabled=True, emergency_stop=False)
         # Publish state immediately on transition (in addition to periodic tick)
         self._publish_state()
@@ -887,6 +938,12 @@ class CompetitionLoopNode:
             elapsed_seconds=self._timer.elapsed_seconds,
             detected_count=self._result_writer.candidate_count,
         )
+        floor = getattr(self, '_floor_lifecycle', None)
+        if floor is not None:
+            with floor.lock:
+                msg.exploration_task_id = floor.task_id
+                msg.current_floor = floor.current_floor
+                msg.floor_exploration_active = floor.active and self._fsm.is_running
         self._state_pub.publish(msg)
 
     # ------------------------------------------------------------------
