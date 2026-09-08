@@ -628,7 +628,6 @@ def plan_to_frontier_with_status(
     obstacle_threshold=50,
     preferred_frontier_cell=None,
     room_bias_weight=0.0,
-    room_bias_center_cells=0.0,
 ):
     """
     Select a reachable frontier and report an explicit planning status.
@@ -814,7 +813,6 @@ def plan_to_frontier_with_status(
             heading_yaw=heading_yaw,
             heading_weight=heading_weight,
             room_bias_weight=room_bias_weight,
-            room_bias_center_cells=room_bias_center_cells,
             cluster_room_dist=cluster_room_dist,
         )
 

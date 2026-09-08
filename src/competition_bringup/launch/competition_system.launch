@@ -59,11 +59,6 @@
        exploration toward rooms where hazard sources spawn and away from
        narrow false spaces. -->
   <arg name="planning_room_bias_weight" default="0.0" />
-  <!-- Centre (metres) of the room-bias dist term.  Frontiers whose rep sits
-       closer to the nearest wall than this get a NEGATIVE bonus (narrow
-       false spaces: corridors / elevator shafts / stairwells), frontiers
-       farther than this get a POSITIVE bonus (wide rooms / lobby). -->
-  <arg name="planning_room_bias_center_m" default="1.9" />
   <arg name="planning_initial_forward_distance" default="4.0" />
   <arg name="planning_initial_forward_lookahead" default="2.0" />
   <arg name="planning_path_compression_enabled" default="false" />
@@ -200,7 +195,6 @@
         <param name="size_weight" value="$(arg planning_frontier_size_weight)" />
         <param name="heading_weight" value="$(arg planning_heading_weight_cells)" />
         <param name="room_bias_weight" value="$(arg planning_room_bias_weight)" />
-        <param name="room_bias_center_m" value="$(arg planning_room_bias_center_m)" />
         <param name="initial_forward_distance"
                value="$(arg planning_initial_forward_distance)" />
         <param name="initial_forward_lookahead"
