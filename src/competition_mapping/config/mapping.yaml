@@ -5,17 +5,20 @@ pointcloud_topic: /livox/Pointcloud2
 map_topic: /competition/map
 mapping_status_topic: /competition/mapping/status
 
-# Frozen frame contract and 40 m x 40 m map
+# Frozen frame contract; fixed window sized to cover the whole building.
+# Robot travel is x in [-10, 10] and y from -3.2 (start) to 35.9 (north end),
+# so the map covers x [-12.5, 12.5] and y [-6.5, 38.5] with margin, instead of
+# a start-centred 40x40 box that wasted the south half and cut off the
+# northern rooms.
 map_frame: world
 expected_base_frame: base
 expected_cloud_frame: laser_livox
 resolution: 0.10
-map_width: 400
-map_height: 400
-origin_mode: initial_pose
-# Used only when origin_mode=fixed
-origin_x: -20.0
-origin_y: -20.0
+map_width: 250
+map_height: 450
+origin_mode: fixed
+origin_x: -12.5
+origin_y: -6.5
 
 # Points are filtered after timestamped TF conversion into base
 sensor_min_range: 0.30
