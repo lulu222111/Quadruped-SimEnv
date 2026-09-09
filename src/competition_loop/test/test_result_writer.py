@@ -211,5 +211,46 @@ class TestResultWriter(unittest.TestCase):
         self.assertEqual(w._exploration_time, 0.0)
 
 
+class TestResultWriterAggregation(unittest.TestCase):
+    """P0-2: writer with an aggregate_fn collapses same-source candidates."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.outpath = Path(self.tmpdir) / "detected_danger.json"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _candidate(self, x, y, z=0.15):
+        return MockHazardCandidate(
+            frame_id="world", x=x, y=y, z=z, position_valid=True
+        )
+
+    def test_aggregate_fn_collapses_cluster(self):
+        from result_aggregator import aggregate_candidates
+
+        w = ResultWriter(
+            str(self.outpath),
+            aggregate_fn=lambda c: aggregate_candidates(c, radius=1.0),
+        )
+        w.set_exploration_time(600.0)
+        # four observations of one source around (1.0, 1.0) + one far source
+        for x, y in ((0.9, 1.1), (1.1, 0.9), (1.05, 1.05), (1.0, 1.0)):
+            w.accept_candidate(self._candidate(x, y))
+        w.accept_candidate(self._candidate(8.0, 8.0))
+        self.assertEqual(w.candidate_count, 5)  # collector still keeps raw count
+        path = w.write()
+        data = json.loads(path.read_text())
+        pts = data["detected_danger_sources"]
+        self.assertEqual(len(pts), 2)  # aggregated down to 2 written points
+        near = [
+            p for p in pts
+            if abs(p["position"][0] - 1.0) < 0.2 and abs(p["position"][1] - 1.0) < 0.2
+        ]
+        self.assertEqual(len(near), 1)
+        self.assertAlmostEqual(near[0]["position"][2], 0.15, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()

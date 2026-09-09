@@ -22,6 +22,7 @@ class HazardCandidateRouter:
         future_tolerance: float = 0.50,
         now_fn: Optional[Callable[[], float]] = None,
         log_fn: Optional[Callable[[str], None]] = None,
+        allowed_labels: Optional[Iterable[str]] = None,
     ) -> None:
         if not math.isfinite(dedup_distance) or dedup_distance <= 0.0:
             raise ValueError("dedup_distance must be finite and > 0")
@@ -35,6 +36,14 @@ class HazardCandidateRouter:
         self.future_tolerance = float(future_tolerance)
         self.now_fn = now_fn
         self.log_fn = log_fn
+        # Optional semantic whitelist (P0-1): when set, only candidates whose
+        # label is in this set pass. The only referee-counted danger source is
+        # the red sphere; green_sphere / red_box are distractor sources and
+        # must never reach the final result (each false report costs far score).
+        if allowed_labels is None:
+            self._allowed_labels = None
+        else:
+            self._allowed_labels = set(str(label) for label in allowed_labels)
         self._accepted_positions = []
         self.last_stats = {}
 
@@ -80,6 +89,7 @@ class HazardCandidateRouter:
             "received": 0,
             "accepted": 0,
             "invalid_position": 0,
+            "label_not_allowed": 0,
             "invalid_timestamp": 0,
             "stale_timestamp": 0,
             "future_timestamp": 0,
@@ -90,6 +100,12 @@ class HazardCandidateRouter:
         now = self.now_fn() if self.now_fn is not None else None
         for candidate in candidates:
             self.last_stats["received"] += 1
+            # P0-1: semantic whitelist gate (distractor sources never pass).
+            if self._allowed_labels is not None and (
+                getattr(candidate, "label", None) not in self._allowed_labels
+            ):
+                self._reject("label_not_allowed")
+                continue
             if not getattr(candidate, "position_valid", False):
                 self._reject("invalid_position")
                 continue

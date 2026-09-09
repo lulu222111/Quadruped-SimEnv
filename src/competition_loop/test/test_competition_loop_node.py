@@ -572,5 +572,49 @@ class TestMissionFoundDanger(unittest.TestCase):
         self.assertEqual(node._return_arrival_count, 0)
 
 
+class TestCandidateWorldZSnap(unittest.TestCase):
+    """P2: world-frame candidate z is snapped to source-centre height."""
+
+    def _make_node(self, ground_z=0.0, radius=0.15):
+        node = object.__new__(CompetitionLoopNode)
+        node._hazard_source_ground_z = ground_z
+        node._hazard_source_radius = radius
+        return node
+
+    def _make_candidate(self, z, valid=True):
+        point = type("Point", (), {})()
+        point.x, point.y, point.z = 3.0, 4.0, z
+        cand = object.__new__(_ci_msg.HazardCandidate)
+        cand.position = point
+        cand.position_valid = valid
+        cand.label = "red_sphere"
+        cand.confidence = 1.0
+        return cand
+
+    def test_snap_z_to_ground_plus_radius(self):
+        node = self._make_node(ground_z=0.0, radius=0.15)
+        cand = self._make_candidate(z=0.9)
+        node._snap_source_center_z(cand)
+        self.assertAlmostEqual(cand.position.z, 0.15, places=6)
+
+    def test_snap_respects_ground_z_and_radius_params(self):
+        node = self._make_node(ground_z=3.0, radius=0.15)
+        cand = self._make_candidate(z=3.9)
+        node._snap_source_center_z(cand)
+        self.assertAlmostEqual(cand.position.z, 3.15, places=6)
+
+    def test_snap_preserves_xy(self):
+        node = self._make_node()
+        cand = self._make_candidate(z=0.9)
+        node._snap_source_center_z(cand)
+        self.assertEqual((cand.position.x, cand.position.y), (3.0, 4.0))
+
+    def test_snap_skips_invalid_candidates(self):
+        node = self._make_node()
+        cand = self._make_candidate(z=0.9, valid=False)
+        node._snap_source_center_z(cand)
+        self.assertAlmostEqual(cand.position.z, 0.9, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()

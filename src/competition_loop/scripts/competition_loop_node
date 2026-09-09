@@ -37,6 +37,7 @@ from competition_state_machine import CompetitionStateMachine, CompetitionPhase
 from interface_validator import InterfaceValidator
 from time_keeper import TimeKeeper
 from result_writer import ResultWriter
+from result_aggregator import aggregate_candidates
 from hazard_candidate_router import HazardCandidateRouter
 from floor_lifecycle import FloorLifecycle
 
@@ -77,6 +78,21 @@ def _safe_repr(value: object) -> str:
         return "<unprintable>"
 
 
+def _read_allowed_labels_param(param_name: str) -> list:
+    """Read ~hazard_allowed_labels as a non-empty list of non-empty strings.
+
+    Accepts a rosparam YAML list or a comma-separated string. Any invalid
+    value falls back to the referee-counted danger label only.
+    """
+    raw = rospy.get_param(param_name, ["red_sphere"])
+    labels = []
+    if isinstance(raw, (list, tuple)):
+        labels = [str(v).strip() for v in raw if isinstance(v, str) and v.strip()]
+    elif isinstance(raw, str):
+        labels = [v.strip() for v in raw.split(",") if v.strip()]
+    return labels if labels else ["red_sphere"]
+
+
 class CompetitionLoopNode:
     """Main competition orchestration node."""
 
@@ -114,6 +130,21 @@ class CompetitionLoopNode:
         self._candidate_dedup_distance = rospy.get_param(
             "~hazard_candidate_dedup_distance", 0.30
         )
+        self._hazard_source_radius = rospy.get_param(
+            "~hazard_source_radius", 0.15
+        )
+        self._hazard_source_ground_z = rospy.get_param(
+            "~hazard_source_ground_z", 0.0
+        )
+        self._hazard_cluster_enabled = rospy.get_param(
+            "~hazard_cluster_enabled", True
+        )
+        self._hazard_cluster_radius = rospy.get_param(
+            "~hazard_cluster_radius", 1.0
+        )
+        self._hazard_allowed_labels = _read_allowed_labels_param(
+            "~hazard_allowed_labels"
+        )
 
         # --- ALWAYS initialise ALL members before any early return ---
         # This guarantees run() will never encounter AttributeError.
@@ -137,7 +168,21 @@ class CompetitionLoopNode:
         # Resolve result path
         self._result_path = self._resolve_result_path()
 
-        self._result_writer = ResultWriter(output_path=str(self._result_path))
+        aggregate_fn = None
+        if self._hazard_cluster_enabled:
+            cluster_radius = (
+                float(self._hazard_cluster_radius)
+                if _is_valid_finite_positive_number(self._hazard_cluster_radius)
+                else 1.0
+            )
+            aggregate_fn = (
+                lambda candidates, _r=cluster_radius:
+                aggregate_candidates(candidates, radius=_r)
+            )
+        self._result_writer = ResultWriter(
+            output_path=str(self._result_path),
+            aggregate_fn=aggregate_fn,
+        )
         self._candidate_router = HazardCandidateRouter(
             self._result_writer,
             dedup_distance=(
@@ -156,6 +201,7 @@ class CompetitionLoopNode:
                 else 0.50
             ),
             now_fn=lambda: rospy.Time.now().to_sec(),
+            allowed_labels=self._hazard_allowed_labels,
         )
         self._tf_buffer = None
         self._tf_listener = None
@@ -368,6 +414,45 @@ class CompetitionLoopNode:
             )
             ok = False
 
+        if not _is_valid_finite_positive_number(self._hazard_source_radius):
+            rospy.logerr(
+                "Invalid ~hazard_source_radius=%s: must be finite and > 0",
+                _safe_repr(self._hazard_source_radius),
+            )
+            ok = False
+        if not _is_valid_finite_non_negative_number(self._hazard_source_ground_z):
+            rospy.logerr(
+                "Invalid ~hazard_source_ground_z=%s: must be finite and >= 0",
+                _safe_repr(self._hazard_source_ground_z),
+            )
+            ok = False
+
+        if not isinstance(self._hazard_cluster_enabled, bool):
+            rospy.logerr(
+                "Invalid ~hazard_cluster_enabled=%s: must be a boolean",
+                _safe_repr(self._hazard_cluster_enabled),
+            )
+            ok = False
+        if not _is_valid_finite_positive_number(self._hazard_cluster_radius):
+            rospy.logerr(
+                "Invalid ~hazard_cluster_radius=%s: must be finite and > 0",
+                _safe_repr(self._hazard_cluster_radius),
+            )
+            ok = False
+        if (
+            not isinstance(self._hazard_allowed_labels, list)
+            or not self._hazard_allowed_labels
+            or not all(
+                isinstance(v, str) and v for v in self._hazard_allowed_labels
+            )
+        ):
+            rospy.logerr(
+                "Invalid ~hazard_allowed_labels=%s: must be a non-empty list of "
+                "non-empty strings",
+                _safe_repr(self._hazard_allowed_labels),
+            )
+            ok = False
+
         return ok
 
     # ------------------------------------------------------------------
@@ -507,7 +592,31 @@ class CompetitionLoopNode:
         world_candidate.label = candidate.label
         world_candidate.confidence = candidate.confidence
         world_candidate.position_valid = candidate.position_valid
+        self._snap_source_center_z(world_candidate)
         return world_candidate
+
+    def _snap_source_center_z(self, world_candidate):
+        """P2: snap an accepted candidate's z to the source-centre height.
+
+        Raw perception hits the visible surface of the source, so the world z
+        lands above the true centre. The referee places every source centre at
+        floor_ground_z + source_radius (sphere radius / box half-height), so we
+        normalise z here -- AFTER the world transform and BEFORE the router's
+        3-D de-dup. This both shrinks the 3-D match distance toward the 1.0 m
+        threshold and makes the de-dup key stable: surface z can jitter by more
+        than the de-dup distance between views of the same source, which would
+        otherwise let one source fan out into many candidates.
+
+        Per-floor ground z is configurable via ~hazard_source_ground_z (0.0 for
+        a single ground-floor demo). Configure per deployed building rather
+        than reading any referee-only file.
+        """
+        if not world_candidate.position_valid:
+            return
+        world_candidate.position.z = (
+            float(self._hazard_source_ground_z)
+            + float(self._hazard_source_radius)
+        )
 
     def _hazard_candidates_callback(self, msg):
         """Convert valid perception candidates and retain unique world points."""

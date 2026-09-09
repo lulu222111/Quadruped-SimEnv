@@ -35,7 +35,8 @@ class ResultWriter:
 
     REQUIRED_FRAME = "world"
 
-    def __init__(self, output_path: Optional[str] = None):
+    def __init__(self, output_path: Optional[str] = None,
+                 aggregate_fn=None):
         if output_path:
             self._output_path = Path(output_path)
         else:
@@ -43,6 +44,11 @@ class ResultWriter:
 
         self._candidates: List[HazardCandidate] = []
         self._exploration_time: float = 0.0
+        # Optional final write-time aggregator (P0-2): a callable that maps the
+        # full accepted-candidate list to the source list that is actually
+        # written. Kept optional so the writer stays a thin, pure collector by
+        # default (all existing tests keep their semantics).
+        self._aggregate_fn = aggregate_fn
 
     # ------------------------------------------------------------------
     # Ingestion
@@ -128,6 +134,9 @@ class ResultWriter:
         return self._output_path
 
     def _build_output(self) -> dict:
+        sources = self._candidates
+        if self._aggregate_fn is not None:
+            sources = self._aggregate_fn(self._candidates)
         return {
             "exploration_time": self._exploration_time,
             "detected_danger_sources": [
@@ -138,7 +147,7 @@ class ResultWriter:
                         float(c.position.z),
                     ]
                 }
-                for c in self._candidates
+                for c in sources
             ],
         }
 

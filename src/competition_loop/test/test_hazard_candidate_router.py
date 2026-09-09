@@ -104,5 +104,36 @@ class TestHazardCandidateRouter(unittest.TestCase):
         self.assertEqual(self.router.last_stats["invalid_timestamp"], 1)
 
 
+class TestHazardLabelWhitelist(unittest.TestCase):
+    """P0-1: only whitelisted labels pass the router."""
+
+    def test_distractor_labels_rejected(self):
+        writer = Writer()
+        router = HazardCandidateRouter(
+            writer,
+            now_fn=lambda: 10.1,
+            allowed_labels=["red_sphere"],
+        )
+        green = Candidate()
+        green.label = "green_sphere"
+        red_box = Candidate(x=2.0)
+        red_box.label = "red_box"
+        danger = Candidate(x=3.0)
+        danger.label = "red_sphere"
+        accepted = router.process([green, red_box, danger], to_world)
+        self.assertEqual(accepted, 1)
+        self.assertEqual(router.last_stats["label_not_allowed"], 2)
+        self.assertEqual(len(writer.items), 1)
+        self.assertEqual(writer.items[0].label, "red_sphere")
+
+    def test_no_whitelist_keeps_legacy_behaviour(self):
+        writer = Writer()
+        router = HazardCandidateRouter(writer, now_fn=lambda: 10.1)
+        green = Candidate()
+        green.label = "green_sphere"
+        accepted = router.process([green], to_world)
+        self.assertEqual(accepted, 1)  # no filter configured -> passes
+
+
 if __name__ == "__main__":
     unittest.main()
