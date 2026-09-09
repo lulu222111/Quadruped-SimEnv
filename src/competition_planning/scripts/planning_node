@@ -56,25 +56,30 @@ BASE_FRAME = "base"
 # by the time the previous one is reached).  Overridden by
 # ~room_mission_targets (JSON list of [x, y]).
 ROOM_MISSION_TARGETS = [
-    # corridor entry / south-door band
-    (0.0, 8.0),
-    (1.8, 14.6),    # room_1 (south-east) door zone
+    # corridor entry, then drive up the CENTRE line (x = 0) so the robot
+    # does not hug either corridor wall; align on the centre before each
+    # door and only then turn toward the doorway.
+    (0.0, 8.0),     # corridor entry (centre line)
+    (0.0, 11.0),    # corridor centre drive
+    (0.0, 14.0),    # align on centre before room_1 door
+    (1.8, 14.6),    # room_1 (south-east) door
     (4.2, 13.5),    # room_1 interior (danger 4.48/2.23/7.02 area)
     (6.6, 13.8),    # room_1 deep
-    (0.0, 15.5),    # corridor
-    (-1.8, 14.6),   # room_0 (south-west) door zone
+    (0.0, 15.0),    # back to corridor centre
+    (-1.8, 14.6),   # room_0 (south-west) door
     (-3.8, 13.3),   # room_0 interior
     (-5.6, 13.6),   # room_0 deep (danger -7.93 is farther; best-effort)
-    # drive corridor north
+    # drive corridor north on the centre line
+    (0.0, 15.5),
     (0.0, 19.0),
     (0.0, 23.0),
     (0.0, 27.0),
-    (0.0, 29.0),
-    (1.8, 29.0),    # room_3 (north-east) door zone
+    (0.0, 28.0),    # align on centre before room_3 door
+    (1.8, 29.0),    # room_3 (north-east) door
     (4.6, 29.0),    # room_3 interior
     (6.8, 28.6),    # room_3 deep
-    (0.0, 29.5),    # corridor
-    (-1.8, 29.0),   # room_2 (north-west) door zone
+    (0.0, 29.5),    # corridor centre
+    (-1.8, 29.0),   # room_2 (north-west) door
     (-3.4, 27.0),   # room_2 interior
     (-4.8, 25.0),   # room_2 danger vicinity (-4.79, 23.31)
     (0.0, 3.0),     # final lobby hold

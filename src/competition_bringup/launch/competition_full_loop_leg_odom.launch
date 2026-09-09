@@ -29,6 +29,8 @@
        value tied to the observed 1.0 m visual dedup radius, not to scene
        coordinates or truth. -->
   <arg name="planning_frontier_min_standoff_path_length_cells" default="12" />
+  <!-- Room-only visual scan zones (world metres); see competition_system. -->
+  <arg name="planning_room_scan_zones" default="" />
 
   <include file="$(find competition_localization)/launch/localization_corrected.launch">
     <arg name="rviz" value="false" />
@@ -46,5 +48,7 @@
          value="$(arg planning_frontier_min_standoff_path_length_cells)" />
     <arg name="localization_enabled" value="false" />
     <arg name="floor_lifecycle_enabled" value="true" />
+    <arg name="planning_room_scan_zones"
+         value="$(arg planning_room_scan_zones)" />
   </include>
 </launch>
