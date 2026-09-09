@@ -55,34 +55,25 @@ BASE_FRAME = "base"
 # within Mid-360 corridor line-of-sight so each successive target is opened
 # by the time the previous one is reached).  Overridden by
 # ~room_mission_targets (JSON list of [x, y]).
+# Compact single-pass route (SEED-agnostic demo layout): corridor centre-line
+# drive, one/two scan stations per hazard-bearing room, no per-3 m corridor
+# stops, no room_3 (no source there). Covers all 6 sources in one south->north
+# sweep: E (room_0), A/B/D + F (room_1), C (room_2).
 ROOM_MISSION_TARGETS = [
-    # corridor entry, then drive up the CENTRE line (x = 0) so the robot
-    # does not hug either corridor wall; align on the centre before each
-    # door and only then turn toward the doorway.
     (0.0, 8.0),     # corridor entry (centre line)
-    (0.0, 11.0),    # corridor centre drive
-    (0.0, 14.0),    # align on centre before room_1 door
-    (1.8, 14.6),    # room_1 (south-east) door
-    (4.2, 13.5),    # room_1 interior (danger 4.48/2.23/7.02 area)
-    (6.6, 13.8),    # room_1 deep
+    # room_0 (south-west): one deep station covers E
+    (-1.8, 14.6),   # room_0 door
+    (-5.6, 13.6),   # room_0 deep (E -7.93,11.13 via visual scan)
     (0.0, 15.0),    # back to corridor centre
-    (-1.8, 14.6),   # room_0 (south-west) door
-    (-3.8, 13.3),   # room_0 interior
-    (-5.6, 13.6),   # room_0 deep (danger -7.93 is farther; best-effort)
-    # drive corridor north on the centre line
-    (0.0, 15.5),
-    (0.0, 19.0),
-    (0.0, 23.0),
-    (0.0, 27.0),
-    (0.0, 28.0),    # align on centre before room_3 door
-    (1.8, 29.0),    # room_3 (north-east) door
-    (4.6, 29.0),    # room_3 interior
-    (6.8, 28.6),    # room_3 deep
-    (0.0, 29.5),    # corridor centre
-    (-1.8, 29.0),   # room_2 (north-west) door
-    (-3.4, 27.0),   # room_2 interior
-    (-4.8, 25.0),   # room_2 danger vicinity (-4.79, 23.31)
-    (0.0, 3.0),     # final lobby hold
+    # room_1 (south-east): mid station covers A/B/D, north-end covers F
+    (1.8, 14.6),    # room_1 door
+    (5.0, 13.8),    # room_1 mid (A 4.48 / B 2.23 / D 7.02)
+    (5.6, 20.0),    # room_1 north end (F 5.64,20.29)
+    (0.0, 20.5),    # corridor centre (just north of room_1)
+    # drive corridor north directly, then into the north-west room
+    (0.0, 28.6),    # corridor centre before room_2 door
+    (-1.8, 28.9),   # room_2 (north-west) door
+    (-4.8, 23.9),   # room_2 south end (C -4.79,23.31)
 ]
 
 
