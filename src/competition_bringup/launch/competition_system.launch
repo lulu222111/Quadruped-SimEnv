@@ -187,7 +187,16 @@
 
     <!-- Mapping -->
     <node pkg="competition_mapping" type="mapping_node" name="mapping"
-          output="screen" respawn="true" />
+          output="screen" respawn="true">
+      <!-- Fixed full-building window (see mapping.yaml): x[-12.5,12.5],
+           y[-6.5,38.5].  Overrides the node default start-centred 40x40 that
+           cut off the northern half of the building. -->
+      <param name="map_width" value="250" />
+      <param name="map_height" value="450" />
+      <param name="origin_mode" value="fixed" />
+      <param name="origin_x" value="-12.5" />
+      <param name="origin_y" value="-6.5" />
+    </node>
 
     <!-- Planning -->
     <group if="$(arg planning_enabled)">
