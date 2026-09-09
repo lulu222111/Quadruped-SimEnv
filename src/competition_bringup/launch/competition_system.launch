@@ -65,8 +65,8 @@
        frontier_stuck_cooldown seconds so the explorer can pick a different
        reachable objective (escapes reachable-but-untraversable false
        spaces like open stairwell/elevator mouths). -->
-  <arg name="planning_frontier_stuck_hold" default="6.0" />
-  <arg name="planning_frontier_stuck_cooldown" default="15.0" />
+  <arg name="planning_frontier_stuck_hold" default="10.0" />
+  <arg name="planning_frontier_stuck_cooldown" default="30.0" />
   <!-- Demo-only deterministic room-mission drive (fixed SEED-agnostic
        layout): entry -> corridor -> 4 rooms in sequence -> lobby hold.
        Overrides frontier exploration while enabled. -->
@@ -84,7 +84,7 @@
   <arg name="planning_visual_scan_enabled" default="true" />
   <arg name="planning_visual_scan_yaw_step" default="0.7853981634" />
   <arg name="planning_visual_scan_yaw_tolerance" default="0.15" />
-  <arg name="planning_visual_scan_dwell" default="0.35" />
+  <arg name="planning_visual_scan_dwell" default="0.6" />
   <arg name="planning_visual_scan_heading_timeout" default="4.0" />
   <arg name="planning_visual_scan_timeout" default="45.0" />
   <arg name="planning_visual_scan_position_dedup_radius" default="1.0" />
@@ -95,8 +95,7 @@
   <arg name="planning_visual_scan_final_before_complete" default="true" />
   <arg name="planning_enabled" default="true" />
   <arg name="planning_path_topic" default="/competition/path" />
-  <arg name="path_follower_max_linear" default="1.0" />
-  <arg name="path_follower_max_angular" default="1.2" />
+  <arg name="path_follower_max_angular" default="0.8" />
   <arg name="path_follower_orientation_tolerance" default="0.15" />
   <!-- Minimum forward speed while driving to a waypoint. The RL locomotion
        policy stands still below ~0.2 m/s, which deadlocks the proportional
@@ -140,7 +139,7 @@
         output="screen" respawn="false">
     <param name="max_time" value="600.0" />
     <param name="floor_lifecycle_enabled" value="$(arg floor_lifecycle_enabled)" />
-    <param name="start_delay" value="2.0" />
+    <param name="start_delay" value="5.0" />
     <param name="auto_start" value="$(arg auto_start)" />
     <param name="finish_on_first_detection" value="$(arg finish_on_first_detection)" />
     <param name="return_on_first_detection" value="$(arg return_on_first_detection)" />
@@ -166,9 +165,9 @@
   <node pkg="competition_control" type="cmd_vel_guard_node" name="cmd_vel_guard"
         output="screen" respawn="true">
     <param name="cmd_vel_timeout" value="0.5" />
-    <param name="max_linear_x" value="1.2" />
+    <param name="max_linear_x" value="0.5" />
     <param name="max_linear_y" value="0.3" />
-    <param name="max_angular_z" value="1.4" />
+    <param name="max_angular_z" value="1.0" />
   </node>
 
   <!-- === Mock subsystem (test mode only) === -->
@@ -281,7 +280,6 @@
     <!-- Path follower -->
     <node pkg="competition_control" type="path_follower_node" name="path_follower"
           output="screen" respawn="true">
-      <param name="max_linear" value="$(arg path_follower_max_linear)" />
       <param name="max_angular" value="$(arg path_follower_max_angular)" />
       <param name="orientation_tolerance"
              value="$(arg path_follower_orientation_tolerance)" />
