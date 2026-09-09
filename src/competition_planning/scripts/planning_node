@@ -48,6 +48,38 @@ from visual_coverage import (
 WORLD_FRAME = "world"
 BASE_FRAME = "base"
 
+# Demo-only hard-coded room-mission drive (SEED-agnostic fixed layout, world
+# metres): entry -> drive central corridor -> south rooms (east/west) ->
+# corridor north -> north rooms (east/west) -> hold in lobby.  Each point must
+# be reachable over already-free space as the robot advances (spacing is
+# within Mid-360 corridor line-of-sight so each successive target is opened
+# by the time the previous one is reached).  Overridden by
+# ~room_mission_targets (JSON list of [x, y]).
+ROOM_MISSION_TARGETS = [
+    # corridor entry / south-door band
+    (0.0, 8.0),
+    (1.8, 14.6),    # room_1 (south-east) door zone
+    (4.2, 13.5),    # room_1 interior (danger 4.48/2.23/7.02 area)
+    (6.6, 13.8),    # room_1 deep
+    (0.0, 15.5),    # corridor
+    (-1.8, 14.6),   # room_0 (south-west) door zone
+    (-3.8, 13.3),   # room_0 interior
+    (-5.6, 13.6),   # room_0 deep (danger -7.93 is farther; best-effort)
+    # drive corridor north
+    (0.0, 19.0),
+    (0.0, 23.0),
+    (0.0, 27.0),
+    (0.0, 29.0),
+    (1.8, 29.0),    # room_3 (north-east) door zone
+    (4.6, 29.0),    # room_3 interior
+    (6.8, 28.6),    # room_3 deep
+    (0.0, 29.5),    # corridor
+    (-1.8, 29.0),   # room_2 (north-west) door zone
+    (-3.4, 27.0),   # room_2 interior
+    (-4.8, 25.0),   # room_2 danger vicinity (-4.79, 23.31)
+    (0.0, 3.0),     # final lobby hold
+]
+
 
 def quaternion_to_yaw(quaternion):
     """Return planar yaw from a geometry_msgs Quaternion."""
@@ -131,6 +163,8 @@ class PlanningNode:
         self.active_frontier_cell = None
         self.active_frontier_still_since = None
         self.active_frontier_last_pos = None
+        # Demo room-mission state (deterministic room-by-room drive).
+        self.room_mission_idx = 0
         self.active_exploration_target = None
         # Once a visual checkpoint is selected, keep the route prefix that
         # reaches that checkpoint stable across ordinary map replans.  The
@@ -388,6 +422,25 @@ class PlanningNode:
             self.frontier_stuck_cooldown = float(
                 rospy.get_param("~frontier_stuck_cooldown", 30.0)
             )
+            self.room_mission_enabled = bool(
+                rospy.get_param("~room_mission_enabled", False)
+            )
+            self.room_mission_arrival_m = float(
+                rospy.get_param("~room_mission_arrival_m", 0.6)
+            )
+            self.room_mission_search_cells = int(
+                rospy.get_param("~room_mission_search_cells", 25)
+            )
+            raw_targets = rospy.get_param(
+                "~room_mission_targets", None
+            )
+            if raw_targets:
+                parsed = json.loads(raw_targets)
+                self.room_mission_targets = [
+                    (float(p[0]), float(p[1])) for p in parsed
+                ]
+            else:
+                self.room_mission_targets = list(ROOM_MISSION_TARGETS)
             self.initial_forward_distance = float(
                 rospy.get_param("~initial_forward_distance", 0.0)
             )
@@ -533,6 +586,10 @@ class PlanningNode:
             raise ValueError("frontier_stuck_hold must be positive")
         if self.frontier_stuck_cooldown <= 0.0:
             raise ValueError("frontier_stuck_cooldown must be positive")
+        if self.room_mission_arrival_m <= 0.0:
+            raise ValueError("room_mission_arrival_m must be positive")
+        if self.room_mission_search_cells <= 0:
+            raise ValueError("room_mission_search_cells must be positive")
         if not 1 <= self.obstacle_threshold <= 100:
             raise ValueError("obstacle_threshold must be in [1, 100]")
 
@@ -697,6 +754,8 @@ class PlanningNode:
         self.active_frontier_cell = None
         self.active_frontier_still_since = None
         self.active_frontier_last_pos = None
+        # Restart the deterministic room-mission drive.
+        self.room_mission_idx = 0
 
     def _clear_frontier_continuation_locked(self):
         """Drop the unfinished frontier route and its visual final marker."""
@@ -705,6 +764,94 @@ class PlanningNode:
         self.frontier_continuation_frontier_count = 0
         self.frontier_continuation_goal_offset_used = False
         self.frontier_continuation_final_pending = False
+
+    def _plan_room_mission(
+        self,
+        map_msg,
+        odom_msg,
+        robot_cell,
+        inflation_radius_cells,
+    ):
+        """Deterministic demo drive: sequentially reach hard-coded points.
+
+        Returns a plan dict compatible with the shared success publisher, or
+        None when the mission is disabled.  While enabled it owns the route
+        (no frontier/continuation fallback), so the robot cannot be dragged
+        back outside or into false spaces.  Reaching a target advances to the
+        next; an unreachable target holds in place (short no-motion route)
+        instead of wandering.
+        """
+        if not self.room_mission_enabled:
+            return None
+        with self.lock:
+            self._clear_frontier_continuation_locked()
+            targets = list(self.room_mission_targets)
+            idx = self.room_mission_idx
+
+        if not targets:
+            return None
+        if idx < 0 or idx >= len(targets):
+            with self.lock:
+                self.room_mission_idx = 0
+            idx = 0
+
+        info = map_msg.info
+        origin = info.origin
+        origin_yaw = quaternion_to_yaw(origin.orientation)
+        robot = odom_msg.pose.pose.position
+
+        # Advance past targets the robot has already reached (the final hold
+        # point is never advanced past).
+        arrival2 = self.room_mission_arrival_m ** 2
+        while idx < len(targets) - 1:
+            tx, ty = targets[idx]
+            dx = robot.x - tx
+            dy = robot.y - ty
+            if dx * dx + dy * dy > arrival2:
+                break
+            idx += 1
+        with self.lock:
+            self.room_mission_idx = idx
+
+        tx, ty = targets[idx]
+        goal_cell = world_to_grid_cell(
+            (tx, ty),
+            resolution=info.resolution,
+            origin_x=origin.position.x,
+            origin_y=origin.position.y,
+            origin_yaw=origin_yaw,
+        )
+        result = plan_to_goal_region_with_status(
+            list(map_msg.data),
+            width=info.width,
+            height=info.height,
+            robot_cell=robot_cell,
+            goal_cell=goal_cell,
+            goal_search_radius_cells=self.room_mission_search_cells,
+            inflation_radius_cells=inflation_radius_cells,
+            start_recovery_radius_cells=(
+                self.start_recovery_radius_cells
+            ),
+            obstacle_threshold=self.obstacle_threshold,
+        )
+        if result.get("status") != PLAN_SUCCESS:
+            rospy.logwarn_throttle(
+                5.0,
+                "planning_node: room_mission target %s unreachable; "
+                "holding",
+                (round(tx, 2), round(ty, 2)),
+            )
+            result = {
+                "status": PLAN_SUCCESS,
+                "path": [robot_cell],
+                "goal_cell": robot_cell,
+            }
+        result["frontier_count"] = 0
+        result["frontier_goal_cell"] = result["goal_cell"]
+        result["frontier_goal_offset_used"] = False
+        result["room_mission_idx"] = idx
+        result["room_mission_total"] = len(targets)
+        return result
 
     def _note_frontier_plan(self, cluster, robot_position):
         """Track no-progress wedging on the active frontier cluster.
@@ -2269,6 +2416,7 @@ class PlanningNode:
         initial_forward = False
         frontier_continuation = False
         continuation_goal_cell = None
+        mission_result = None
         if returning:
             return_cell = world_to_grid_cell(
                 (return_start_pose["x"], return_start_pose["y"]),
@@ -2300,6 +2448,17 @@ class PlanningNode:
             )
             initial_forward = result is not None
         if not returning and not initial_forward:
+            mission_result = self._plan_room_mission(
+                map_msg,
+                odom_msg,
+                robot_cell,
+                inflation_radius_cells,
+            )
+        if mission_result is not None:
+            result = mission_result
+            frontier_continuation = False
+            continuation_goal_cell = None
+        elif not returning and not initial_forward:
             with self.lock:
                 continuation_goal_cell = (
                     self.frontier_continuation_goal_cell

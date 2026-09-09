@@ -67,6 +67,10 @@
        spaces like open stairwell/elevator mouths). -->
   <arg name="planning_frontier_stuck_hold" default="10.0" />
   <arg name="planning_frontier_stuck_cooldown" default="30.0" />
+  <!-- Demo-only deterministic room-mission drive (fixed SEED-agnostic
+       layout): entry -> corridor -> 4 rooms in sequence -> lobby hold.
+       Overrides frontier exploration while enabled. -->
+  <arg name="planning_room_mission_enabled" default="false" />
   <arg name="planning_initial_forward_distance" default="4.0" />
   <arg name="planning_initial_forward_lookahead" default="2.0" />
   <arg name="planning_path_compression_enabled" default="false" />
@@ -207,6 +211,8 @@
                value="$(arg planning_frontier_stuck_hold)" />
         <param name="frontier_stuck_cooldown"
                value="$(arg planning_frontier_stuck_cooldown)" />
+        <param name="room_mission_enabled"
+               value="$(arg planning_room_mission_enabled)" />
         <param name="initial_forward_distance"
                value="$(arg planning_initial_forward_distance)" />
         <param name="initial_forward_lookahead"
