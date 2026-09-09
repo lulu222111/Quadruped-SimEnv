@@ -71,6 +71,12 @@
        layout): entry -> corridor -> 4 rooms in sequence -> lobby hold.
        Overrides frontier exploration while enabled. -->
   <arg name="planning_room_mission_enabled" default="false" />
+  <!-- Room-only visual scan: JSON [[xmin,xmax,ymin,ymax], ...] in world
+       metres.  When non-empty, visual scan stations are created / final
+       scans fire only inside these zones (rooms), so the robot does not
+       waste time rotating in the entry/lobby/corridor (hazards spawn only
+       inside rooms).  Empty = scan anywhere. -->
+  <arg name="planning_room_scan_zones" default="" />
   <arg name="planning_initial_forward_distance" default="4.0" />
   <arg name="planning_initial_forward_lookahead" default="2.0" />
   <arg name="planning_path_compression_enabled" default="false" />
@@ -213,6 +219,8 @@
                value="$(arg planning_frontier_stuck_cooldown)" />
         <param name="room_mission_enabled"
                value="$(arg planning_room_mission_enabled)" />
+        <param name="room_scan_zones"
+               value="$(arg planning_room_scan_zones)" />
         <param name="initial_forward_distance"
                value="$(arg planning_initial_forward_distance)" />
         <param name="initial_forward_lookahead"

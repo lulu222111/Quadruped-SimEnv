@@ -165,6 +165,10 @@ class PlanningNode:
         self.active_frontier_last_pos = None
         # Demo room-mission state (deterministic room-by-room drive).
         self.room_mission_idx = 0
+        # Room-only visual scan zones: hazards spawn only inside rooms, so
+        # outside (lobby/corridor/entry) scan stations are skipped.  Empty
+        # list = scan anywhere (no gating).
+        self.room_scan_zones = []
         self.active_exploration_target = None
         # Once a visual checkpoint is selected, keep the route prefix that
         # reaches that checkpoint stable across ordinary map replans.  The
@@ -441,6 +445,18 @@ class PlanningNode:
                 ]
             else:
                 self.room_mission_targets = list(ROOM_MISSION_TARGETS)
+            raw_zones = rospy.get_param("~room_scan_zones", None)
+            if raw_zones:
+                parsed_zones = json.loads(raw_zones)
+                self.room_scan_zones = [
+                    (
+                        float(zone[0]), float(zone[1]),
+                        float(zone[2]), float(zone[3]),
+                    )
+                    for zone in parsed_zones
+                ]
+            else:
+                self.room_scan_zones = []
             self.initial_forward_distance = float(
                 rospy.get_param("~initial_forward_distance", 0.0)
             )
@@ -1029,6 +1045,20 @@ class PlanningNode:
         result["continuation_goal_cell"] = goal_cell
         return result
 
+    def _in_room_scan_zone(self, x, y):
+        """True when (x, y) lies in any configured room scan zone.
+
+        Empty zones => no gating (scan anywhere).  Used for room-only
+        visual scanning: hazards spawn only inside rooms, so rotating to
+        scan while in the entry/lobby/corridor is wasted time.
+        """
+        if not self.room_scan_zones:
+            return True
+        for x0, x1, y0, y1 in self.room_scan_zones:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return True
+        return False
+
     def _select_visual_scan_checkpoint(
         self,
         path_msg,
@@ -1058,9 +1088,12 @@ class PlanningNode:
         first_pose = path_msg.poses[0].pose.position
         first_position = (float(first_pose.x), float(first_pose.y))
         if not self.visual_coverage.scanned_positions:
-            if not self.visual_coverage.position_is_cooling_down(
-                first_position,
-                now,
+            if (
+                self._in_room_scan_zone(*first_position)
+                and not self.visual_coverage.position_is_cooling_down(
+                    first_position,
+                    now,
+                )
             ):
                 return first_position
 
@@ -1083,6 +1116,8 @@ class PlanningNode:
             # reach it, receive SCAN_SKIPPED, and replan the same frontier
             # route indefinitely.  If every pose is already covered, return
             # no checkpoint so the full frontier route remains executable.
+            if not self._in_room_scan_zone(current_x, current_y):
+                continue
             if self.visual_coverage.position_is_covered(current):
                 continue
             if self.visual_coverage.position_is_cooling_down(
@@ -1262,6 +1297,15 @@ class PlanningNode:
                 return False
 
             robot = odom_msg.pose.pose.position
+            if not self._in_room_scan_zone(robot.x, robot.y):
+                # Room-only final scan: outside a room there is nothing left
+                # to expose (hazards spawn only inside rooms).
+                self.active_exploration_target = None
+                self.visual_scan_checkpoint_path = None
+                self.visual_scan_checkpoint_goal = None
+                self.visual_scan_checkpoint_origin = None
+                self.visual_scan_final_pending = False
+                return False
             if self.active_exploration_target is not None:
                 distance = hypot(
                     robot.x - self.active_exploration_target[0],
