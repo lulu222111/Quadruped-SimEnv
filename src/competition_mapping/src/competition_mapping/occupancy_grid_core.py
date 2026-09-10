@@ -81,8 +81,27 @@ class OccupancyGridCore:
             raise ValueError("max_height must be > min_height")
 
     def reset(self) -> None:
-        """Set every cell to unknown."""
-        self._data: List[int] = [self.UNKNOWN] * (self.width * self.height)
+        """Clear the map and every cell's accumulated evidence."""
+        size = self.width * self.height
+        self._data: List[int] = [self.UNKNOWN] * size
+        self._occupied_evidence: List[int] = [0] * size
+        self._free_evidence: List[int] = [0] * size
+
+    def _evidence_value(self, index: int) -> int:
+        """Publish one cell from the evidence accumulated for it.
+
+        A cell counts as an obstacle only while its endpoint evidence
+        outnumbers the free rays cast through it.  Deciding from the totals
+        instead of the newest write keeps a lone stray return from outliving
+        sustained proof that the space is empty.
+        """
+        occupied = self._occupied_evidence[index]
+        free = self._free_evidence[index]
+        if occupied > free:
+            return self.OCCUPIED
+        if free > 0:
+            return self.FREE
+        return self.UNKNOWN
 
     def data_copy(self) -> List[int]:
         return list(self._data)
@@ -185,17 +204,25 @@ class OccupancyGridCore:
             if endpoint_inside:
                 occupied_endpoints.add(endpoint)
 
-        # Apply every free ray first, then every endpoint. This lets a new scan
-        # clear stale obstacles while guaranteeing occupied wins within one scan.
+        # Accumulate evidence per cell, then republish each touched cell from
+        # its totals.  This scan's own endpoints supersede its own rays, so
+        # occupied still wins within a single scan, while a lone endpoint can
+        # no longer outlive the free rays later scans cast through the cell.
+        touched: List[int] = []
         for cell in free_cells:
+            if cell in occupied_endpoints:
+                continue
             index = self.grid_to_index(*cell)
-            if self._data[index] != self.FREE:
-                self._data[index] = self.FREE
-                stats["changed_cells"] += 1
+            self._free_evidence[index] += 1
+            touched.append(index)
         for cell in occupied_endpoints:
             index = self.grid_to_index(*cell)
-            if self._data[index] != self.OCCUPIED:
-                self._data[index] = self.OCCUPIED
+            self._occupied_evidence[index] += 1
+            touched.append(index)
+        for index in touched:
+            value = self._evidence_value(index)
+            if self._data[index] != value:
+                self._data[index] = value
                 stats["changed_cells"] += 1
 
         stats["free_cells_updated"] = len(free_cells)

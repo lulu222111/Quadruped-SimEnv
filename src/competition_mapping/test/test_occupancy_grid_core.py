@@ -89,6 +89,58 @@ class OccupancyGridCoreTest(unittest.TestCase):
         self.assertEqual(100, grid.get_cell(7, 5))
         self.assertEqual(100, grid.get_cell(9, 5))
 
+    def test_late_stray_endpoint_does_not_reoccupy_a_clear_cell(self):
+        # The return-closure defect.  The robot drives through a cell many
+        # times, then one stray return lands in it.  Under last-write-wins the
+        # stray return occupied the cell for good and walled off the corridor
+        # the robot had just used.
+        grid = self.make_grid()
+        for _ in range(6):
+            grid.integrate_scan(0.0, 0.0, 0.0, [(3.0, 0.0, 0.0)])
+        self.assertEqual(0, grid.get_cell(7, 5))
+        grid.integrate_scan(0.0, 0.0, 0.0, [(2.0, 0.0, 0.0)])
+        self.assertEqual(0, grid.get_cell(7, 5))
+        self.assertEqual(100, grid.get_cell(8, 5))
+
+    def test_stray_endpoints_never_outnumber_clear_sightings(self):
+        # Same shape at the ratio measured on the real run (a handful of stray
+        # endpoints against dozens of clear sightings).
+        grid = self.make_grid()
+        for _ in range(30):
+            grid.integrate_scan(0.0, 0.0, 0.0, [(3.0, 0.0, 0.0)])
+        for _ in range(4):
+            grid.integrate_scan(0.0, 0.0, 0.0, [(2.0, 0.0, 0.0)])
+        self.assertEqual(0, grid.get_cell(7, 5))
+
+    def test_repeated_obstacle_evidence_survives_free_rays(self):
+        # A real obstacle keeps being hit; the stray rays that cross it must
+        # not erase it.
+        grid = self.make_grid()
+        for _ in range(3):
+            grid.integrate_scan(0.0, 0.0, 0.0, [(2.0, 0.0, 0.0)])
+        grid.integrate_scan(0.0, 0.0, 0.0, [(3.0, 0.0, 0.0)])
+        grid.integrate_scan(0.0, 0.0, 0.0, [(3.0, 0.0, 0.0)])
+        self.assertEqual(100, grid.get_cell(7, 5))
+
+    def test_endpoint_only_cell_is_never_cleared(self):
+        # No ray ever crossed these cells, so free evidence can never
+        # outnumber the obstacle evidence.
+        grid = self.make_grid()
+        grid.integrate_scan(0.0, 0.0, 0.0, [(2.0, 0.0, 0.0)])
+        for _ in range(50):
+            grid.integrate_scan(0.0, 0.0, 0.0, [(1.0, 1.0, 0.0)])
+        self.assertEqual(100, grid.get_cell(7, 5))
+
+    def test_reset_clears_accumulated_evidence(self):
+        grid = self.make_grid()
+        for _ in range(3):
+            grid.integrate_scan(0.0, 0.0, 0.0, [(2.0, 0.0, 0.0)])
+        grid.reset()
+        self.assertEqual(-1, grid.get_cell(7, 5))
+        grid.integrate_scan(0.0, 0.0, 0.0, [(3.0, 0.0, 0.0)])
+        self.assertEqual(0, grid.get_cell(7, 5))
+        self.assertEqual(100, grid.get_cell(8, 5))
+
     def test_empty_scan_does_not_change_map(self):
         grid = self.make_grid()
         before = grid.data_copy()
