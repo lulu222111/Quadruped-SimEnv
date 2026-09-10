@@ -734,10 +734,15 @@ def _door_config_entry(door: DoorSpec) -> dict[str, object]:
     payload = door.as_dict()
     payload["model_name"] = f"dynamic_{door.id}"
     panel_offset = door.width / 4.0
-    slide_offset = door.width / 4.0 + 0.06
+    # A sliding leaf only clears the opening once its inner edge passes the
+    # doorway edge, i.e. slide_offset >= door.width / 2.  The previous
+    # width/4 + 0.06 kept each leaf's inner edge at 0.56 m for a 2.0 m door, so
+    # 0.88 m of the opening stayed blocked even in the "open" pose and the
+    # planner saw the entrance as impassable.  Elevator doors already used the
+    # opening-clearing formula; use it for every door.
+    slide_offset = door.width / 2.0 + WALL_THICKNESS / 2.0 + DOOR_PANEL_THICKNESS
     recess_offset = 0.0
     if door.kind == "elevator":
-        slide_offset = door.width / 2.0 + WALL_THICKNESS / 2.0 + DOOR_PANEL_THICKNESS
         recess_offset = -(WALL_THICKNESS / 2.0 + DOOR_PANEL_THICKNESS / 2.0)
         payload["motion_duration"] = ELEVATOR_DOOR_MOTION_DURATION
     payload["panel_poses"] = {
