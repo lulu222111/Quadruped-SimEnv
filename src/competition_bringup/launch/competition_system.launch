@@ -206,6 +206,14 @@
       <param name="origin_mode" value="fixed" />
       <param name="origin_x" value="-12.5" />
       <param name="origin_y" value="-6.5" />
+      <!-- Height window from the authored mapping config
+           (competition_mapping/config/mapping.yaml): qualification-scene floor
+           returns measure -0.31..-0.18 m in the base frame and must be excluded
+           while obstacles >= ~0.16 m are retained.  Without these the node fell
+           back to its default min_height=-0.5, which admitted floor returns as
+           obstacles. -->
+      <param name="min_height" value="-0.15" />
+      <param name="max_height" value="1.50" />
     </node>
 
     <!-- Planning -->
