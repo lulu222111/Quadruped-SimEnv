@@ -2158,5 +2158,253 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
         self.assertEqual(node.generation, 0)
 
 
+class RoomMissionCompletionTest(unittest.TestCase):
+    """Deterministic tests for the room-mission terminal completion gate.
+
+    The drive owns the route while it runs, so the floor could never complete:
+    reaching the last service point only held position.  These tests pin the
+    required lifecycle ``final service -> exploration_complete`` and the
+    bounded wedged-target recovery that goes with it.
+    """
+
+    TARGETS = [(1.5, 1.5), (3.5, 3.5)]
+
+    def setUp(self):
+        _reset_fake_ros(clock=100.0)
+        _STATE["params"].update(
+            {
+                "map_timeout": 1.0,
+                "localization_timeout": 2.0,
+                "mapping_status_timeout": 3.0,
+                "localization_status_timeout": 3.0,
+                "future_stamp_tolerance": 0.2,
+                "status_heartbeat_interval": 0.1,
+                "replan_interval": 2.0,
+                "room_mission_enabled": True,
+                "room_mission_targets": json.dumps(self.TARGETS),
+                "visual_scan_enabled": True,
+                "visual_scan_yaw_step": math.pi / 2.0,
+                "visual_scan_yaw_tolerance": 0.1,
+                "visual_scan_dwell": 0.1,
+                "visual_scan_heading_timeout": 2.0,
+                "visual_scan_timeout": 20.0,
+                "visual_scan_max_heading_retries": 0,
+            }
+        )
+        self.node = PLANNING_NODE.PlanningNode()
+
+    @staticmethod
+    def _make_free_map(stamp):
+        msg = FakeOccupancyGrid()
+        msg.header.stamp = FakeTime(stamp)
+        msg.header.frame_id = "world"
+        msg.info.resolution = 1.0
+        msg.info.width = 5
+        msg.info.height = 5
+        msg.data = [0] * 25
+        return msg
+
+    @staticmethod
+    def _odom_at(stamp, x, y):
+        msg = FakeOdometry()
+        msg.header.stamp = FakeTime(stamp)
+        msg.header.frame_id = "world"
+        msg.child_frame_id = "base"
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        msg.pose.pose.orientation.w = 1.0
+        return msg
+
+    @staticmethod
+    def _status(valid, stamp):
+        msg = FakeModuleStatus()
+        msg.header.stamp = FakeTime(stamp)
+        msg.state = (
+            FakeModuleStatus.RUNNING if valid else FakeModuleStatus.BLOCKED
+        )
+        msg.valid = valid
+        msg.confidence = 1.0 if valid else 0.0
+        msg.detail = "test"
+        return msg
+
+    def _published(self, topic):
+        return _STATE["published"].get(topic, [])
+
+    def _last_status_msg(self):
+        return self._published("/competition/planning/status")[-1]
+
+    def _complete_published(self):
+        return [
+            message.data
+            for message in self._published(
+                "/competition/planning/exploration_complete"
+            )
+            if message.data
+        ]
+
+    def _cycle(self, now, x, y):
+        """Publish one fully healthy generation and run one planning tick.
+
+        Returns the clock value this cycle ended on, so callers can keep
+        simulated time monotonic (a rollback would open a new generation and
+        legitimately reset the drive).
+        """
+        set_clock(now)
+        self.node.mapping_status_callback(self._status(True, now))
+        self.node.localization_status_callback(self._status(True, now))
+        self.node.map_callback(self._make_free_map(now + 0.1))
+        self.node.odom_callback(self._odom_at(now + 0.1, x, y))
+        set_clock(now + 0.2)
+        self.node.plan_callback(None)
+        return now + 0.2
+
+    def _finish_active_visual_scan(self, start):
+        """Drive the active scan to completion with deterministic odometry."""
+        now = start
+        while self.node.visual_coverage.active:
+            set_clock(now)
+            yaw = self.node.visual_coverage.current_heading
+            odom = self._odom_at(now, 3.5, 3.5)
+            odom.pose.pose.orientation.z = math.sin(yaw / 2.0)
+            odom.pose.pose.orientation.w = math.cos(yaw / 2.0)
+            self.node.odom_callback(odom)
+            self.node.visual_scan_callback(None)
+            now += 0.01
+        return now
+
+    def test_drive_keeps_running_while_targets_remain(self):
+        # Mid-route: neither target is within arrival range, so the drive keeps
+        # its index and never claims terminal completion.
+        self._cycle(100.0, 2.5, 2.5)
+        self.assertEqual(self.node.room_mission_idx, 0)
+        self.assertFalse(self.node.room_mission_terminal)
+
+    def test_final_target_latches_terminal_instead_of_holding_route(self):
+        now = self._cycle(100.0, 1.5, 1.5)
+        self.assertEqual(self.node.room_mission_idx, len(self.TARGETS) - 1)
+        self.assertFalse(self.node.room_mission_terminal)
+
+        self._cycle(now + 0.1, 3.5, 3.5)
+        self.assertTrue(self.node.room_mission_terminal)
+        # The terminal gate must not publish a drive route; it starts the
+        # final visual exposure first (the drive path is never latched).
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertEqual(self._complete_published(), [])
+
+    def test_terminal_gate_completes_only_after_final_scan_and_debounce(self):
+        self.node.room_mission_idx = len(self.TARGETS) - 1
+        self.node.room_mission_terminal = True
+        now = self._cycle(100.0, 3.5, 3.5)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertEqual(self._complete_published(), [])
+
+        now = self._finish_active_visual_scan(now + 0.1)
+        self.assertFalse(self.node.visual_scan_final_pending)
+
+        for _ in range(3):
+            now = self._cycle(now + 0.1, 3.5, 3.5)
+
+        self.assertTrue(self.node._exploration_complete_active)
+        self.assertEqual(self._complete_published(), [True])
+        # The confirming status the floor lifecycle consumes is published by
+        # the same SUCCEEDED commit, so the proof and the Bool edge agree.
+        self.assertEqual(
+            self._last_status_msg().state,
+            FakeModuleStatus.SUCCEEDED,
+        )
+        self.assertTrue(self._last_status_msg().exploration_complete)
+
+    def test_heartbeat_reasserts_completion_level_for_freshness(self):
+        """The floor lifecycle needs jointly-fresh Bool and status evidence."""
+        self._cycle(100.0, 2.5, 2.5)
+        before = len(self._complete_published())
+        self.node._exploration_complete_active = True
+        self.node.last_status = (
+            FakeModuleStatus.SUCCEEDED,
+            False,
+            1.0,
+            "room mission complete: no further route",
+        )
+        set_clock(100.3)
+        self.node.heartbeat_callback(None)
+        self.assertEqual(len(self._complete_published()), before + 1)
+        self.assertTrue(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+        self.assertTrue(self._last_status_msg().exploration_complete)
+        self.assertEqual(
+            self._last_status_msg().state,
+            FakeModuleStatus.SUCCEEDED,
+        )
+
+        # A stale-upstream heartbeat withdraws the completion evidence rather
+        # than re-asserting it, so the floor cannot complete on stale inputs.
+        set_clock(200.0)
+        self.node.heartbeat_callback(None)
+        self.assertFalse(self._last_status_msg().exploration_complete)
+
+    def test_stuck_skips_wedged_target_once_per_budget(self):
+        _reset_fake_ros(clock=100.0)
+        _STATE["params"].update(
+            {
+                "map_timeout": 1.0,
+                "localization_timeout": 2.0,
+                "mapping_status_timeout": 3.0,
+                "localization_status_timeout": 3.0,
+                "future_stamp_tolerance": 0.2,
+                "status_heartbeat_interval": 0.1,
+                "room_mission_enabled": True,
+                "room_mission_targets": json.dumps(self.TARGETS),
+                "room_mission_stuck_skip_limit": 1,
+            }
+        )
+        node = PLANNING_NODE.PlanningNode()
+        self.assertEqual(node.room_mission_stuck_skip_limit, 1)
+
+        node.stuck_callback(FakeBool(data=True))
+        self.assertEqual(node.room_mission_idx, 1)
+        self.assertEqual(node.room_mission_stuck_skips, 1)
+
+        # Budget exhausted: a repeat report must not move the route again.
+        node.room_mission_idx = 0
+        node.stuck_callback(FakeBool(data=True))
+        self.assertEqual(node.room_mission_idx, 0)
+        self.assertEqual(node.room_mission_stuck_skips, 1)
+
+    def test_stuck_never_skips_past_the_final_target(self):
+        self.node.room_mission_idx = len(self.TARGETS) - 1
+        self.node.stuck_callback(FakeBool(data=True))
+        self.assertEqual(self.node.room_mission_idx, len(self.TARGETS) - 1)
+        self.assertEqual(self.node.room_mission_stuck_skips, 0)
+
+    def test_stuck_ignored_when_room_mission_disabled(self):
+        _reset_fake_ros(clock=100.0)
+        _STATE["params"].update(
+            {
+                "map_timeout": 1.0,
+                "localization_timeout": 2.0,
+                "mapping_status_timeout": 3.0,
+                "localization_status_timeout": 3.0,
+                "future_stamp_tolerance": 0.2,
+                "status_heartbeat_interval": 0.1,
+            }
+        )
+        node = PLANNING_NODE.PlanningNode()
+        node.stuck_callback(FakeBool(data=True))
+        self.assertEqual(node.room_mission_idx, 0)
+        self.assertEqual(node.room_mission_stuck_skips, 0)
+
+    def test_terminal_latch_resets_at_generation_boundary(self):
+        self.node.room_mission_terminal = True
+        self.node.room_mission_stuck_skips = 2
+        self.node._reset_visual_coverage_locked()
+        self.assertFalse(self.node.room_mission_terminal)
+        self.assertEqual(self.node.room_mission_stuck_skips, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -572,6 +572,86 @@ class TestMissionFoundDanger(unittest.TestCase):
         self.assertEqual(node._return_arrival_count, 0)
 
 
+class TestFloorLifecycleCompletion(unittest.TestCase):
+    """The floor-complete evidence chain must drive RETURNING exactly once.
+
+    The planner emits the Bool level and the confirming SUCCEEDED status from
+    the same completion commit, and re-asserts the level on every heartbeat
+    while the condition holds.  These tests pin the resulting loop behaviour:
+    a *jointly fresh* pair enters RETURNING once, and a pair that is never
+    jointly fresh cannot.
+    """
+
+    def _make_node(self):
+        node = object.__new__(CompetitionLoopNode)
+        node._fsm = _cn_mod.CompetitionStateMachine()
+        node._fsm.transition_to(CompetitionPhase.RUNNING, "exploring")
+        node._floor_lifecycle = _cn_mod.FloorLifecycle(
+            {
+                "door_ids": [{"kind": "main_entrance", "floor_index": 0}],
+                "elevators": [],
+            }
+        )
+        node._published_states = []
+        node._publish_state = lambda: node._published_states.append(
+            node._fsm.detail
+        )
+        node._publish_safety_signals = lambda **kwargs: None
+        node._return_start_pose = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0}
+        node._return_arrival_count = 0
+        node._detect_time_regression = lambda: False
+        node._timer = type("Timer", (), {"is_expired": False})()
+        return node
+
+    def _complete(self, node, now):
+        """One planner completion commit as the planner actually emits it."""
+        floor = node._floor_lifecycle
+        floor.observe_status(
+            floor.task_id, now, True, True, now
+        )
+        floor.observe_bool(True, now)
+
+    def test_jointly_fresh_evidence_enters_returning_once(self):
+        ros_time = _cn_mod.rospy.Time
+        ros_time.set_now(100.0)
+        node = self._make_node()
+        floor = node._floor_lifecycle
+        floor.activate(0, 100.0)
+
+        # Activation re-arms the edge detector with an explicit False level.
+        floor.observe_bool(False, 100.1)
+
+        ros_time.set_now(101.0)
+        self._complete(node, 101.0)
+        node._tick_running()
+        self.assertEqual(node._fsm.phase, CompetitionPhase.RETURNING)
+        self.assertFalse(floor.active)
+
+        # Consumed exactly once: a repeated fresh pair cannot re-fire.
+        return_count = len(node._published_states)
+        ros_time.set_now(101.5)
+        self._complete(node, 101.5)
+        node._tick_running()
+        self.assertEqual(len(node._published_states), return_count)
+        self.assertEqual(node._fsm.phase, CompetitionPhase.RETURNING)
+
+    def test_expired_evidence_never_enters_returning(self):
+        ros_time = _cn_mod.rospy.Time
+        ros_time.set_now(100.0)
+        node = self._make_node()
+        floor = node._floor_lifecycle
+        floor.activate(0, 100.0)
+        floor.observe_bool(False, 100.1)
+
+        # Bool and status are each individually valid but never jointly fresh:
+        # the confirming status arrives long after the level was last asserted.
+        floor.observe_bool(True, 101.0)
+        floor.observe_status(floor.task_id, 103.0, True, True, 103.0)
+        ros_time.set_now(103.0)
+        node._tick_running()
+        self.assertEqual(node._fsm.phase, CompetitionPhase.RUNNING)
+
+
 class TestCandidateWorldZSnap(unittest.TestCase):
     """P2: world-frame candidate z is snapped to source-centre height."""
 

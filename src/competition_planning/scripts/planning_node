@@ -161,6 +161,15 @@ class PlanningNode:
         self.active_frontier_last_pos = None
         # Demo room-mission state (deterministic room-by-room drive).
         self.room_mission_idx = 0
+        # Latched once the final room-mission target has been serviced.  From
+        # then on the deterministic drive is finished and the planner runs the
+        # same terminal completion gate the frontier path uses (final visual
+        # exposure, then the debounced exploration-complete signal) instead of
+        # holding the last target forever.  Cleared only at a mission /
+        # generation boundary by ``_reset_visual_coverage_locked``.
+        self.room_mission_terminal = False
+        # Bounded per-epoch budget of wedged service points that were skipped.
+        self.room_mission_stuck_skips = 0
         # Room-only visual scan zones: hazards spawn only inside rooms, so
         # outside (lobby/corridor/entry) scan stations are skipped.  Empty
         # list = scan anywhere (no gating).
@@ -431,6 +440,13 @@ class PlanningNode:
             self.room_mission_search_cells = int(
                 rospy.get_param("~room_mission_search_cells", 25)
             )
+            # Bounded physical-stuck recovery for the deterministic drive:
+            # a wedged service point is skipped at most this many times per
+            # mission epoch, so a single unreachable target cannot pin the
+            # whole route while a flapping stuck signal cannot erode coverage.
+            self.room_mission_stuck_skip_limit = int(
+                rospy.get_param("~room_mission_stuck_skip_limit", 2)
+            )
             raw_targets = rospy.get_param(
                 "~room_mission_targets", None
             )
@@ -602,6 +618,10 @@ class PlanningNode:
             raise ValueError("room_mission_arrival_m must be positive")
         if self.room_mission_search_cells <= 0:
             raise ValueError("room_mission_search_cells must be positive")
+        if self.room_mission_stuck_skip_limit < 0:
+            raise ValueError(
+                "room_mission_stuck_skip_limit must not be negative"
+            )
         if not 1 <= self.obstacle_threshold <= 100:
             raise ValueError("obstacle_threshold must be in [1, 100]")
 
@@ -768,6 +788,8 @@ class PlanningNode:
         self.active_frontier_last_pos = None
         # Restart the deterministic room-mission drive.
         self.room_mission_idx = 0
+        self.room_mission_terminal = False
+        self.room_mission_stuck_skips = 0
 
     def _clear_frontier_continuation_locked(self):
         """Drop the unfinished frontier route and its visual final marker."""
@@ -825,6 +847,37 @@ class PlanningNode:
         with self.lock:
             self.room_mission_idx = idx
 
+        # Terminal condition: the last required room-mission service point has
+        # been physically reached.  Latch it so a subsequent replan (or a
+        # bounded local detour after arrival) cannot restart the drive, and
+        # hand the cycle over to the shared completion gate.  The drive never
+        # advances past the final target, so ``idx`` alone identifies it.
+        if not self.room_mission_terminal and idx == len(targets) - 1:
+            dx = robot.x - targets[idx][0]
+            dy = robot.y - targets[idx][1]
+            if dx * dx + dy * dy <= arrival2:
+                with self.lock:
+                    self.room_mission_terminal = True
+                rospy.loginfo(
+                    "planning_node: final room-mission target %s serviced; "
+                    "running terminal completion gate",
+                    (round(targets[idx][0], 2), round(targets[idx][1], 2)),
+                )
+
+        if self.room_mission_terminal:
+            result = {
+                "status": PLAN_SUCCESS,
+                "path": [robot_cell],
+                "goal_cell": robot_cell,
+            }
+            result["frontier_count"] = 0
+            result["frontier_goal_cell"] = robot_cell
+            result["frontier_goal_offset_used"] = False
+            result["room_mission_idx"] = idx
+            result["room_mission_total"] = len(targets)
+            result["room_mission_terminal"] = True
+            return result
+
         tx, ty = targets[idx]
         goal_cell = world_to_grid_cell(
             (tx, ty),
@@ -863,6 +916,7 @@ class PlanningNode:
         result["frontier_goal_offset_used"] = False
         result["room_mission_idx"] = idx
         result["room_mission_total"] = len(targets)
+        result["room_mission_terminal"] = False
         return result
 
     def _note_frontier_plan(self, cluster, robot_position):
@@ -1593,6 +1647,65 @@ class PlanningNode:
         if completion_was_active or task_changed:
             self._publish_exploration_complete(False)
 
+    def _skip_wedged_room_mission_target_locked(self):
+        """Advance past a service point the robot physically cannot reach.
+
+        The follower reports "commanded motion, no measured progress" only
+        after ``stuck_duration_sec`` of continuous commanded travel, so this is
+        a physical-contact signal rather than map noise.  The deterministic
+        drive plans fresh from the live map every cycle, so re-planning the
+        *same* target cannot escape the wedge; the recoverable action is to
+        release that target and continue the sweep at the next one (the
+        room-mission analogue of a frontier cooldown).
+
+        The budget is bounded per mission epoch (``room_mission_stuck_skip_
+        limit``) and the final target is never skipped, because the drive never
+        advances past it — skipping it would wrap the index back to the start
+        of the route.  Caller owns ``self.lock``; returns True when a skip was
+        applied.
+        """
+        if not self.room_mission_enabled:
+            return False
+        if self.room_mission_terminal:
+            return False
+        if self.room_mission_stuck_skips >= self.room_mission_stuck_skip_limit:
+            rospy.logwarn_throttle(
+                5.0,
+                "planning_node: stuck reported in exploration but the "
+                "room-mission skip budget (%d) is exhausted; holding",
+                self.room_mission_stuck_skip_limit,
+            )
+            return False
+        targets = list(self.room_mission_targets)
+        if self.room_mission_idx >= len(targets) - 1:
+            # The final service point is handled by the terminal gate, which
+            # latches on arrival; never wrap the index back to the route head.
+            return False
+
+        wedged = targets[self.room_mission_idx]
+        self.room_mission_stuck_skips += 1
+        self.room_mission_idx += 1
+        # Release the bounded visual-station route prefix: it was planned
+        # toward the wedged target, and keeping it would keep commanding the
+        # same blocked motion.  Coverage bookkeeping is untouched, so the
+        # skipped station is still eligible for a later checkpoint.
+        self.active_exploration_target = None
+        self.visual_scan_checkpoint_path = None
+        self.visual_scan_checkpoint_goal = None
+        self.visual_scan_checkpoint_origin = None
+        rospy.logwarn(
+            "planning_node: room-mission target %s unreachable after stuck "
+            "report; skipping to %s (skip %d/%d this epoch)",
+            (round(wedged[0], 2), round(wedged[1], 2)),
+            (
+                round(targets[self.room_mission_idx][0], 2),
+                round(targets[self.room_mission_idx][1], 2),
+            ),
+            self.room_mission_stuck_skips,
+            self.room_mission_stuck_skip_limit,
+        )
+        return True
+
     def stuck_callback(self, msg):
         """Drop the committed RETURNING route once when the follower is wedged.
 
@@ -1609,6 +1722,10 @@ class PlanningNode:
             return
         with self.lock:
             if not self.returning:
+                # Exploration-side recovery: the deterministic drive has no
+                # committed route to drop, so the wedged *target* is released
+                # instead (bounded, see the helper).
+                self._skip_wedged_room_mission_target_locked()
                 return
             if not self.return_recommit_on_stuck_enabled:
                 return
@@ -1880,6 +1997,15 @@ class PlanningNode:
                 return
             status = self.last_status
             self._publish_status_message_locked(*status, stamp=now)
+            if self._exploration_complete_active:
+                # The floor lifecycle only consumes completion while both the
+                # Bool edge and the confirming SUCCEEDED status are *jointly*
+                # fresh (default 1.0 s, the same period as this heartbeat).  A
+                # one-shot edge would therefore expire before the next
+                # confirming status and the floor could never complete, so
+                # re-assert the level while the condition holds.  Consumption
+                # itself stays exactly-once on the lifecycle side.
+                self._publish_exploration_complete(True)
 
     def invalidate_plan(self, state, confidence, detail):
         """Withdraw the latched path and publish an invalid status."""
@@ -2494,6 +2620,37 @@ class PlanningNode:
                 robot_cell,
                 inflation_radius_cells,
             )
+        if mission_result is not None and mission_result.get(
+            "room_mission_terminal"
+        ):
+            # The deterministic drive has serviced its last required point.
+            # Reuse the frontier path's terminal semantics: finish the pending
+            # visual exposure first, then publish the same SUCCEEDED status so
+            # the debounced exploration-complete signal (and its Bool edge) is
+            # emitted by exactly one code path.  No route is published here, so
+            # Control holds position while the completion evidence is built.
+            if self._start_final_visual_scan_if_needed(
+                odom_msg,
+                expected_generation=expected_generation,
+                mission_epoch=mission_epoch,
+            ):
+                return
+            detail = "room mission complete: no further route"
+            committed = self._commit_invalid_result_if_current(
+                ModuleStatus.SUCCEEDED,
+                1.0,
+                detail,
+                expected_generation,
+                map_msg,
+                odom_msg,
+            )
+            if committed:
+                rospy.loginfo_throttle(5.0, detail)
+                self._record_exploration_complete(
+                    expected_generation,
+                    mission_epoch,
+                )
+            return
         if mission_result is not None:
             result = mission_result
             frontier_continuation = False
@@ -3289,6 +3446,12 @@ class PlanningNode:
                 self.exploration_complete_confirmations,
             )
             self._publish_exploration_complete(True)
+            with self.lock:
+                # Publish the confirming status in the same instant as the
+                # level.  The floor lifecycle only consumes completion while
+                # both are jointly fresh, so emitting them one heartbeat apart
+                # would leave completion to a timing race it can lose.
+                self._publish_status_message_locked(*self.last_status)
 
     def _clear_exploration_complete(self):
         """Withdraw completion evidence after progress or a pending scan."""
