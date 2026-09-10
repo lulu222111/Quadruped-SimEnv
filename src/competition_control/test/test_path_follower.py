@@ -304,6 +304,10 @@ class TestPathFollower(unittest.TestCase):
         self.follower.min_linear = 0.0
         self.follower.stuck_duration_sec = 0.0
         self.follower.stuck_progress_epsilon = 0.05
+        self.follower.stuck_progress_ratio = 0.2
+        self.follower.stuck_expected_progress_min = 0.10
+        self.follower._stuck_expected_progress = 0.0
+        self.follower._stuck_last_command_time = None
         self.follower.stuck_backoff_linear = 0.0
         self.follower.stuck_backoff_duration = 3.0
         self.follower.stuck_backoff_max = 3
@@ -589,6 +593,127 @@ class TestPathFollower(unittest.TestCase):
         self.assertEqual(self._stuck_true_count(), 0)
         self._fresh_stuck_step(20.0, x=0.3)  # 6 s since reset -> stuck
         self.assertEqual(self._stuck_true_count(), 1)
+
+    # ------------------------------------------------------------------
+    # Command-relative progress gate (run-f1 creeping-livelock regression)
+    # ------------------------------------------------------------------
+
+    def _arm_relative(self, duration=8.0, ratio=0.2):
+        self._arm_stuck(duration=duration)
+        self.follower.stuck_progress_ratio = ratio
+        self.follower.stuck_expected_progress_min = 0.10
+
+    def test_creeping_livelock_is_detected_as_stuck(self):
+        """run-f1 regression: creep that stays just above the absolute epsilon.
+
+        run-f1 commanded 0.25 m/s while the robot achieved 0.006-0.010 m/s
+        (2-4 % of command) for 281 sim s.  Every 8 s window moved 0.056-0.083 m
+        -- MORE than the 0.05 m absolute epsilon -- so the legacy window reset
+        forever and neither the backoff nor the planner stuck signal ever fired.
+        The command-relative gate must catch exactly this case.
+        """
+        self._arm_relative(duration=8.0)
+        self._fresh_stuck_step(10.0, x=0.0, points=[(10.0, 0.0)])
+        self.assertEqual(self._stuck_true_count(), 0)
+
+        # ~0.008 m/s creep; by t=18.5 the robot has moved 0.068 m > epsilon
+        for t in (12.0, 14.0, 16.0, 18.5):
+            self._fresh_stuck_step(t, x=0.008 * (t - 10.0), points=[(10.0, 0.0)])
+
+        self.assertGreater(
+            0.008 * 8.5, self.follower.stuck_progress_epsilon,
+            "test must exercise the case the absolute epsilon cannot see",
+        )
+        self.assertEqual(self._stuck_true_count(), 1)
+
+    def test_creeping_livelock_still_commands_backoff(self):
+        """The relative gate must drive the EXISTING backoff, not just the flag."""
+        self._arm_stuck(duration=8.0, backoff_linear=0.15)
+        self.follower.stuck_progress_ratio = 0.2
+        self._fresh_stuck_step(10.0, x=0.0, points=[(10.0, 0.0)])
+        for t in (12.0, 14.0, 16.0, 18.5):
+            self._fresh_stuck_step(t, x=0.008 * (t - 10.0), points=[(10.0, 0.0)])
+        self.assertEqual(self._stuck_true_count(), 1)
+        self.assertEqual(self.follower._stuck_backoff_count, 1)
+        # next step is inside the recovery window -> backward command
+        self._fresh_stuck_step(18.6, x=0.068, points=[(10.0, 0.0)])
+        self.assertLess(self.follower.raw_vel_pub.messages[-1].linear.x, 0.0)
+
+    def test_healthy_progress_is_not_stuck(self):
+        """Progress that tracks the command must never be declared stuck."""
+        self._arm_relative(duration=8.0)
+        self._fresh_stuck_step(10.0, x=0.0, points=[(10.0, 0.0)])
+        for t in (12.0, 14.0, 16.0, 18.0, 20.0):
+            self._fresh_stuck_step(t, x=0.25 * (t - 10.0), points=[(10.0, 0.0)])
+        self.assertEqual(self._stuck_true_count(), 0)
+
+    def test_slower_but_tracking_progress_is_not_stuck(self):
+        """Genuine motion at 60 % of command is slow, not stuck."""
+        self._arm_relative(duration=8.0)
+        self._fresh_stuck_step(10.0, x=0.0, points=[(10.0, 0.0)])
+        for t in (12.0, 14.0, 16.0, 18.0, 20.0):
+            self._fresh_stuck_step(t, x=0.15 * (t - 10.0), points=[(10.0, 0.0)])
+        self.assertEqual(self._stuck_true_count(), 0)
+
+    def test_precision_approach_is_not_falsely_stuck(self):
+        """Short low-speed approach that tracks its command stays clean."""
+        self._arm_relative(duration=8.0)
+        self.follower.min_linear = 0.0
+        self._fresh_stuck_step(10.0, x=0.0, points=[(0.3, 0.0)])
+        self._fresh_stuck_step(11.0, x=0.18, points=[(0.3, 0.0)])
+        self._fresh_stuck_step(12.0, x=0.29, points=[(0.3, 0.0)])
+        self.assertEqual(self._stuck_true_count(), 0)
+
+    def test_pure_rotation_does_not_arm_relative_gate(self):
+        """In-place yaw turns command zero translation, so the gate stays off."""
+        self._arm_relative(duration=2.0)
+        # target yaw far from the robot's -> rotation_only path, linear.x == 0
+        _MockTime.set(10.0)
+        self._planning(True)
+        self._localization(True)
+        self._odom(x=0.0, y=0.0)
+        poses = [_PoseStamped("world", 0.0, 0.0, None, yaw=math.pi)]
+        self.follower.on_path(_Path("world", poses, None))
+        self.follower.step()
+        self.assertEqual(self.follower.raw_vel_pub.messages[-1].linear.x, 0.0)
+        for t in (12.0, 14.0, 16.0):
+            _MockTime.set(t)
+            self._planning(True)
+            self._localization(True)
+            self._odom(x=0.0, y=0.0)
+            self.follower.on_path(_Path("world", poses, None))
+            self.follower.step()
+        self.assertEqual(self._stuck_true_count(), 0)
+
+    def test_zero_command_and_hold_do_not_arm_relative_gate(self):
+        """No path / no driving means no expected progress and no recovery."""
+        self._arm_relative(duration=2.0)
+        self._fresh_stuck_step(10.0, x=0.0, points=[(10.0, 0.0)])
+        # drop the path entirely (HOLD analogue): planner reports invalid
+        _MockTime.set(11.0)
+        self._planning(False)
+        self._localization(True)
+        self._odom(x=0.0, y=0.0)
+        for t in (13.0, 15.0, 17.0):
+            _MockTime.set(t)
+            self._planning(False)
+            self._localization(True)
+            self._odom(x=0.0, y=0.0)
+            self.follower.step()
+        self.assertEqual(self._stuck_true_count(), 0)
+
+    def test_window_resets_when_relative_progress_recovers(self):
+        """A livelock that breaks out must clear the window, not stay latched."""
+        self._arm_relative(duration=8.0)
+        self._fresh_stuck_step(10.0, x=0.0, points=[(10.0, 0.0)])
+        # creeping: stays below the ratio but the window is not yet expired
+        self._fresh_stuck_step(12.0, x=0.016, points=[(10.0, 0.0)])
+        self.assertEqual(self.follower._stuck_expected_progress > 0.0, True)
+        # breaks free and tracks the command -> window resets
+        self._fresh_stuck_step(13.0, x=0.266, points=[(10.0, 0.0)])
+        self.assertEqual(self.follower._stuck_expected_progress, 0.0)
+        self._fresh_stuck_step(14.0, x=0.516, points=[(10.0, 0.0)])
+        self.assertEqual(self._stuck_true_count(), 0)
 
     def test_stuck_disabled_by_default(self):
         self._arm()  # stuck_duration_sec = 0.0, stuck_pub None

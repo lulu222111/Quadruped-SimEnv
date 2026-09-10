@@ -154,6 +154,25 @@ class PathFollower:
         self.stuck_backoff_max = int(
             self._positive_param("~stuck_backoff_max", 3)
         )
+        # Command-relative progress gate (run-f1 livelock).  The absolute
+        # epsilon above cannot see a robot that keeps creeping just above it:
+        # run-f1 commanded 0.25 m/s while the robot achieved 0.006-0.010 m/s
+        # (2-4 % of command) for 281 sim s, and every 8 s window moved
+        # 0.056-0.083 m -- just over the 0.05 m epsilon -- so the window reset
+        # forever and no backoff, stuck signal or planner skip ever fired.
+        # This second criterion compares measured progress against the
+        # translational command actually integrated over the same window, so
+        # it is scale free.  Inactive while stuck_duration_sec is 0.
+        self.stuck_progress_ratio = self._positive_param(
+            "~stuck_progress_ratio", 0.2
+        )
+        if self.stuck_progress_ratio > 1.0:
+            raise ValueError("~stuck_progress_ratio must not exceed 1.0")
+        self.stuck_expected_progress_min = self._nonnegative_param(
+            "~stuck_expected_progress_min", 0.10
+        )
+        self._stuck_expected_progress = 0.0
+        self._stuck_last_command_time = None
         self._stuck_start_time = None
         self._stuck_start_position = None
         self._stuck_notified = False
@@ -798,6 +817,8 @@ class PathFollower:
         if not driving:
             self._stuck_start_time = None
             self._stuck_start_position = None
+            self._stuck_expected_progress = 0.0
+            self._stuck_last_command_time = None
             return
 
         px = odom.pose.pose.position.x
@@ -808,13 +829,37 @@ class PathFollower:
         if self._stuck_start_time is None:
             self._stuck_start_time = now.to_sec()
             self._stuck_start_position = (px, py)
+            self._stuck_expected_progress = 0.0
+            self._stuck_last_command_time = now.to_sec()
             return
 
-        # Moved enough: reset the window.
+        # Integrate the translational command magnitude actually requested over
+        # this window.  A zero command contributes zero expected progress, so
+        # HOLD, intentional stops and pure in-place yaw turns never arm the
+        # relative gate.
+        dt = now.to_sec() - self._stuck_last_command_time
+        if dt > 0.0:
+            self._stuck_expected_progress += abs(cmd.linear.x) * dt
+        self._stuck_last_command_time = now.to_sec()
+
         sx, sy = self._stuck_start_position
-        if math.hypot(px - sx, py - sy) >= self.stuck_progress_epsilon:
+        moved = math.hypot(px - sx, py - sy)
+
+        # Second, command-relative criterion.  Only meaningful once enough
+        # translation has actually been requested.
+        relative_progress = None
+        if self._stuck_expected_progress >= self.stuck_expected_progress_min:
+            relative_progress = moved / self._stuck_expected_progress
+        creeping = (
+            relative_progress is not None
+            and relative_progress < self.stuck_progress_ratio
+        )
+
+        # Moved enough AND still tracking the command: reset the window.
+        if moved >= self.stuck_progress_epsilon and not creeping:
             self._stuck_start_time = now.to_sec()
             self._stuck_start_position = (px, py)
+            self._stuck_expected_progress = 0.0
             return
 
         # Stuck long enough: report once per path, then back off.
@@ -828,9 +873,13 @@ class PathFollower:
             self.stuck_pub.publish(notice)
             rospy.logwarn(
                 "path_follower: no measured progress for %.1f s while "
-                "driving (%.3f m) — reporting stuck to planner",
+                "driving (moved %.3f m of %.3f m commanded = %.0f%%) — "
+                "reporting stuck to planner",
                 now.to_sec() - self._stuck_start_time,
-                math.hypot(px - sx, py - sy),
+                moved,
+                self._stuck_expected_progress,
+                100.0 * (relative_progress if relative_progress is not None
+                         else 1.0),
             )
 
         # Physically break the wedge: command a short backward motion.
@@ -850,6 +899,7 @@ class PathFollower:
         # Reset the window so a re-wedge after the backoff re-triggers.
         self._stuck_start_time = now.to_sec()
         self._stuck_start_position = (px, py)
+        self._stuck_expected_progress = 0.0
 
     def _recovery_active(self, now):
         return (
@@ -872,6 +922,8 @@ class PathFollower:
         """
         self._stuck_start_time = None
         self._stuck_start_position = None
+        self._stuck_expected_progress = 0.0
+        self._stuck_last_command_time = None
         self._stuck_notified = False
         self._recovery_until = None
         self._stuck_backoff_count = 0
