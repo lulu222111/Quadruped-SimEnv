@@ -99,6 +99,61 @@ class BuildingControlRuntimeTest(unittest.TestCase):
         self.assertEqual(elevator_result["target_door_id"], "elevator_floor_2")
         self.assertEqual(elevator_result["state"], "door_open")
 
+    def test_initial_open_panels_use_model_reference_frame(self) -> None:
+        """Panels must be placed in the MODEL frame, not by composing world poses.
+
+        Regression for the entrance pinch: requesting a composed WORLD pose for a
+        panel made Gazebo satisfy it by translating the parent model (authored
+        x=0.0 -> x=0.56 == the slide offset) while leaving the panel at its closed
+        relative offset, which blocked the doorway in the occupancy grid.
+        """
+        runtime = BuildingControlRuntime(
+            door_specs=[
+                {
+                    "id": "main_entrance",
+                    "model_name": "dynamic_main_entrance",
+                    "initial_open": True,
+                    "closed_pose": [0.0, 0.0, 1.2, 0.0, 0.0, 1.5708],
+                    "panel_poses": {
+                        "left_closed": [0.0, -0.5, 0.0, 0.0, 0.0, 0.0],
+                        "left_open": [0.0, -1.06, 0.0, 0.0, 0.0, 0.0],
+                        "right_closed": [0.0, 0.5, 0.0, 0.0, 0.0, 0.0],
+                        "right_open": [0.0, 1.06, 0.0, 0.0, 0.0, 0.0],
+                    },
+                },
+            ],
+            elevator_specs=[],
+        )
+        set_model_state = Mock()
+        set_link_state = Mock()
+
+        applied = _apply_initial_open_doors(runtime, set_model_state, set_link_state)
+
+        self.assertEqual(applied, ("main_entrance",))
+        poses = {call.args[0].link_name: call.args[0]
+                 for call in set_link_state.call_args_list}
+        self.assertEqual(
+            set(poses),
+            {
+                "dynamic_main_entrance::left_panel",
+                "dynamic_main_entrance::right_panel",
+            },
+        )
+        for link_name, state in poses.items():
+            # Applied relative to the model, so it cannot displace the parent.
+            self.assertEqual(state.reference_frame, "dynamic_main_entrance")
+        # The model-relative OPEN offsets, not a composed world position.
+        self.assertAlmostEqual(
+            poses["dynamic_main_entrance::left_panel"].pose.position.y, -1.06, places=6)
+        self.assertAlmostEqual(
+            poses["dynamic_main_entrance::right_panel"].pose.position.y, 1.06, places=6)
+        self.assertAlmostEqual(
+            poses["dynamic_main_entrance::left_panel"].pose.position.x, 0.0, places=6)
+        self.assertAlmostEqual(
+            poses["dynamic_main_entrance::right_panel"].pose.position.x, 0.0, places=6)
+        # The parent stays at its authored pose.
+        self.assertEqual(set_model_state.call_args.args[0].pose.position.x, 0.0)
+
     def test_compose_world_pose_rotates_local_offsets(self) -> None:
         pose = _compose_world_pose(
             [1.0, 2.0, 0.5, 0.0, 0.0, 3.141592653589793 / 2.0],

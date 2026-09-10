@@ -181,13 +181,27 @@ def _apply_panel_poses(
     model_pose: list[float],
     panel_poses: dict[str, list[float] | None],
 ) -> None:
+    """Place each panel at its pose RELATIVE TO THE MODEL.
+
+    ``panel_poses`` values are model-relative offsets (the same frame the SDF
+    authors the panel links in).  They must be applied in the model's reference
+    frame: requesting the composed WORLD pose instead makes Gazebo satisfy the
+    request by translating the parent model while leaving the panel's relative
+    offset untouched.  That moved ``dynamic_main_entrance`` from its authored
+    x=0.0 to x=0.56 (== the door slide offset) and left the panels at their
+    closed relative offsets, pinching the doorway in the occupancy grid.
+
+    ``model_pose`` is kept in the signature for callers that also reposition the
+    model, but panel placement no longer depends on it.
+    """
     for link_name, pose_values in panel_poses.items():
         if pose_values:
             _apply_link_pose(
                 set_link_state,
                 model_name,
                 link_name,
-                _compose_world_pose(model_pose, pose_values),
+                pose_values,
+                reference_frame=model_name,
             )
 
 
@@ -362,14 +376,27 @@ def _apply_existing_model_state(set_model_state, model_name: str, pose, twist, d
     set_model_state(model_state)
 
 
-def _apply_link_pose(set_link_state, model_name: str, link_name: str, pose_values: list[float]) -> None:
+def _apply_link_pose(
+    set_link_state,
+    model_name: str,
+    link_name: str,
+    pose_values: list[float],
+    reference_frame: str = "world",
+) -> None:
+    """Set one link pose, expressed in ``reference_frame``.
+
+    Panel placement passes ``reference_frame=model_name`` with the model-relative
+    panel offset, so Gazebo changes the link-relative transform.  Passing a
+    composed WORLD pose here instead makes Gazebo translate the parent model,
+    which is what displaced the main entrance (see _apply_panel_poses).
+    """
     from gazebo_msgs.msg import LinkState
     from geometry_msgs.msg import Pose
     from tf.transformations import quaternion_from_euler
 
     link_state = LinkState()
     link_state.link_name = f"{model_name}::{link_name}"
-    link_state.reference_frame = "world"
+    link_state.reference_frame = reference_frame
     link_state.pose = Pose()
     link_state.pose.position.x = float(pose_values[0])
     link_state.pose.position.y = float(pose_values[1])
