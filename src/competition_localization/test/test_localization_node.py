@@ -356,6 +356,7 @@ def _adapter_with_start(start: dict) -> object:
     adapter.correction_timeout = 0.5
     adapter.max_correction_skew = 0.20
     adapter._latest_raw_world_to_base = None
+    adapter._latest_raw_stamp = None
     adapter._T_world_to_correction = None
     adapter._latest_correction_world_to_base = None
     adapter._world_correction_yaw_offset = None
@@ -1065,6 +1066,228 @@ class TestLocalizationNode(unittest.TestCase):
                 self.assertFalse(adapter._start_pose_valid, f"case {i}")
                 self.assertEqual(adapter._state, _ModuleStatus.FAILED, f"case {i}")
                 self.assertFalse(adapter._valid, f"case {i}")
+
+
+class TestAlignmentTransformChain(unittest.TestCase):
+    """Deterministic transform / alignment tests.
+
+    Written BEFORE the localization repair so the first incorrect transform is
+    identified by a failing test rather than inferred from run data.
+
+    The raw FAST-LIO path is self-consistent by construction: at the latched t0
+    pose the composed world -> base pose equals the start pose exactly.  Any
+    constant yaw bias must therefore enter through the planar correction latch.
+    """
+
+    @staticmethod
+    def _adapter(start_yaw=0.0, extrinsic_yaw=0.0, mode="planar_relative"):
+        adapter = _adapter_with_start(
+            {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": start_yaw}
+        )
+        adapter.start_alignment_delay = 0.0
+        adapter.correction_enabled = True
+        adapter.correction_mode = mode
+        adapter._T_base_to_imu = mod._transform_from_translation_quat(
+            (0.0, 0.0, 0.0),
+            mod._quat_from_euler_rpy(0.0, 0.0, extrinsic_yaw),
+        )
+        adapter._odom_pub = _RecordingPublisher()
+        return adapter
+
+    @staticmethod
+    def _yaw(transform):
+        _, q = mod._transform_to_translation_quat(transform)
+        return mod._euler_rpy_from_quat(q)[2]
+
+    @staticmethod
+    def _pose(x, y, z, yaw):
+        return _make_odom(
+            x, y, z, 0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+        )
+
+    # --- quaternion / composition direction --------------------------------
+
+    def test_quaternion_composition_direction(self):
+        """_quat_mul(a, b) must apply b first, then a."""
+        a = mod._quat_from_euler_rpy(0.0, 0.0, 0.5)
+        b = mod._quat_from_euler_rpy(0.0, 0.0, 0.25)
+        composed = mod._quat_rotate(mod._quat_mul(a, b), (1.0, 0.0, 0.0))
+        expected = mod._quat_rotate(a, mod._quat_rotate(b, (1.0, 0.0, 0.0)))
+        for i in range(3):
+            self.assertAlmostEqual(composed[i], expected[i], places=9)
+        # Rotations about z commute, so check a non-commuting pair too.
+        rx = mod._quat_from_euler_rpy(0.4, 0.0, 0.0)
+        composed2 = mod._quat_rotate(mod._quat_mul(a, rx), (0.0, 1.0, 0.0))
+        expected2 = mod._quat_rotate(a, mod._quat_rotate(rx, (0.0, 1.0, 0.0)))
+        for i in range(3):
+            self.assertAlmostEqual(composed2[i], expected2[i], places=9)
+
+    def test_transform_multiply_applies_right_operand_first(self):
+        """_transform_multiply(A, B) * p == A * (B * p)."""
+        A = mod._transform_from_translation_quat(
+            (1.0, -2.0, 0.5), mod._quat_from_euler_rpy(0.0, 0.0, 0.6)
+        )
+        B = mod._transform_from_translation_quat(
+            (0.5, 3.0, -1.0), mod._quat_from_euler_rpy(0.0, 0.0, -0.9)
+        )
+        p = (0.3, 0.7, 0.2)
+        t_ab, q_ab = mod._transform_to_translation_quat(
+            mod._transform_multiply(A, B)
+        )
+        got = mod._quat_rotate(q_ab, p)
+        got = tuple(got[i] + t_ab[i] for i in range(3))
+        tb, qb = mod._transform_to_translation_quat(B)
+        inner = mod._quat_rotate(qb, p)
+        inner = tuple(inner[i] + tb[i] for i in range(3))
+        ta, qa = mod._transform_to_translation_quat(A)
+        want = mod._quat_rotate(qa, inner)
+        want = tuple(want[i] + ta[i] for i in range(3))
+        for i in range(3):
+            self.assertAlmostEqual(got[i], want[i], places=9)
+
+    # --- alignment: zero offset, known +/- yaw, initialization -------------
+
+    def test_alignment_is_exact_at_t0_for_known_yaws(self):
+        """World -> base at the latched t0 pose must equal the start pose.
+
+        Covers the zero-offset case and known positive/negative yaw, with a
+        non-identity base -> IMU extrinsic that must cancel exactly.
+        """
+        for start_yaw in (0.0, 0.7, -1.2, math.pi / 2.0):
+            for extrinsic_yaw in (0.0, 0.35, -2.1):
+                adapter = self._adapter(
+                    start_yaw=start_yaw, extrinsic_yaw=extrinsic_yaw
+                )
+                p0 = self._pose(1.0, 2.0, 0.4, 0.3)
+                adapter._fixed_stamp = None
+                mod.LocalizationAdapter._compute_alignment(
+                    adapter, mod.transform_from_odom(p0)
+                )
+                T_world_body = mod._transform_multiply(
+                    adapter._T_world_to_camera_init, mod.transform_from_odom(p0)
+                )
+                T_world_base = mod.compose_world_to_base(
+                    T_world_body, adapter._T_base_to_imu
+                )
+                t, _ = mod._transform_to_translation_quat(T_world_base)
+                for i, want in enumerate((0.0, 0.0, 0.0)):
+                    self.assertAlmostEqual(
+                        t[i], want, places=6,
+                        msg=f"start_yaw={start_yaw} ext={extrinsic_yaw}",
+                    )
+                self.assertAlmostEqual(
+                    mod._wrap_angle(self._yaw(T_world_base) - start_yaw),
+                    0.0,
+                    places=6,
+                    msg=f"start_yaw={start_yaw} ext={extrinsic_yaw}",
+                )
+
+    def test_base_to_imu_extrinsic_cancels_in_composition(self):
+        """The fixed base -> IMU extrinsic must not leak into the base pose."""
+        base = mod._transform_from_translation_quat(
+            (0.2, -0.1, 0.15), mod._quat_from_euler_rpy(0.1, -0.05, 1.1)
+        )
+        results = []
+        for extrinsic_yaw in (0.0, 0.8, -1.7):
+            adapter = self._adapter(
+                start_yaw=0.4, extrinsic_yaw=extrinsic_yaw
+            )
+            mod.LocalizationAdapter._compute_alignment(adapter, base)
+            T_world_body = mod._transform_multiply(
+                adapter._T_world_to_camera_init, base
+            )
+            T_world_base = mod.compose_world_to_base(
+                T_world_body, adapter._T_base_to_imu
+            )
+            results.append(mod._transform_to_translation_quat(T_world_base))
+        for t, q in results[1:]:
+            for i in range(3):
+                self.assertAlmostEqual(t[i], results[0][0][i], places=9)
+                self.assertAlmostEqual(q[i], results[0][1][i], places=9)
+
+    # --- planar correction latch: time alignment ---------------------------
+
+    def test_matched_correction_latch_yields_zero_offset(self):
+        """When the raw and correction frames agree, the offset must be zero."""
+        adapter = self._adapter(start_yaw=0.0)
+        adapter._aligned = True
+        adapter._latest_raw_world_to_base = self._pose_as_transform(0.15)
+        adapter._latest_raw_stamp = _MockTimeInstance(10.0)
+        _MockTime._now = 10.0
+        mod.LocalizationAdapter._correction_callback(
+            adapter, _make_correction(0.0, 0.0, yaw=0.15,
+                                      stamp=_MockTimeInstance(10.0))
+        )
+        self.assertAlmostEqual(adapter._world_correction_yaw_offset, 0.0, places=9)
+        self.assertAlmostEqual(adapter._latest_correction_world_yaw, 0.15, places=9)
+
+    def test_stale_raw_pose_must_not_bias_the_correction_latch(self):
+        """A rotating robot must not latch a permanent yaw bias.
+
+        The planar offsets are latched ONCE from two poses sampled at different
+        instants: the raw pose is the most recent FAST-LIO frame (10 Hz, up to
+        ~100 ms stale) while the correction pose is fresh (500 Hz leg odometry).
+        If the robot rotates in that gap the latched offset absorbs the rotation
+        and the error is permanent -- a constant heading bias, which is exactly
+        the observed signature (eyaw constant within a run at -8.59 deg in
+        run-a3 and -4.15 deg in run-a5, stdev < 0.6 deg over hundreds of
+        seconds, but differing between runs).
+
+        Required behaviour: the latch must not combine attitudes whose source
+        timestamps violate ``max_correction_skew``.  It defers until a
+        time-aligned pair arrives, rather than baking the gap rotation in.
+        """
+        adapter = self._adapter(start_yaw=0.0)
+        adapter._aligned = True
+        # Newest raw FAST-LIO sample predates the correction by 0.3 s, which is
+        # beyond max_correction_skew (0.20 s), and the robot rotated 0.15 rad in
+        # that gap.
+        adapter._latest_raw_world_to_base = self._pose_as_transform(0.0)
+        adapter._latest_raw_stamp = _MockTimeInstance(9.7)
+        _MockTime._now = 10.0
+        mod.LocalizationAdapter._correction_callback(
+            adapter, _make_correction(0.0, 0.0, yaw=0.15,
+                                      stamp=_MockTimeInstance(10.0))
+        )
+        # Nothing is latched and nothing is published from the skewed pair.
+        self.assertIsNone(adapter._world_correction_yaw_offset)
+        self.assertIsNone(adapter._world_correction_xy_offset)
+        self.assertIsNone(adapter._latest_correction_world_yaw)
+        self.assertIsNone(adapter._latest_correction_world_xy)
+        self.assertFalse(adapter._valid)
+
+        # A time-aligned pair then latches normally, with no residual bias.
+        adapter._latest_raw_world_to_base = self._pose_as_transform(0.15)
+        adapter._latest_raw_stamp = _MockTimeInstance(10.0)
+        _MockTime._now = 10.0
+        mod.LocalizationAdapter._correction_callback(
+            adapter, _make_correction(0.0, 0.0, yaw=0.15,
+                                      stamp=_MockTimeInstance(10.0))
+        )
+        self.assertAlmostEqual(adapter._world_correction_yaw_offset, 0.0, places=9)
+        self.assertAlmostEqual(adapter._latest_correction_world_yaw, 0.15, places=9)
+
+    def test_skew_gate_admits_pairs_within_the_bound(self):
+        """The bound must be usable in practice, not an unreachable gate."""
+        adapter = self._adapter(start_yaw=0.0)
+        adapter._aligned = True
+        adapter._latest_raw_stamp = _MockTimeInstance(10.0)
+        adapter._latest_raw_world_to_base = self._pose_as_transform(0.05)
+        _MockTime._now = 10.0
+        # Exactly at the bound.
+        mod.LocalizationAdapter._correction_callback(
+            adapter, _make_correction(0.0, 0.0, yaw=0.05,
+                                      stamp=_MockTimeInstance(10.0 + 0.20))
+        )
+        self.assertIsNotNone(adapter._world_correction_yaw_offset)
+        self.assertAlmostEqual(adapter._latest_correction_world_yaw, 0.05, places=9)
+
+    @staticmethod
+    def _pose_as_transform(yaw):
+        return mod.transform_from_odom(
+            _make_odom(0.0, 0.0, 0.0, 0.0, 0.0,
+                       math.sin(yaw / 2.0), math.cos(yaw / 2.0))
+        )
 
 
 if __name__ == "__main__":

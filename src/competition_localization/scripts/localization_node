@@ -385,6 +385,10 @@ class LocalizationAdapter:
         self._T_world_to_camera_init: Optional[Transform] = None
         self._T_base_to_imu: Optional[Transform] = None
         self._latest_raw_world_to_base: Optional[Transform] = None
+        # Source stamp of the raw (FAST-LIO) pose above.  The planar offsets are
+        # latched once and then held for the whole run, so the pair they combine
+        # must be shown to come from (nearly) the same instant.
+        self._latest_raw_stamp: Optional[rospy.Time] = None
         self._T_world_to_correction: Optional[Transform] = None
         self._latest_correction_world_to_base: Optional[Transform] = None
         self._world_correction_yaw_offset: Optional[float] = None
@@ -674,6 +678,7 @@ class LocalizationAdapter:
             self._last_input_stamp = None
             self._last_odom_time = None
             self._latest_raw_world_to_base = None
+            self._latest_raw_stamp = None
             self._reset_correction_state(reset_alignment=True)
             self._state = ModuleStatus.STARTING
             self._valid = False
@@ -695,6 +700,22 @@ class LocalizationAdapter:
             self._latest_correction_world_yaw is not None
             and self._latest_correction_world_xy is not None
         )
+
+    def _correction_latch_pair_is_time_aligned(self, correction_stamp) -> bool:
+        """True when the pair about to be latched is within the allowed skew.
+
+        The planar offsets are latched once and held for the whole alignment
+        generation, so the raw FAST-LIO pose and the correction pose they
+        combine must come from (nearly) the same instant.  This is the same
+        ``max_correction_skew`` bound the publish path already enforces; the
+        latch must not be the one place that accepts skewed evidence.
+        """
+        if self._latest_raw_stamp is None:
+            return False
+        if correction_stamp is None:
+            return False
+        skew = abs((correction_stamp - self._latest_raw_stamp).to_sec())
+        return math.isfinite(skew) and skew <= self.max_correction_skew
 
     def _require_fresh_correction(self, fastlio_stamp, now) -> bool:
         """Fail closed unless the required correction is fresh and aligned."""
@@ -894,6 +915,7 @@ class LocalizationAdapter:
                 )
                 T_world_to_base = compose_world_to_base(T_world_to_body, T_base_to_imu)
                 self._latest_raw_world_to_base = T_world_to_base
+                self._latest_raw_stamp = stamp
                 if not self._require_fresh_correction(stamp, now):
                     return
                 if self.correction_enabled:
@@ -1026,6 +1048,37 @@ class LocalizationAdapter:
 
             T_correction_to_base = transform_from_odom(msg)
             if self.correction_mode in ("yaw_only", "planar_relative"):
+                # The relative offsets below are latched ONCE and then held for
+                # the remainder of the alignment generation, so the two poses
+                # they combine must be shown to come from the same instant.
+                # `raw_*` is the newest FAST-LIO frame (10 Hz) while the
+                # correction is fresh (500 Hz); if the robot rotates in that
+                # gap the difference is baked in permanently as a constant
+                # heading/position bias.  `_require_fresh_correction` already
+                # enforces this bound for every published frame -- the latch
+                # must honour the same bound instead of being the one place
+                # that accepts skewed evidence.
+                needs_latch = self._world_correction_yaw_offset is None or (
+                    self.correction_mode == "planar_relative"
+                    and self._world_correction_xy_offset is None
+                )
+                if needs_latch and not self._correction_latch_pair_is_time_aligned(
+                    stamp
+                ):
+                    self._invalidate_correction_measurement()
+                    self._state = ModuleStatus.STARTING
+                    self._valid = False
+                    self._detail = (
+                        "waiting for a time-aligned FAST-LIO/correction pair "
+                        "before latching planar alignment"
+                    )
+                    rospy.logwarn_throttle(
+                        1.0,
+                        "localization_node: planar alignment latch deferred; "
+                        "FAST-LIO/correction source skew exceeds %.2f s",
+                        self.max_correction_skew,
+                    )
+                    return
                 raw_translation, raw_quaternion = _transform_to_translation_quat(
                     self._latest_raw_world_to_base
                 )
