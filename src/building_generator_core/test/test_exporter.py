@@ -158,6 +158,53 @@ class ExporterTest(unittest.TestCase):
             self.assertGreater(abs(right_open[1]), required_offset)
             self.assertEqual(elevator_door["motion_duration"], 25.0)
 
+    def test_initial_open_door_is_spawned_with_panels_already_open(self) -> None:
+        """The spawned SDF must carry the authored OPEN panel poses.
+
+        Regression for the entrance seal: _build_door_model always emitted the
+        panels at their CLOSED offsets and relied on a runtime SetLinkState call
+        to open them.  That runtime call moved the parent model instead of the
+        panels (or silently did nothing), so the LiDAR kept seeing a solid
+        door-plane surface across the opening and the planner read the entrance
+        as impassable.  The door must instead be SPAWNED in its intended state.
+        """
+        import xml.etree.ElementTree as ET
+
+        from building_generator_core.exporter import door_panel_poses
+
+        constraints = BuildingConstraints.from_dict(
+            {
+                "seed": 77,
+                "floor_count": 1,
+                "rooms_per_floor": 4,
+                "building_footprint_limit": {"width": 30.0, "length": 60.0},
+            }
+        )
+        layout = generate_layout(constraints)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_paths = export_sdf(layout, target="gazebo_classic", output_dir=tmpdir)
+            root = ET.parse(artifact_paths.world_sdf).getroot()
+
+            door = next(d for d in layout.door_specs if d.kind == "main_entrance")
+            closed, opened = door_panel_poses(door)
+            model = next(m for m in root.iter("model")
+                         if m.get("name") == f"dynamic_{door.id}")
+
+            # Parent stays at the authored pose.
+            parent_pose = [float(v) for v in model.find("pose").text.split()]
+            for i, want in enumerate(door.pose):
+                # The world file writes poses with 4 decimals.
+                self.assertAlmostEqual(parent_pose[i], float(want), places=3)
+
+            panels = {link.get("name"): [float(v) for v in link.find("pose").text.split()]
+                      for link in model.findall("link")}
+            self.assertAlmostEqual(panels["left_panel"][1], opened[0][1], places=3)
+            self.assertAlmostEqual(panels["right_panel"][1], opened[1][1], places=3)
+            # And specifically NOT the closed offsets.
+            self.assertNotAlmostEqual(panels["left_panel"][1], closed[0][1], places=3)
+            self.assertNotAlmostEqual(panels["right_panel"][1], closed[1][1], places=3)
+
     def test_elevator_car_opening_faces_the_lobby_door_side(self) -> None:
         constraints = BuildingConstraints.from_dict(
             {

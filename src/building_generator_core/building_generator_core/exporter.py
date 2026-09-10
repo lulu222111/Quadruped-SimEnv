@@ -673,15 +673,41 @@ def _append_elevator_shaft_details(model: ET.Element, *, floor: FloorLayout) -> 
     )
 
 
+def door_panel_poses(door: DoorSpec) -> tuple[list[list[float]], list[list[float]]]:
+    """Authored (closed, open) local panel poses -- single source of truth.
+
+    Both the door config and the spawned SDF must use these exact values, so the
+    world model is emitted in its intended state and the two can never drift.
+    """
+    panel_offset = door.width / 4.0
+    slide_offset = door.width / 4.0 + 0.06
+    recess_offset = 0.0
+    if door.kind == "elevator":
+        slide_offset = door.width / 2.0 + WALL_THICKNESS / 2.0 + DOOR_PANEL_THICKNESS
+        recess_offset = -(WALL_THICKNESS / 2.0 + DOOR_PANEL_THICKNESS / 2.0)
+    closed = [
+        [0.0, -panel_offset, 0.0, 0.0, 0.0, 0.0],
+        [0.0, panel_offset, 0.0, 0.0, 0.0, 0.0],
+    ]
+    opened = [
+        [recess_offset, -panel_offset - slide_offset, 0.0, 0.0, 0.0, 0.0],
+        [recess_offset, panel_offset + slide_offset, 0.0, 0.0, 0.0, 0.0],
+    ]
+    return closed, opened
+
+
 def _build_door_model(door: DoorSpec) -> ET.Element:
     model = ET.Element("model", {"name": f"dynamic_{door.id}"})
     ET.SubElement(model, "static").text = "false"
+    # Parent stays at the authored pose; only the panels carry the open/closed
+    # state, so an initially-open door is SPAWNED open rather than spawned closed
+    # and repaired by a runtime SetLinkState call.
     ET.SubElement(model, "pose").text = _format_pose(door.pose)
     panel_width = door.width / 2.0
-    left_offset = -panel_width / 2.0
-    right_offset = panel_width / 2.0
-    _append_kinematic_panel(model, "left_panel", (0.0, left_offset, 0.0, 0.0, 0.0, 0.0), (DOOR_PANEL_THICKNESS, panel_width, door.height))
-    _append_kinematic_panel(model, "right_panel", (0.0, right_offset, 0.0, 0.0, 0.0, 0.0), (DOOR_PANEL_THICKNESS, panel_width, door.height))
+    closed, opened = door_panel_poses(door)
+    panels = opened if door.initial_open else closed
+    _append_kinematic_panel(model, "left_panel", tuple(panels[0]), (DOOR_PANEL_THICKNESS, panel_width, door.height))
+    _append_kinematic_panel(model, "right_panel", tuple(panels[1]), (DOOR_PANEL_THICKNESS, panel_width, door.height))
     return model
 
 
@@ -733,18 +759,14 @@ def _build_elevator_model(layout: BuildingLayout, elevator_id: str) -> ET.Elemen
 def _door_config_entry(door: DoorSpec) -> dict[str, object]:
     payload = door.as_dict()
     payload["model_name"] = f"dynamic_{door.id}"
-    panel_offset = door.width / 4.0
-    slide_offset = door.width / 4.0 + 0.06
-    recess_offset = 0.0
     if door.kind == "elevator":
-        slide_offset = door.width / 2.0 + WALL_THICKNESS / 2.0 + DOOR_PANEL_THICKNESS
-        recess_offset = -(WALL_THICKNESS / 2.0 + DOOR_PANEL_THICKNESS / 2.0)
         payload["motion_duration"] = ELEVATOR_DOOR_MOTION_DURATION
+    closed, opened = door_panel_poses(door)
     payload["panel_poses"] = {
-        "left_closed": [0.0, -panel_offset, 0.0, 0.0, 0.0, 0.0],
-        "right_closed": [0.0, panel_offset, 0.0, 0.0, 0.0, 0.0],
-        "left_open": [recess_offset, -panel_offset - slide_offset, 0.0, 0.0, 0.0, 0.0],
-        "right_open": [recess_offset, panel_offset + slide_offset, 0.0, 0.0, 0.0, 0.0],
+        "left_closed": closed[0],
+        "right_closed": closed[1],
+        "left_open": opened[0],
+        "right_open": opened[1],
     }
     payload["closed_pose"] = list(door.pose)
     return payload
