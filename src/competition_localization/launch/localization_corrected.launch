@@ -50,8 +50,17 @@
     <param name="max_imu_joint_skew" value="$(arg max_imu_joint_skew)" />
     <param name="frame_id" value="c2r28_fastlio_local" />
     <param name="child_frame_id" value="c2r28_base" />
-    <!-- Preserve PR #16 candidate values; this pass does not retune them. -->
-    <param name="vel_scale" type="double" value="1.2" />
+    <!-- PR #16 candidate values, except vel_scale: the PR #16 value 1.2 was
+         measured to over-scale planar distance by +2.21 % / +2.62 % on two
+         independent Floor-0 runs, which is what drives the robot's believed
+         pose ~0.45 m past its true pose at the 1.20 m room_1 doorway.
+         Re-derived OFFLINE from those runs as 1.2 / mean(scale) = 1.17172
+         -> 1.172; see reports/floor0_closure/calibrate_vel_scale.py and
+         reports/floor0_closure/vel_scale_calibration.txt.
+         Ground truth is used for offline calibration only; the runtime chain
+         never reads a truth channel (RUNTIME_GT_FEEDBACK_USED = false,
+         GROUND_TRUTH_FEEDBACK_COUNT = 0). -->
+    <param name="vel_scale" type="double" value="1.172" />
     <param name="lp_alpha" type="double" value="0.8" />
     <param name="contact_vz_thresh" type="double" value="0.15" />
   </node>
