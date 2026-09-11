@@ -1251,6 +1251,108 @@ class PlanningNode:
             pose.header.stamp = stamp
         return path, goal
 
+    def _release_stale_visual_checkpoint(
+        self,
+        map_msg,
+        inflation_radius_cells,
+    ):
+        """Drop a held visual checkpoint whose route the live map now blocks.
+
+        A held route is a planner output from an earlier map, so incremental
+        occupancy changes can since have marked one of its cells blocked in the
+        very grid the planner plans on.  Republishing it verbatim then commands
+        the follower down a route the planner itself would refuse to produce --
+        measured on run p0c, 6 of the 41 republished poses sat inside inflated-
+        blocked cells at the room_1 doorway and the robot wedged on the jamb for
+        ~50 s while a legal freshly-planned route existed.
+
+        Returns True when a checkpoint was released.  Caller owns the lock.
+        """
+        if (
+            self.active_exploration_target is None
+            or self.visual_scan_checkpoint_path is None
+        ):
+            return False
+        if self._path_is_clear_of_inflated_obstacles(
+            self.visual_scan_checkpoint_path,
+            map_msg,
+            inflation_radius_cells,
+        ):
+            return False
+
+        rospy.logwarn_throttle(
+            5.0,
+            "planning_node: dropping stale visual scan checkpoint "
+            "(%.2f, %.2f); its held route is blocked in the current map",
+            self.active_exploration_target[0],
+            self.active_exploration_target[1],
+        )
+        self.active_exploration_target = None
+        self.visual_scan_checkpoint_path = None
+        self.visual_scan_checkpoint_goal = None
+        self.visual_scan_checkpoint_origin = None
+        return True
+
+    def _path_is_clear_of_inflated_obstacles(
+        self,
+        path_msg,
+        map_msg,
+        inflation_radius_cells,
+    ):
+        """Whether every pose of a route clears the inflated obstacle grid.
+
+        A held route is a planner output from an *earlier* map, so incremental
+        occupancy changes can since have marked one of its cells blocked in the
+        very grid the planner plans on.  Republishing it verbatim then commands
+        the follower down a route the planner itself would refuse to produce.
+
+        The predicate deliberately mirrors ``path_planner.inflate_obstacles``
+        (same circular footprint, same ``obstacle_threshold``) so the verdict
+        matches the grid the planner plans on, but evaluates only the route's
+        own cells instead of inflating the whole grid.
+        """
+        info = map_msg.info
+        resolution = info.resolution
+        if info.width <= 0 or info.height <= 0 or resolution <= 0.0:
+            return False
+        if len(map_msg.data) != info.width * info.height:
+            return False
+
+        radius = int(inflation_radius_cells)
+        if radius < 0:
+            return False
+        offsets = [
+            (offset_x, offset_y)
+            for offset_y in range(-radius, radius + 1)
+            for offset_x in range(-radius, radius + 1)
+            if offset_x * offset_x + offset_y * offset_y <= radius * radius
+        ]
+
+        origin = info.origin
+        origin_yaw = quaternion_to_yaw(origin.orientation)
+        data = map_msg.data
+        threshold = self.obstacle_threshold
+
+        for pose_stamped in path_msg.poses:
+            position = pose_stamped.pose.position
+            if not (isfinite(position.x) and isfinite(position.y)):
+                return False
+            cell_x, cell_y = world_to_grid_cell(
+                (position.x, position.y),
+                resolution=resolution,
+                origin_x=origin.position.x,
+                origin_y=origin.position.y,
+                origin_yaw=origin_yaw,
+            )
+            for offset_x, offset_y in offsets:
+                x = cell_x + offset_x
+                y = cell_y + offset_y
+                if not (0 <= x < info.width and 0 <= y < info.height):
+                    continue
+                if data[y * info.width + x] >= threshold:
+                    return False
+        return True
+
     def _exploration_target_reached_locked(self, robot_position):
         """Return whether the current planner target is within scan range."""
         if self.active_exploration_target is None:
@@ -3032,6 +3134,16 @@ class PlanningNode:
                     # bounded by the checkpoint, so the robot cannot pass a
                     # station before the next planner tick can start its
                     # scan.
+                    # A held route is a planner output from an earlier map; the
+                    # map watchdogs below only gate its freshness, not its
+                    # geometry.  Revalidate before holding, so a stale route is
+                    # dropped and the ``else`` arm selects a station from the
+                    # path that was just planned against the current map.
+                    self._release_stale_visual_checkpoint(
+                        map_msg,
+                        inflation_radius_cells,
+                    )
+
                     if (
                         self.active_exploration_target is not None
                         and self.visual_scan_checkpoint_path is not None

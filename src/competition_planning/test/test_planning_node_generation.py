@@ -11,6 +11,7 @@ directory next to this file.
 
 import importlib.machinery
 import importlib.util
+import copy
 import json
 import math
 import sys
@@ -760,6 +761,101 @@ class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
         self.assertIn(
             "visual_scan_checkpoint_path_held",
             self._last_status_msg().detail,
+        )
+
+    def test_stale_checkpoint_route_is_released_not_republished(self):
+        """A held route the live map blocks is released, not republished.
+
+        The held route is a planner output from an earlier map; the map
+        watchdogs gate its freshness, not its geometry.  Without the
+        revalidation the node republishes the same blocked geometry for ever
+        and the follower is commanded into the obstacle -- measured on run
+        p0c, 6 of 41 held poses sat inside inflated-blocked cells at the
+        room_1 doorway and the robot wedged on the jamb for ~50 s.
+        """
+        node = self.node
+        mapping = self._make_map(100.1)
+        resolution = mapping.info.resolution
+        origin_x = mapping.info.origin.position.x
+        origin_y = mapping.info.origin.position.y
+
+        def held_route(cell_x, cell_y):
+            msg = FakePath()
+            msg.header.stamp = FakeTime(100.1)
+            msg.header.frame_id = "world"
+            pose = FakePoseStamped()
+            pose.header.stamp = FakeTime(100.1)
+            pose.header.frame_id = "world"
+            pose.pose.position.x = origin_x + (cell_x + 0.5) * resolution
+            pose.pose.position.y = origin_y + (cell_y + 0.5) * resolution
+            msg.poses = [pose]
+            return msg
+
+        def arm(route):
+            node.active_exploration_target = (1.5, 1.5)
+            node.visual_scan_checkpoint_path = route
+            node.visual_scan_checkpoint_goal = copy.deepcopy(route.poses[-1])
+            node.visual_scan_checkpoint_origin = (0.5, 0.5)
+
+        # A route the current map leaves clear stays held.
+        arm(held_route(2, 2))
+        self.assertFalse(node._release_stale_visual_checkpoint(mapping, 2))
+        self.assertEqual(node.active_exploration_target, (1.5, 1.5))
+        self.assertIsNotNone(node.visual_scan_checkpoint_path)
+
+        # The same route, now inside the inflated footprint of an obstacle the
+        # live map has since recorded, is released so the freshly planned path
+        # is published instead.
+        mapping.data[2 * mapping.info.width + 1] = 100
+        self.assertTrue(node._release_stale_visual_checkpoint(mapping, 2))
+        self.assertIsNone(node.active_exploration_target)
+        self.assertIsNone(node.visual_scan_checkpoint_path)
+        self.assertIsNone(node.visual_scan_checkpoint_goal)
+        self.assertIsNone(node.visual_scan_checkpoint_origin)
+
+        # Nothing armed: the release is a no-op rather than an error.
+        self.assertFalse(node._release_stale_visual_checkpoint(mapping, 2))
+
+    def test_held_route_predicate_matches_the_planning_inflation(self):
+        """The revalidation predicate mirrors path_planner.inflate_obstacles."""
+        node = self.node
+        mapping = self._make_map(100.1)
+        resolution = mapping.info.resolution
+        origin_x = mapping.info.origin.position.x
+        origin_y = mapping.info.origin.position.y
+
+        def path_through(cell_x, cell_y):
+            msg = FakePath()
+            msg.header.stamp = FakeTime(100.1)
+            msg.header.frame_id = "world"
+            pose = FakePoseStamped()
+            pose.header.stamp = FakeTime(100.1)
+            pose.header.frame_id = "world"
+            pose.pose.position.x = origin_x + (cell_x + 0.5) * resolution
+            pose.pose.position.y = origin_y + (cell_y + 0.5) * resolution
+            msg.poses = [pose]
+            return msg
+
+        # Cell (2, 2) is free; the ring around it is unknown (-1), which is
+        # not an obstacle, so a radius-2 footprint stays clear.
+        self.assertTrue(
+            node._path_is_clear_of_inflated_obstacles(
+                path_through(2, 2), mapping, 2
+            )
+        )
+        # Occupying (1, 2) puts (2, 2) inside the radius-2 footprint of an
+        # obstacle -- exactly what inflate_obstacles would mark blocked.
+        mapping.data[2 * mapping.info.width + 1] = 100
+        self.assertFalse(
+            node._path_is_clear_of_inflated_obstacles(
+                path_through(2, 2), mapping, 2
+            )
+        )
+        # A radius that does not reach the obstacle still accepts the route.
+        self.assertTrue(
+            node._path_is_clear_of_inflated_obstacles(
+                path_through(2, 2), mapping, 0
+            )
         )
 
     def test_frontier_continuation_replans_same_goal_on_current_map(self):
