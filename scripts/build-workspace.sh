@@ -144,6 +144,61 @@ else
     exit 1
 fi
 
+# --- SimEnv: FAST-LIO SimEnv/MARSIM localization repairs -------------------
+# Three independent repairs, applied in order.  Each is idempotent
+# (reverse-check first) and fail-closed (FATAL if neither direction applies),
+# so a submodule that does not match the patch baseline stops the build instead
+# of silently producing an unpatched binary.
+#
+#   1. fast_lio_marsim_det_range.patch
+#        Enforce the configured `mapping/det_range` in the MARSIM PointCloud2
+#        handler.  The simulator emits stray returns out to |coord| ~ 1000 m;
+#        with `blind` tested but `det_range` ignored, those points reached
+#        pcl::VoxelGrid, whose integer-index guard trips and silently bypasses
+#        downsampling (observed: 676 overflow warnings per rotation run).
+#   2. fast_lio_marsim_imu_interval.patch
+#        Anchor the IMU integration interval in UndistortPcl on
+#        `last_lidar_end_time_` for MARSIM too.  The MARSIM branch compared
+#        against `pcl_beg_time` (the *current* scan's begin), which is >= every
+#        IMU sample in the group, so the loop skipped them all
+#        (observed: count=40 steps=1 dt=0.000000) and no IMU was integrated.
+#   3. fast_lio_initial_gravity_alignment.patch
+#        Initialize camera_init in the horizontal plane from the measured
+#        gravity (Elevator-LIO convention).  Without it `rot` stays identity and
+#        camera_init inherits the IMU's own orientation; this platform's IMU
+#        carries the fixed 45 deg pitch of `laser_livox_joint`
+#        (rpy="0 0.785 0"), so level-ground motion appeared as an x/z diagonal
+#        and world z grew on flat ground.
+# `git apply` needs the submodule's .git linkage to resolve.  When this repo is
+# checked out as a *linked worktree*, src/fast_lio/.git points at
+# <main>/.git/worktrees/<name>/modules/src/fast_lio, which is outside the
+# container bind mount, so git fails there with "not a git repository".  Fall
+# back to patch(1), which only needs the working tree.
+apply_fastlio_patch() {
+    local name="$1"
+    local patch="/workspace/SimEnv/scripts/patches/$name"
+    local sub=/workspace/SimEnv/src/fast_lio
+    if [ ! -f "$patch" ]; then
+        echo "FATAL: fast_lio patch file missing inside container: $patch" >&2
+        exit 1
+    fi
+    if git -C "$sub" apply --reverse --check "$patch" >/dev/null 2>&1 \
+       || patch -p1 -R --dry-run -d "$sub" -i "$patch" >/dev/null 2>&1; then
+        echo "fast_lio: $name already applied (idempotent skip)"
+    elif git -C "$sub" apply "$patch" 2>/dev/null \
+         || patch -p1 -d "$sub" -i "$patch"; then
+        echo "fast_lio: $name applied"
+    else
+        echo "FATAL: failed to apply $name." >&2
+        echo "Check that the src/fast_lio submodule commit matches the patch baseline." >&2
+        exit 1
+    fi
+}
+
+apply_fastlio_patch fast_lio_marsim_det_range.patch
+apply_fastlio_patch fast_lio_marsim_imu_interval.patch
+apply_fastlio_patch fast_lio_initial_gravity_alignment.patch
+
 catkin_make \
     -j"$CATKIN_JOBS" \
     -l"$CATKIN_JOBS" \
