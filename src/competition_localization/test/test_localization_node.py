@@ -14,6 +14,7 @@ import math
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -345,6 +346,29 @@ def _adapter_with_start(start: dict) -> object:
     adapter._last_input_stamp = None
     adapter._last_ros_time = None
     adapter.start_alignment_delay = 2.0
+    # Startup vertical references.  A level reported attitude plus a floor
+    # datum equal to the scene start z reproduces the pre-existing alignment
+    # exactly, so the transform-chain tests below keep pinning the same
+    # contract; the estimator tests set these explicitly.
+    adapter._initial_roll = 0.0
+    adapter._initial_pitch = 0.0
+    adapter._initial_floor_height = adapter._start_z
+    adapter._initial_cloud = None
+    adapter._initial_imu_accel = []
+    adapter._initial_lock = threading.Lock()
+    adapter._initial_attitude_sub = None
+    adapter._initial_floor_sub = None
+    adapter.initial_attitude_topic = "/trunk_imu"
+    adapter.initial_floor_cloud_topic = "/livox/Pointcloud2"
+    adapter.initial_attitude_samples = 40
+    adapter.initial_attitude_gravity_tolerance = 0.6
+    adapter.initial_attitude_stillness = 0.15
+    adapter.initial_attitude_timeout = 20.0
+    adapter.initial_floor_min_range = 1.2
+    adapter.initial_floor_max_range = 4.0
+    adapter.initial_floor_percentile = 5.0
+    adapter.initial_floor_min_points = 200
+    adapter.initial_floor_timeout = 20.0
     adapter.input_frame_id = "camera_init"
     adapter.input_child_frame_id = "body"
     adapter.input_timeout = 0.5
@@ -379,6 +403,154 @@ def _adapter_with_start(start: dict) -> object:
     adapter.publish_tf_enabled = False
     adapter._lock = type("L", (), {"acquire": lambda self: None, "release": lambda self: None, "__enter__": lambda self: self, "__exit__": lambda *args: None})()
     return adapter
+
+
+STANDARD_G = mod.STANDARD_GRAVITY
+
+
+
+class _FakePc2Reader:
+    """Stands in for sensor_msgs.point_cloud2 in the mocked-ROS harness."""
+
+    def __init__(self, points):
+        self._points = points
+
+    def read_points(self, cloud, field_names=None, skip_nans=True):
+        return iter(self._points)
+
+
+class TestInitialVerticalAlignment(unittest.TestCase):
+    """The initial gravity level and floor datum must come from the robot's own
+    sensors, and alignment must fail closed when they are unavailable.
+
+    Rationale (measured on run p0e): assuming a level start leaks horizontal
+    motion into world z, and taking z from the scene file's *spawn* height
+    biases it by ~0.29 m.  Together they walked the mapper's base-relative
+    height window up until 0.30 m obstacles fell out of it entirely, so the
+    robot drove into obstacles it could not see.
+    """
+
+    def _adapter(self, **overrides):
+        adapter = _adapter_with_start(
+            {"x": 0.0, "y": -3.2, "z": 0.6, "yaw": 0.0}
+        )
+        adapter._T_base_to_imu = mod._identity_transform()
+        adapter._initial_roll = None
+        adapter._initial_pitch = None
+        adapter._initial_floor_height = None
+        for key, value in overrides.items():
+            setattr(adapter, key, value)
+        return adapter
+
+    # --- attitude ------------------------------------------------------
+
+    def test_attitude_rejects_a_non_gravity_window(self):
+        adapter = self._adapter()
+        freefall = [(0.0, 0.0, 0.0)] * adapter.initial_attitude_samples
+        self.assertIsNone(adapter._attitude_from_accel_window(freefall))
+
+    def test_attitude_rejects_a_moving_window(self):
+        """Specific force during motion is not gravity, so tilt would be wrong."""
+        adapter = self._adapter()
+        n = adapter.initial_attitude_samples
+        moving = [(0.0, 0.0, STANDARD_G) for _ in range(n - 1)]
+        moving.append((0.0, 0.0, STANDARD_G + 3.0))
+        self.assertIsNone(adapter._attitude_from_accel_window(moving))
+
+    def test_attitude_requires_a_full_window(self):
+        adapter = self._adapter()
+        self.assertIsNone(
+            adapter._attitude_from_accel_window([(0.0, 0.0, STANDARD_G)])
+        )
+
+    def test_attitude_recovers_a_known_tilt(self):
+        adapter = self._adapter()
+        roll_deg, pitch_deg = 0.394, 0.947
+        r, p = math.radians(roll_deg), math.radians(pitch_deg)
+        accel = (
+            -STANDARD_G * math.sin(p),
+            STANDARD_G * math.sin(r) * math.cos(p),
+            STANDARD_G * math.cos(r) * math.cos(p),
+        )
+        window = [accel] * adapter.initial_attitude_samples
+        estimate = adapter._attitude_from_accel_window(window)
+        self.assertIsNotNone(estimate)
+        self.assertAlmostEqual(math.degrees(estimate[0]), roll_deg, places=3)
+        self.assertAlmostEqual(math.degrees(estimate[1]), pitch_deg, places=3)
+
+    # --- floor datum ---------------------------------------------------
+
+    def test_floor_datum_is_the_low_percentile_of_base_z(self):
+        adapter = self._adapter()
+        adapter._initial_floor_min_points = 100
+        points = [(1.5 + (i % 20) * 0.1, 0.0, -0.31) for i in range(400)]
+        points += [(2.0, 0.0, 0.8) for _ in range(60)]  # furniture
+        original = mod._pc2
+        mod._pc2 = _FakePc2Reader(points)
+        try:
+            height = adapter._estimate_initial_floor_height(object())
+        finally:
+            mod._pc2 = original
+        self.assertIsNotNone(height)
+        self.assertAlmostEqual(height, 0.31, places=2)
+
+    def test_floor_datum_fails_closed_on_a_thin_cloud(self):
+        adapter = self._adapter()
+        adapter._initial_floor_min_points = 100
+        original = mod._pc2
+        mod._pc2 = _FakePc2Reader([(2.0, 0.0, -0.31)] * 5)
+        try:
+            self.assertIsNone(adapter._estimate_initial_floor_height(object()))
+        finally:
+            mod._pc2 = original
+
+    def test_floor_datum_rejects_a_plane_above_the_base(self):
+        adapter = self._adapter()
+        adapter._initial_floor_min_points = 10
+        original = mod._pc2
+        mod._pc2 = _FakePc2Reader([(2.0, 0.0, 0.5)] * 50)
+        try:
+            self.assertIsNone(adapter._estimate_initial_floor_height(object()))
+        finally:
+            mod._pc2 = original
+
+    # --- alignment -----------------------------------------------------
+
+    def test_alignment_fails_closed_without_either_reference(self):
+        adapter = self._adapter()
+        self.assertFalse(adapter._compute_alignment(mod._identity_transform()))
+        self.assertIsNone(adapter._T_world_to_camera_init)
+
+    def test_alignment_uses_the_measured_attitude_and_floor_datum(self):
+        roll_deg, pitch_deg, floor = 0.394, 0.947, 0.30
+        adapter = self._adapter(
+            _initial_roll=math.radians(roll_deg),
+            _initial_pitch=math.radians(pitch_deg),
+            _initial_floor_height=floor,
+        )
+        self.assertTrue(adapter._compute_alignment(mod._identity_transform()))
+        translation, quat = mod._transform_to_translation_quat(
+            adapter._T_world_to_camera_init
+        )
+        rpy = mod._euler_rpy_from_quat(quat)
+        self.assertAlmostEqual(math.degrees(rpy[0]), roll_deg, places=3)
+        self.assertAlmostEqual(math.degrees(rpy[1]), pitch_deg, places=3)
+        self.assertAlmostEqual(translation[2], floor, places=6)
+        # The scene file's spawn z (0.6) must not reach the world z origin.
+        self.assertNotAlmostEqual(translation[2], adapter._start_z, places=3)
+
+    def test_alignment_never_uses_the_scene_spawn_z(self):
+        adapter = self._adapter(
+            _initial_roll=0.0,
+            _initial_pitch=0.0,
+            _initial_floor_height=0.0,
+        )
+        adapter._start_z = 0.6
+        self.assertTrue(adapter._compute_alignment(mod._identity_transform()))
+        translation, _ = mod._transform_to_translation_quat(
+            adapter._T_world_to_camera_init
+        )
+        self.assertAlmostEqual(translation[2], 0.0, places=6)
 
 
 class TestLocalizationNode(unittest.TestCase):
@@ -978,8 +1150,14 @@ class TestLocalizationNode(unittest.TestCase):
         for tok in ("rospy.ServiceProxy", "get_model_state", "gazebo_msgs",
                     "subprocess", "os.system", "import numpy", "import scipy"):
             self.assertNotIn(tok, source, f"forbidden token {tok!r} in node source")
-        # The only input subscriber uses the legitimate /Odometry topic.
-        self.assertEqual(source.count("rospy.Subscriber("), 2)
+        # Input subscribers: /Odometry, the optional correction odometry, and
+        # the two startup-only vertical references (trunk IMU gravity level,
+        # raw LiDAR floor datum).  None of them is a truth channel, and both
+        # startup subscriptions are released once the alignment is computed.
+        self.assertEqual(source.count("rospy.Subscriber("), 4)
+        for topic in ('"/trunk_imu"', '"/livox/Pointcloud2"'):
+            self.assertIn(topic, source, f"expected startup input {topic}")
+        self.assertIn("sub.unregister()", source)
         self.assertIn("correction_enabled", source)
         self.assertIn("/c2r28/proprio_fastlio_shadow/odom", source)
         self.assertIn("self.odom_input_topic", source)

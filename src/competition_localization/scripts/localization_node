@@ -50,6 +50,16 @@ import tf2_ros
 from competition_interfaces.msg import ModuleStatus
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu, PointCloud2
+
+try:  # ROS point-cloud reader; absent in the fake-ROS unit-test harness.
+    import sensor_msgs.point_cloud2 as _pc2
+except Exception:  # pragma: no cover - test harness only
+    _pc2 = None
+
+
+# Standard gravity, for validating a stationary accelerometer window.
+STANDARD_GRAVITY = 9.80665
 
 
 # Team coordinate-frame contract (see docs/team/module_contracts.md):
@@ -323,6 +333,69 @@ class LocalizationAdapter:
             "~team_scene_info_path", "generated_building/team_scene_info.json"
         )
         self.start_alignment_delay = rospy.get_param("~start_alignment_delay", 2.0)
+
+        # --- initial vertical alignment -------------------------------------
+        # The world frame must be gravity-level and its z origin must sit on
+        # the floor, otherwise the base frame's z drifts as the robot drives
+        # and the mapper's base-relative height window rides up with it (a
+        # 0.30 m obstacle then falls out of the window entirely; measured on
+        # run p0e).  Both references are taken from the robot's OWN sensors:
+        #   roll/pitch  <- the trunk IMU's gravity direction at startup
+        #   floor datum <- the startup LiDAR's own floor returns
+        # Neither the scene file's spawn z nor any ground-truth channel is
+        # used.  Both sources are already production inputs (`/trunk_imu`
+        # feeds leg_odometry, the raw cloud feeds filter_livox).
+        self.initial_attitude_topic = rospy.get_param(
+            "~initial_attitude_topic", "/trunk_imu"
+        )
+        self.initial_attitude_samples = int(
+            rospy.get_param("~initial_attitude_samples", 40)
+        )
+        self.initial_attitude_gravity_tolerance = float(
+            rospy.get_param("~initial_attitude_gravity_tolerance", 0.6)
+        )
+        self.initial_attitude_stillness = float(
+            rospy.get_param("~initial_attitude_stillness", 0.15)
+        )
+        self.initial_attitude_timeout = float(
+            rospy.get_param("~initial_attitude_timeout", 20.0)
+        )
+        self.initial_floor_cloud_topic = rospy.get_param(
+            "~initial_floor_cloud_topic", "/livox/Pointcloud2"
+        )
+        self.initial_floor_min_range = float(
+            rospy.get_param("~initial_floor_min_range", 1.2)
+        )
+        self.initial_floor_max_range = float(
+            rospy.get_param("~initial_floor_max_range", 4.0)
+        )
+        self.initial_floor_percentile = float(
+            rospy.get_param("~initial_floor_percentile", 5.0)
+        )
+        self.initial_floor_min_points = int(
+            rospy.get_param("~initial_floor_min_points", 200)
+        )
+        self.initial_floor_timeout = float(
+            rospy.get_param("~initial_floor_timeout", 20.0)
+        )
+        if self.initial_attitude_samples < 1:
+            raise ValueError("~initial_attitude_samples must be positive")
+        if self.initial_floor_min_points < 1:
+            raise ValueError("~initial_floor_min_points must be positive")
+        if not 0.0 <= self.initial_floor_percentile <= 50.0:
+            raise ValueError("~initial_floor_percentile must be in [0, 50]")
+        if self.initial_floor_min_range >= self.initial_floor_max_range:
+            raise ValueError(
+                "~initial_floor_min_range must be below ~initial_floor_max_range"
+            )
+        self._initial_lock = threading.Lock()
+        self._initial_imu_accel: List[Tuple[float, float, float]] = []
+        self._initial_imu_first_time: Optional[rospy.Time] = None
+        self._initial_cloud: Optional[PointCloud2] = None
+        self._initial_cloud_time: Optional[rospy.Time] = None
+        self._initial_roll: Optional[float] = None
+        self._initial_pitch: Optional[float] = None
+        self._initial_floor_height: Optional[float] = None
         # FAST-LIO input frame contract + watchdog timeout.
         self.input_frame_id = rospy.get_param("~input_frame_id", "camera_init")
         self.input_child_frame_id = rospy.get_param("~input_child_frame_id", "body")
@@ -422,6 +495,22 @@ class LocalizationAdapter:
         self._odom_sub = rospy.Subscriber(
             self.odom_input_topic, Odometry, self._odom_callback, queue_size=10
         )
+        # Startup-only vertical references.  Both are unsubscribed once the
+        # alignment is computed: they exist solely to establish the initial
+        # gravity level and floor datum, never to follow the ground online.
+        self._initial_attitude_sub = rospy.Subscriber(
+            self.initial_attitude_topic,
+            Imu,
+            self._initial_attitude_callback,
+            queue_size=200,
+        )
+        self._initial_floor_sub = rospy.Subscriber(
+            self.initial_floor_cloud_topic,
+            PointCloud2,
+            self._initial_floor_callback,
+            queue_size=2,
+        )
+
         self._correction_sub = None
         if self.correction_enabled:
             self._correction_sub = rospy.Subscriber(
@@ -896,11 +985,15 @@ class LocalizationAdapter:
             if not self._aligned:
                 elapsed = (now - self._first_valid_pose_time).to_sec()
                 if elapsed >= self.start_alignment_delay:
-                    self._compute_alignment(self._first_valid_pose)
-                    self._aligned = True
-                    rospy.loginfo(
-                        "localization_node: world alignment computed from latched t0 pose"
-                    )
+                    # Fail closed: alignment waits for a real gravity level and
+                    # a real floor datum.  Publishing a guessed vertical
+                    # reference silently blinds the mapper to low obstacles.
+                    if self._compute_alignment(self._first_valid_pose):
+                        self._aligned = True
+                        rospy.loginfo(
+                            "localization_node: world alignment computed from "
+                            "latched t0 pose"
+                        )
 
             if self._aligned and self._T_world_to_camera_init is not None:
                 T_camera_init_to_body = transform_from_odom(msg)
@@ -1162,22 +1255,208 @@ class LocalizationAdapter:
             _quat_from_euler_rpy(roll, pitch, yaw),
         )
 
-    def _compute_alignment(self, first_pose: Transform) -> None:
+    # --- startup vertical references ------------------------------------
+
+    def _initial_attitude_callback(self, msg) -> None:
+        """Latch base roll/pitch from the trunk IMU's gravity direction.
+
+        Latched eagerly, at the first window that is simultaneously
+        gravity-magnitude and stationary, so the reference is taken while the
+        robot is still standing rather than once it has started driving.
+        """
+        sample = (
+            float(msg.linear_acceleration.x),
+            float(msg.linear_acceleration.y),
+            float(msg.linear_acceleration.z),
+        )
+        with self._initial_lock:
+            if self._initial_roll is not None:
+                return
+            self._initial_imu_accel.append(sample)
+            keep = self.initial_attitude_samples * 4
+            if len(self._initial_imu_accel) > keep:
+                del self._initial_imu_accel[:-keep]
+            estimate = self._attitude_from_accel_window(
+                list(self._initial_imu_accel)
+            )
+            if estimate is None:
+                return
+            self._initial_roll, self._initial_pitch = estimate
+        rospy.loginfo(
+            "localization_node: initial base attitude from %s gravity: "
+            "roll=%+.3f deg pitch=%+.3f deg",
+            self.initial_attitude_topic,
+            math.degrees(self._initial_roll),
+            math.degrees(self._initial_pitch),
+        )
+
+    def _initial_floor_callback(self, msg) -> None:
+        """Keep the most recent startup cloud for the floor datum."""
+        with self._initial_lock:
+            if self._aligned:
+                return
+            self._initial_cloud = msg
+
+    def _attitude_from_accel_window(self, samples):
+        """Roll/pitch implied by a stationary accelerometer window, or None.
+
+        Returns None unless the window both has gravity magnitude and is
+        genuinely still: a moving robot's specific force includes its own
+        acceleration, and aligning to that would tilt the world frame.
+        """
+        if len(samples) < self.initial_attitude_samples:
+            return None
+        window = samples[-self.initial_attitude_samples:]
+        count = len(window)
+        ax = sum(s[0] for s in window) / count
+        ay = sum(s[1] for s in window) / count
+        az = sum(s[2] for s in window) / count
+        magnitude = math.sqrt(ax * ax + ay * ay + az * az)
+        if not math.isfinite(magnitude) or magnitude <= 0.0:
+            return None
+        if abs(magnitude - STANDARD_GRAVITY) > self.initial_attitude_gravity_tolerance:
+            return None
+        for axis in range(3):
+            values = [s[axis] for s in window]
+            if max(values) - min(values) > self.initial_attitude_stillness:
+                return None
+        roll = math.atan2(ay, az)
+        pitch = math.asin(max(-1.0, min(1.0, -ax / magnitude)))
+        return roll, pitch
+
+    def _estimate_initial_floor_height(self, cloud):
+        """Height of `base` above its own floor, from the startup LiDAR.
+
+        Raw returns are mapped into the base frame with the known base<->LiDAR
+        extrinsic and reduced to a low percentile of base-frame z over a
+        horizontal annulus.  The floor plane is the only structure that spans
+        that annulus at a consistent height, so the percentile is robust to
+        furniture and to the robot's own returns.  Returns None when the
+        observation is too thin to trust, so the caller fails closed.
+        """
+        if cloud is None or _pc2 is None:
+            return None
+        extrinsic = self._T_base_to_imu
+        if extrinsic is None:
+            return None
+        rotation = (
+            (extrinsic[0], extrinsic[1], extrinsic[2]),
+            (extrinsic[4], extrinsic[5], extrinsic[6]),
+            (extrinsic[8], extrinsic[9], extrinsic[10]),
+        )
+        translation = (extrinsic[3], extrinsic[7], extrinsic[11])
+
+        heights = []
+        try:
+            points = _pc2.read_points(
+                cloud, field_names=("x", "y", "z"), skip_nans=True
+            )
+            for point in points:
+                px, py, pz = float(point[0]), float(point[1]), float(point[2])
+                if not (
+                    math.isfinite(px) and math.isfinite(py) and math.isfinite(pz)
+                ):
+                    continue
+                base_x = (
+                    rotation[0][0] * px
+                    + rotation[0][1] * py
+                    + rotation[0][2] * pz
+                    + translation[0]
+                )
+                base_y = (
+                    rotation[1][0] * px
+                    + rotation[1][1] * py
+                    + rotation[1][2] * pz
+                    + translation[1]
+                )
+                base_z = (
+                    rotation[2][0] * px
+                    + rotation[2][1] * py
+                    + rotation[2][2] * pz
+                    + translation[2]
+                )
+                planar = math.hypot(base_x, base_y)
+                if self.initial_floor_min_range <= planar <= self.initial_floor_max_range:
+                    heights.append(base_z)
+        except Exception as exc:  # malformed cloud: fail closed, never guess
+            rospy.logwarn_throttle(
+                5.0,
+                "localization_node: startup floor cloud unreadable (%s)",
+                exc,
+            )
+            return None
+
+        if len(heights) < self.initial_floor_min_points:
+            return None
+        heights.sort()
+        index = int(round(self.initial_floor_percentile / 100.0 * (len(heights) - 1)))
+        index = max(0, min(len(heights) - 1, index))
+        floor_z = heights[index]
+        if not math.isfinite(floor_z) or floor_z >= 0.0:
+            # The floor must lie below the base; anything else is not a floor.
+            return None
+        return -floor_z
+
+    def _compute_alignment(self, first_pose: Transform) -> bool:
         """Compute world -> camera_init using ONLY the latched first pose P0.
 
         Formula (team contract):
             T_world_to_camera_init = T_start * T_base_to_body * (P0)^-1
-        where T_start is the world -> base start pose read from the scene
-        file, T_base_to_body is the fixed base -> livox_imu_link extrinsic,
-        and P0 is the FIRST valid FAST-LIO body pose (t0), latched once and
-        never refreshed. This guarantees the output world -> base equals the
-        start pose at t0 even if the robot moved during the stabilization
-        delay.
+        where T_start is the world -> base start pose, T_base_to_body is the
+        fixed base -> livox_imu_link extrinsic, and P0 is the FIRST valid
+        FAST-LIO body pose (t0), latched once and never refreshed. This
+        guarantees the output world -> base equals the start pose at t0 even
+        if the robot moved during the stabilization delay.
+
+        ``T_start`` is built from the robot's OWN startup observations rather
+        than assumed:
+          * roll/pitch from the trunk IMU's gravity direction, so the world
+            frame is gravity-level.  Assuming a level start instead leaks
+            horizontal motion into world z (~0.008 m per metre travelled,
+            measured on run p0e), which walks the mapper's base-relative
+            height window up until it no longer contains low obstacles.
+          * z from the startup LiDAR's own floor datum, so the world origin
+            sits on the floor.  The scene file's ``robot_start.z`` is the
+            *spawn* height (0.6 m) while the robot settles to ~0.31 m, so
+            using it biased z by ~0.29 m.
+
+        Returns False (fail closed) when either reference is not yet
+        available, leaving the caller unaligned rather than guessing.
         """
-        # Start pose in world (roll/pitch assumed zero on ground start)
-        q_ws = _quat_from_euler_rpy(0.0, 0.0, self._start_yaw)
+        roll = self._initial_roll
+        pitch = self._initial_pitch
+        if roll is None or pitch is None:
+            if self._first_valid_pose_time is not None and (
+                rospy.Time.now() - self._first_valid_pose_time
+            ).to_sec() > self.initial_attitude_timeout:
+                rospy.logerr_throttle(
+                    5.0,
+                    "localization_node: no stationary gravity window on %s "
+                    "after %.0f s; refusing to align",
+                    self.initial_attitude_topic,
+                    self.initial_attitude_timeout,
+                )
+            return False
+
+        with self._initial_lock:
+            floor_height = self._initial_floor_height
+            if floor_height is None:
+                floor_height = self._estimate_initial_floor_height(
+                    self._initial_cloud
+                )
+                self._initial_floor_height = floor_height
+        if floor_height is None:
+            rospy.logwarn_throttle(
+                5.0,
+                "localization_node: no usable startup floor datum from %s "
+                "yet; refusing to align",
+                self.initial_floor_cloud_topic,
+            )
+            return False
+
+        q_ws = _quat_from_euler_rpy(roll, pitch, self._start_yaw)
         T_ws = _transform_from_translation_quat(
-            (self._start_x, self._start_y, self._start_z), q_ws
+            (self._start_x, self._start_y, floor_height), q_ws
         )
 
         # Inverse of the latched first body pose (P0)^-1
@@ -1191,9 +1470,22 @@ class LocalizationAdapter:
         self._T_world_to_camera_init = _transform_multiply(T_ws_imu, T_bc)
 
         rospy.loginfo(
-            "World alignment: start=(%.3f, %.3f, %.3f, yaw=%.3f), based on latched t0 pose",
-            self._start_x, self._start_y, self._start_z, self._start_yaw,
+            "World alignment: start=(%.3f, %.3f, z=%.3f yaw=%.3f), "
+            "roll=%+.3f deg pitch=%+.3f deg (trunk IMU), floor datum %.3f m "
+            "(startup LiDAR); scene spawn z=%.3f NOT used; based on latched "
+            "t0 pose",
+            self._start_x, self._start_y, floor_height, self._start_yaw,
+            math.degrees(roll), math.degrees(pitch), floor_height,
+            self._start_z,
         )
+        # The startup references are one-shot: release the sensors so nothing
+        # can follow the ground online.
+        for sub in (self._initial_attitude_sub, self._initial_floor_sub):
+            if sub is not None:
+                sub.unregister()
+        self._initial_attitude_sub = None
+        self._initial_floor_sub = None
+        return True
 
     def _publish_tf(self, odom: Odometry) -> None:
         """Publish dynamic transform world -> base.

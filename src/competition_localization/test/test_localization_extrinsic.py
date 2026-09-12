@@ -13,6 +13,7 @@ These tests prove the matrix multiplication order using non-zero translation
 from __future__ import annotations
 
 import math
+import threading
 import sys
 import unittest
 from pathlib import Path
@@ -376,6 +377,16 @@ class TestExtrinsicComposition(unittest.TestCase):
         adapter._start_yaw = start["yaw"]
         adapter._T_base_to_imu = T_base_to_imu
         adapter._T_world_to_camera_init = None
+        # Startup vertical references: a level reported attitude and a floor
+        # datum equal to the scene start z reproduce the pre-existing vertical
+        # contract, so this test keeps pinning the extrinsic composition.
+        adapter._initial_roll = 0.0
+        adapter._initial_pitch = 0.0
+        adapter._initial_floor_height = start["z"]
+        adapter._initial_cloud = None
+        adapter._initial_lock = threading.Lock()
+        adapter._initial_attitude_sub = None
+        adapter._initial_floor_sub = None
 
         # t0: FAST-LIO body (IMU) pose in camera_init is identity.
         P0 = mod._identity_transform()

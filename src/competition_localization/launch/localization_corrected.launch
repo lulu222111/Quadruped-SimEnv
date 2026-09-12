@@ -48,6 +48,12 @@
     <param name="odom_topic" value="$(arg leg_odom_topic)" />
     <param name="max_imu_age" value="$(arg max_imu_age)" />
     <param name="max_imu_joint_skew" value="$(arg max_imu_joint_skew)" />
+    <!-- Startup-only vertical references: the trunk IMU gives the initial
+         gravity level and the raw LiDAR gives the initial floor datum, so the
+         world frame is level and its z origin sits on the floor.  Both are
+         released once the alignment is computed. -->
+    <param name="initial_attitude_topic" value="$(arg leg_imu_topic)" />
+    <param name="initial_floor_cloud_topic" value="$(arg raw_cloud_topic)" />
     <param name="frame_id" value="c2r28_fastlio_local" />
     <param name="child_frame_id" value="c2r28_base" />
     <!-- PR #16 candidate values, except vel_scale: the PR #16 value 1.2 was
