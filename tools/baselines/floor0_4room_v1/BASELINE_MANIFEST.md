@@ -23,7 +23,7 @@ competition-faithful final scene baseline
 BASELINE_NAME = floor0-4room-v1
 
 SUPERPROJECT_BASE           = 08704862c05b4c97a8a80fbe71ca14b262528612
-SUPERPROJECT_BASELINE_COMMIT = <superproject tip of baseline/floor0-4room-v1>
+SUPERPROJECT_BASELINE_COMMIT = db092493723ea1d02d46323e1c26b234fec1d7f6
 SUPERPROJECT_REMOTE_BRANCH  = origin/baseline/floor0-4room-v1
 SUPERPROJECT_REMOTE         = https://github.com/Carl-Huang12138/DG-202602-SimEnv.git
 
