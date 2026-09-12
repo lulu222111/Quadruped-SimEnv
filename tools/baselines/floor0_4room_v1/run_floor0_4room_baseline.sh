@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 BASELINE_DIR="$ROOT/tools/baselines/floor0_4room_v1"
 MANIFEST="$BASELINE_DIR/BASELINE_MANIFEST.md"
 LAUNCH="$BASELINE_DIR/floor0_4room_replay.launch"
