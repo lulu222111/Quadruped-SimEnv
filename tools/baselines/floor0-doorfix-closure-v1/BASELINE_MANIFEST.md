@@ -22,7 +22,20 @@ FLOOR_COUNT = 1
 ROOMS_PER_FLOOR = 4
 ENABLE_GROUND_TRUTH = 0
 ENABLE_REFEREE_ODOM = 0
+WRITE_GENERATED_TRUTH_COPY = 0
+UNITREE_AUTO_CMD_VEL = 1
+CONTROLLER_FOREGROUND = 0
+ENABLE_SENSORS = 1
+ENABLE_REALSENSE = 1
 ```
+
+Every key above is exported into the run environment, so each one must appear in
+this canonical `KEY = value` form — the parser (`manifest_value`) matches
+`^KEY<spaces>=<spaces>value` and silently yields an **empty** string otherwise.
+Descriptive repeats in sections 3+ use `KEY: value` (a colon) on purpose: they
+document the run, they are never parsed. `WRITE_GENERATED_TRUTH_COPY = 0`
+matters because production `auto.sh` defaults it to `1`, which would mirror the
+referee truth into `generated_building/danger_truth.json`.
 
 * `PRODUCTION_BASE_HEAD` subject: `fix(building-generator): fully clear main entrance when open`
 * Branch that carries it: `origin/fix/huangym/main-entrance-open-geometry-v1`
@@ -288,7 +301,9 @@ Additional gates (not in the required nine, still fail-closed):
 * `CLOSURE_GATE` — post-run: `RETURNING` entered, `ARRIVED_START`,
   `FINISHED`, `CURRENT_FLOOR_COMPLETE`, `HAZARD_UNIQUE = 6/6`,
   `FALSE_ALARMS_WRITTEN = 0`, `MAX_TIME_REACHED = False`,
-  `RETURNING_GOAL_NOT_REACHABLE = 0`, both entrance crossings observed.
+  `RETURNING_GOAL_NOT_REACHABLE = 0`, both entrance crossings observed,
+  and no `generated_building/danger_truth.json` (the frozen
+  `WRITE_GENERATED_TRUTH_COPY = 0`).
 
 Every gate starts as `NOT_RUN`; the run aborts at the first `FAIL`, so a green
 final report means every gate was actually evaluated.

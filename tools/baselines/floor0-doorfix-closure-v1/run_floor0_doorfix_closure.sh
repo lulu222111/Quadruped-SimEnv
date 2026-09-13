@@ -144,6 +144,11 @@ GUI="${GUI:-$FROZEN_GUI}"
 FROZEN_ROS_MASTER="$(manifest_value ROS_MASTER_URI)"
 FROZEN_GAZEBO_MASTER="$(manifest_value GAZEBO_MASTER_URI)"
 
+# EVERY frozen key that is exported below must resolve here.  A key that is
+# missing from the canonical `KEY = value` block in the manifest parses as an
+# empty string, and an empty value silently falls back to a production default
+# in auto.sh (WRITE_GENERATED_TRUTH_COPY defaults to 1 there, not 0), so this
+# check is fail-closed rather than a convenience.
 for _pair in "PRODUCTION_BASE_HEAD:$FROZEN_BASE" "TOOLING_SCOPE:$FROZEN_SCOPE" \
              "FAST_LIO:$FROZEN_FASTLIO" \
              "LIVOX:$FROZEN_LIVOX" "SEED:$FROZEN_SEED" "FLOOR_COUNT:$FROZEN_FLOORS" \
@@ -151,8 +156,15 @@ for _pair in "PRODUCTION_BASE_HEAD:$FROZEN_BASE" "TOOLING_SCOPE:$FROZEN_SCOPE" \
              "MAIN_ENTRANCE_CLEARANCE:$FROZEN_CLEARANCE" "SCENE_DANGER_COUNT:$FROZEN_SCENE_DANGER" \
              "SCENE_DISTRACTOR_COUNT:$FROZEN_SCENE_DISTRACTOR" \
              "ENABLE_GROUND_TRUTH:$FROZEN_GT" "ENABLE_REFEREE_ODOM:$FROZEN_REF_ODOM" \
+             "WRITE_GENERATED_TRUTH_COPY:$FROZEN_TRUTH_COPY" \
+             "UNITREE_AUTO_CMD_VEL:$FROZEN_AUTO_CMD_VEL" \
+             "CONTROLLER_FOREGROUND:$FROZEN_CTRL_FG" \
+             "ENABLE_SENSORS:$FROZEN_SENSORS" "ENABLE_REALSENSE:$FROZEN_REALSENSE" \
+             "DANGER_COUNT_RANGE:$FROZEN_DANGER_RANGE" \
+             "DISTRACTOR_COUNT_RANGE:$FROZEN_DISTRACTOR_RANGE" \
+             "ROS_MASTER_URI:$FROZEN_ROS_MASTER" "GAZEBO_MASTER_URI:$FROZEN_GAZEBO_MASTER" \
              "GUI:$FROZEN_GUI" "BUILDING_WIDTH:$FROZEN_WIDTH" "BUILDING_LENGTH:$FROZEN_LENGTH"; do
-    [ -n "${_pair#*:}" ] || { echo "[closure] FATAL: cannot parse ${_pair%%:*} from manifest" >&2; exit 1; }
+    [ -n "${_pair#*:}" ] || { echo "[closure] FATAL: cannot parse ${_pair%%:*} from manifest (missing 'KEY = value' line?)" >&2; exit 1; }
 done
 
 info "baseline        : $BASELINE_DIR"
@@ -1022,6 +1034,14 @@ out["DETECTED_DANGER_JSON_COUNT"] = len(detected)
 out["HAZARD_UNIQUE_DETECTED_COUNT"] = len(matched)
 out["FALSE_ALARMS_WRITTEN"] = false_alarms
 
+# --- ground-truth leakage on disk --------------------------------------------
+# The frozen WRITE_GENERATED_TRUTH_COPY=0 must keep the referee truth file out
+# of the scene directory that production nodes can see
+# (generate_competition_scene.py mirrors it there unless --no-generated-truth-copy
+# is passed).
+out["GT_TRUTH_COPY_IN_GENERATED_BUILDING"] = (
+    repo / "generated_building" / "danger_truth.json").exists()
+
 # --- entrance crossings + zone coverage from the production odom samples ---
 traj = []
 for line in read(WATCHER).splitlines()[1:]:
@@ -1058,6 +1078,7 @@ REQUIRED = {
     "MAX_TIME_REACHED": False,
     "ENTRANCE_CROSSING_OUT_TO_IN": True,
     "ENTRANCE_CROSSING_IN_TO_OUT": True,
+    "GT_TRUTH_COPY_IN_GENERATED_BUILDING": False,
 }
 REQUIRED_COUNTS = {
     "HAZARD_UNIQUE_DETECTED_COUNT": ("==", "TRUE_DANGER_COUNT"),

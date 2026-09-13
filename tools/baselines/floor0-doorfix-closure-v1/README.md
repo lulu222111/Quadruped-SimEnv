@@ -66,6 +66,37 @@ bash tools/baselines/floor0-doorfix-closure-v1/run_floor0_doorfix_closure.sh --d
 The runner depends on **nothing** outside this repository: no private absolute
 paths, no `/tmp` wrappers, no uncommitted patches.
 
+### Container prerequisites (verified live)
+
+* **ROS networking.** Start the container through `compose.yaml`
+  (`docker compose up -d --no-build`), which sets
+  `extra_hosts: "<hostname>:127.0.0.1"`. When creating it by hand, pass the same
+  mapping explicitly:
+
+  ```bash
+  docker run … --network host --hostname simenv-closure \
+      --add-host simenv-closure:127.0.0.1 …
+  ```
+
+  Without it the container's own hostname does not resolve, `auto.sh` starts and
+  generates the scene, and then `roslaunch` dies during startup with
+
+  ```text
+  RLException: Unable to contact my own server at [http://<hostname>:<port>/]
+  ```
+
+  `getent hosts "$(hostname)"` must print `127.0.0.1` before the run. This is an
+  environment fault, never a mission result.
+* **Display.** GUI=true is the frozen configuration, so `DISPLAY` must be set and
+  `/tmp/.X11-unix` + the `XAUTHORITY` file must be bind-mounted (again, what
+  `compose.yaml` does).
+* **Clean container.** `PROCESS_GATE` fails closed if a `gzserver`/`rosmaster`
+  from an earlier attempt is still alive in the same container.
+* **Submodules.** `git submodule update --init --recursive` occasionally fails on
+  the nested `src/fast_lio/include/ikd-Tree` with a transient
+  `curl 16 Error in the HTTP2 framing layer`. Re-run it (optionally with
+  `-c http.version=HTTP/1.1`); a partially initialised clone does not build.
+
 ### Three identities — read before comparing commits
 
 ```text
@@ -128,7 +159,7 @@ main entrance open clearance = 2.000 m
 | `GUI_GATE` | `gzserver` + `gzclient` alive on a real display (explicit `GUI=0` is recorded as `DEVIATION`) |
 | `MAX_TIME_GATE` | **live** value of `/competition_loop/max_time` is `7200.0` |
 | `GT_COMPLIANCE_GATE` | no forbidden truth publisher; no production node subscribes to a truth channel |
-| `CLOSURE_GATE` | the full sequence above, 6/6 hazards, 0 false alarms, both entrance crossings |
+| `CLOSURE_GATE` | the full sequence above, 6/6 hazards, 0 false alarms, both entrance crossings, and **no** `generated_building/danger_truth.json` on disk (the frozen `WRITE_GENERATED_TRUTH_COPY=0`) |
 
 Every gate starts as `NOT_RUN`; the run aborts at the first `FAIL`, so a green
 report means every gate was really evaluated. Exit code `0` only if all pass.
