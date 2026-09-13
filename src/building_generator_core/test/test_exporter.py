@@ -205,6 +205,42 @@ class ExporterTest(unittest.TestCase):
             self.assertNotAlmostEqual(panels["left_panel"][1], closed[0][1], places=3)
             self.assertNotAlmostEqual(panels["right_panel"][1], closed[1][1], places=3)
 
+    def test_open_panel_pose_clears_the_doorway_opening(self) -> None:
+        """An open leaf must clear the opening, not just move part-way.
+
+        Regression for the entrance pinch: doors other than elevators used
+        slide_offset = width/4 + 0.06, which left each leaf's inner edge at
+        0.56 m for a 2.0 m door.  The doorway therefore stayed 0.88 m blocked
+        even in the "open" pose, the planner saw the entrance as impassable and
+        the robot could neither enter nor return.
+        """
+        constraints = BuildingConstraints.from_dict(
+            {
+                "seed": 77,
+                "floor_count": 1,
+                "rooms_per_floor": 4,
+                "building_footprint_limit": {"width": 30.0, "length": 60.0},
+            }
+        )
+        layout = generate_layout(constraints)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_paths = export_sdf(layout, target="gazebo_classic", output_dir=tmpdir)
+            door_config = yaml.safe_load(Path(artifact_paths.door_config).read_text())
+            entrance = next(item for item in door_config["doors"]
+                            if item["kind"] == "main_entrance")
+
+            half_width = entrance["width"] / 2.0
+            leaf_half = entrance["width"] / 4.0
+            for key, sign in (("left_open", -1.0), ("right_open", 1.0)):
+                offset = entrance["panel_poses"][key][1]
+                self.assertEqual(sign, 1.0 if offset > 0 else -1.0)
+                # The leaf's inner edge must reach at least the doorway edge.
+                self.assertGreaterEqual(
+                    abs(offset) - leaf_half, half_width,
+                    f"{key} leaves the doorway partly blocked",
+                )
+
     def test_elevator_car_opening_faces_the_lobby_door_side(self) -> None:
         constraints = BuildingConstraints.from_dict(
             {

@@ -680,10 +680,15 @@ def door_panel_poses(door: DoorSpec) -> tuple[list[list[float]], list[list[float
     world model is emitted in its intended state and the two can never drift.
     """
     panel_offset = door.width / 4.0
-    slide_offset = door.width / 4.0 + 0.06
+    # A sliding leaf only clears the opening once its inner edge passes the
+    # doorway edge, i.e. slide_offset >= door.width / 2.  The previous
+    # width/4 + 0.06 kept each leaf's inner edge at 0.56 m for a 2.0 m door, so
+    # 0.88 m of the opening stayed blocked even in the "open" pose and the
+    # planner saw the entrance as impassable.  Elevator doors already used the
+    # opening-clearing formula; use it for every door.
+    slide_offset = door.width / 2.0 + WALL_THICKNESS / 2.0 + DOOR_PANEL_THICKNESS
     recess_offset = 0.0
     if door.kind == "elevator":
-        slide_offset = door.width / 2.0 + WALL_THICKNESS / 2.0 + DOOR_PANEL_THICKNESS
         recess_offset = -(WALL_THICKNESS / 2.0 + DOOR_PANEL_THICKNESS / 2.0)
     closed = [
         [0.0, -panel_offset, 0.0, 0.0, 0.0, 0.0],
