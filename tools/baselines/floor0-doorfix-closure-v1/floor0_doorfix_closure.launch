@@ -1,0 +1,70 @@
+<?xml version="1.0"?>
+<!--
+  =============================================================================
+  VALIDATION WIRING ONLY — NOT PRODUCTION CONFIGURATION
+  =============================================================================
+  floor0-doorfix-closure-v1 wrapper.
+
+  It only *selects* arguments that already exist in the committed production
+  launch files; no production file is edited, and no production algorithm is
+  changed.  See BASELINE_MANIFEST.md for the provenance of every value below
+  (all recovered live from
+  artifacts/floor0-full-repro/floor0-full-repro-20260913-155635).
+
+  Launch order matters:
+    1. localization_corrected.launch  -> the ONLY /competition/localization/odom
+       publisher in this run (competition_system.launch is started with
+       localization_enabled=false so its own FAST-LIO bringup is skipped).
+    2. competition_system.launch      -> the frozen Floor0 mission args.
+    3. /competition_loop/max_time     -> set AFTER the include.
+
+  Why (3) is after the include: competition_system.launch hard-codes
+  <param name="max_time" value="600.0"/> inside its competition_loop node and
+  exposes no <arg> for it.  A <param> written BEFORE the include is overwritten
+  by that node's private parameter (the known limitation of the older
+  floor0_4room_v1 wrapper); writing it AFTER the include makes the override
+  survive roslaunch ordering.  Verified live: the authoritative run's
+  params.txt records `rosparam get /competition_loop/max_time` = 7200.0.
+
+  The runner does not take this on trust: MAX_TIME_GATE reads the parameter
+  back from the live parameter server and fails closed unless it is 7200.0.
+  =============================================================================
+-->
+<launch>
+
+  <arg name="max_time" default="7200.0" />
+  <arg name="team_scene_info_path" default="generated_building/team_scene_info.json" />
+
+  <!-- Room-only visual scan zones, world metres, recovered verbatim from the
+       authoritative run's live parameter server (/planning/room_scan_zones):
+       [[1.1,9.5,7.9,21.9],[-9.5,-1.1,7.9,21.9],
+        [1.1,9.5,21.9,35.9],[-9.5,-1.1,21.9,35.9]] -->
+  <arg name="planning_room_scan_zones"
+       default="[[1.1,9.5,7.9,21.9],[-9.5,-1.1,7.9,21.9],[1.1,9.5,21.9,35.9],[-9.5,-1.1,21.9,35.9]]" />
+
+  <!-- 1. Canonical localization chain (the ONLY /competition/localization/odom
+          publisher in this run). -->
+  <include file="$(find competition_localization)/launch/localization_corrected.launch">
+    <arg name="rviz" value="false" />
+    <arg name="team_scene_info_path" value="$(arg team_scene_info_path)" />
+    <arg name="correction_enabled" value="true" />
+    <arg name="correction_mode" value="planar_relative" />
+  </include>
+
+  <!-- 2. Competition stack with the frozen Floor0 args. -->
+  <include file="$(find competition_bringup)/launch/competition_system.launch">
+    <arg name="competition_mode" value="true" />
+    <arg name="auto_start" value="true" />
+    <arg name="localization_enabled" value="false" />
+    <arg name="floor_lifecycle_enabled" value="true" />
+    <arg name="planning_room_mission_enabled" value="true" />
+    <arg name="planning_room_scan_zones" value="$(arg planning_room_scan_zones)" />
+    <arg name="planning_visual_scan_route_spacing" value="4.0" />
+  </include>
+
+  <!-- 3. AFTER the include: overrides the node's hard-coded
+          <param name="max_time" value="600.0"/>.  Verified live with
+          `rosparam get /competition_loop/max_time` (recorded in params.txt). -->
+  <param name="/competition_loop/max_time" value="$(arg max_time)" />
+
+</launch>
