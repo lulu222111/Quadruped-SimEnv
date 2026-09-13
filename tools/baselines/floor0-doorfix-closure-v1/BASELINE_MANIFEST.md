@@ -38,7 +38,8 @@ matters because production `auto.sh` defaults it to `1`, which would mirror the
 referee truth into `generated_building/danger_truth.json`.
 
 * `PRODUCTION_BASE_HEAD` subject: `fix(building-generator): fully clear main entrance when open`
-* Branch that carries it: `origin/fix/huangym/main-entrance-open-geometry-v1`
+* Branch that carries the baseline: `origin/baseline/floor0-doorfix-closure-v1`
+  (the production base itself is `origin/fix/huangym/main-entrance-open-geometry-v1`)
 * Submodule paths: `src/fast_lio`, `src/livox_ros_driver`
 * Container image used by the authoritative run: `simenv:noetic-cu128`
 
