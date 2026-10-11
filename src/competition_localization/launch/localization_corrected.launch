@@ -1,4 +1,22 @@
 <launch>
+  <!-- =====================================================================
+       中文说明（模块级）：localization_corrected.launch —— 校正定位链（验证用）
+
+       职责：把三件事组装成一条"唯一的 world->base 输出链"——
+         1) 原始 LiDAR 点云先经 filter_livox.py 裁剪（去自机身近场点与仿真
+            超远异常点，避免污染配准与身体自遮挡造成的欠跟踪）；
+         2) 点云 + Livox IMU 送 FAST-LIO 得到 /Odometry；
+         3) JointState + 躯干 IMU 送 leg_odometry.py 得到本体平面里程计，
+            再由 localization_node 用 planar_relative 模式对 FAST-LIO 位姿做
+            持续校正（xy/yaw 取自腿式里程计，z/roll/pitch 仍取自 FAST-LIO）。
+
+       为什么需要它：仿真中 FAST-LIO 的平面位姿会缓慢漂移，用本体高频里程计
+       做相对校正可以在不引入真值的前提下显著改善长距离闭环精度。
+
+       重要：本文件在正式竞赛启动（competition_system.launch）中默认不启用；
+       使用时必须把 competition_system.launch 的 localization_enabled 置 false，
+       否则会出现两个 world->base 动态发布者。
+       ===================================================================== -->
   <!--
     ================================================================
     EXPERIMENTAL / VALIDATION ONLY

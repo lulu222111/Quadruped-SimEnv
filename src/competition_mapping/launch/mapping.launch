@@ -1,4 +1,15 @@
 <launch>
+  <!-- =====================================================================
+       中文说明（模块级）：mapping.launch —— 建图节点启动（话题可覆盖）
+
+       职责：以 config/mapping.yaml 为默认参数启动 mapping_node，并允许外层通过
+       arg 覆盖四个关键话题（点云、定位里程计、定位状态），保证"输入源可替换"
+       而不需要改代码。
+
+       为什么话题要参数化：正式链路与校正链路（localization_corrected.launch）
+       使用同一套建图节点，只是上游里程计来源不同；把话题做成 arg 可以让两种
+       装配共享同一份建图实现，避免出现"两套地图代码"。
+       ===================================================================== -->
   <arg name="config_file" default="$(find competition_mapping)/config/mapping.yaml"/>
   <arg name="pointcloud_topic" default="/livox/Pointcloud2"/>
   <arg name="odom_topic" default="/competition/localization/odom"/>

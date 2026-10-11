@@ -1,4 +1,24 @@
 <launch>
+  <!-- =====================================================================
+       中文说明（模块级）：competition_system.launch —— 竞赛系统统一启动
+
+       职责：一条命令拉起全链路（competition_loop、cmd_vel_guard、
+       localization、perception、mapping、planning、path_follower），并把所有
+       可调参数集中暴露为 launch arg；默认值即"已标定的正式配置"，验证用的
+       差异配置由外层 wrapper（tools/baselines/... 下的 replay launch）覆盖。
+
+       为什么这样装配：
+         * 定位链只有一个 world->base 动态发布者：本文件通过 localization_enabled
+           控制是否内建 FAST-LIO 链；若外层已 include 了 localization_corrected
+           .launch，就必须把它置 false，否则会出现两个定位源。
+         * 运动安全：path_follower 只发 /competition/raw_cmd_vel，/cmd_vel 由
+           cmd_vel_guard 独占发布，保证任一时刻只有一个 motion owner。
+         * 合规：默认关闭真值/裁判通道（ENABLE_GROUND_TRUTH=0、
+           ENABLE_REFEREE_ODOM=0），算法只允许消费公开接口。
+
+       阅读提示：本文件中的参数注释解释了取值的经验依据（例如 min_height 为何
+       不能太低、visual_scan 各个时间常数的含义），修改行为前请先读这些注释。
+       ===================================================================== -->
   <!--
     competition_system.launch — unified competition system startup.
 

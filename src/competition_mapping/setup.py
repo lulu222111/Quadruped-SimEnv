@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# 中文说明：catkin_python_setup() 使用的安装描述——把 src/competition_mapping
+# 作为 Python 包对外安装（导出纯算法部分），供 scripts/mapping_node 直接 import。
 from setuptools import setup
 from catkin_pkg.python_setup import generate_distutils_setup
 

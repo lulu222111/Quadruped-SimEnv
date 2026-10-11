@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# =============================================================================
+# 模块说明（中文）：door_controller.py —— 门/电梯官方服务的极薄客户端
+#
+# 职责：仅封装 /set_door_state 与 /call_elevator 两个环境官方服务。
+# 为什么刻意"薄"：门与电梯的开放/楼层状态必须以官方服务返回值作为唯一证据，
+#       本模块因此只做请求构造、服务就绪等待与返回值映射，不实现任何自主策略、
+#       不做时间推断、不读取任何门/电梯配置或真值文件。
+# 结构导航：DoorController（行 16 起）→ open_door/close_door（行 38-56）→
+#       call_elevator（行 71-94，elevator_id/target_floor/open_doors 封装）。
+# 输入：门 id / 电梯 id、目标楼层等调用参数
+# 输出：服务响应字典（状态与楼层证据）
+# =============================================================================
 """door_controller.py — thin wrapper around building door/elevator services.
 
 This module calls the existing /set_door_state and /call_elevator services

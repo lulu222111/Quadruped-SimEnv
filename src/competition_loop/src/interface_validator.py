@@ -1,4 +1,23 @@
 #!/usr/bin/env python3
+# =============================================================================
+# 模块说明（中文）：interface_validator.py —— 启动/运行时接口合规校验
+#
+# 职责：校验算法只通过公开接口工作：加载并严格校验唯一允许的场景文件
+#       （team_scene_info.json），检查禁止话题是否被发布，检查禁止文件是否存在。
+# 为什么这样设计（合规性要求）：
+#   1) 竞赛模式禁止算法消费真值/裁判通道（/Odometry_gazebo、/ground_truth/*、
+#      /gazebo/model_states 等）以及非公开文件（layout_metadata.json、
+#      building_config.json、danger_truth.json、door_config.yaml 等）。
+#   2) 就绪判定必须显式：用 completed/passed 状态标志而非"错误列表为空"来判定，
+#      因为 ROS Master 查询失败属于瞬态，不能据此认为检查通过，必须可重试。
+#   3) 禁止文件检查只做存在性告警，绝不读取内容、绝不删除文件。
+# 结构导航：InterfaceValidator（行 21 起）→ load_scene_info（行 89-129，唯一
+#       允许文件的严格加载）→ check_forbidden_topics（行 135-224，含瞬态重试
+#       语义）→ check_forbidden_files（行 230-268）→ is_ready（行 269-284，
+#       显式就绪契约）。
+# 输入：competition_mode 等参数、ROS Master 发布话题列表、文件系统存在性
+# 输出：就绪判定、错误/告警列表与可打印报告
+# =============================================================================
 """interface_validator.py — validate that the competition environment is compliant.
 
 In competition mode this checks that forbidden topics are not being published

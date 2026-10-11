@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+# =============================================================================
+# 模块说明（中文）：cmd_vel_guard_node —— 唯一 /cmd_vel 发布者与安全网关
+#
+# 职责：订阅跟随器给出的原始速度，做限幅后发布到 /cmd_vel，并聚合出权威的
+#       /competition/control/status。
+# 为什么必须独占：整机只允许一个进程触碰 /cmd_vel；任何"另开一路速度发布"的
+#       改动都会破坏安全模型。安全条件永远覆盖跟随器状态：急停、未使能、
+#       非法（非有限）指令、上游订阅超时、代际不匹配 —— 任一成立即输出零速。
+# 关键设计：控制循环从"读安全态"到"发布 /cmd_vel + status"全程持同一把锁，
+#       保证回调要么发生在本轮决策之前、要么在提交之后，不会被夹在中间，
+#       从而不会出现"用一半旧输入算出并下发速度"的情况。
+#       ROS 时间回退时清空全部缓存输入并补发零速；节点退出时重复补发零速。
+# 结构导航：CmdVelGuard（行 30 起）→ 回调（行 118-215）→ _control_loop
+#       （行 217-250，原子决策+发布）→ _select_status（行 252-400，优先级链）
+#       → 代际/失效与 rollback（行 406-508）→ _on_shutdown（行 519-528）。
+# 输入：/competition/raw_cmd_vel、follower 状态、enabled、estop
+# 输出：/cmd_vel、/competition/control/status
+# =============================================================================
 """Exclusive /cmd_vel publisher and authoritative control-status aggregator.
 
 Subscribes:

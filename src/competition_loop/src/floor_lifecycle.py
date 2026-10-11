@@ -1,3 +1,20 @@
+# =============================================================================
+# 模块说明（中文）：floor_lifecycle.py —— "当前楼层完成"门（纯逻辑）
+#
+# 职责：从公开场景信息（门/电梯 id 列表）推导 home_floor 与必需楼层集合，
+#       并用"两条相互独立的证据通道"判断当前楼层是否真的完成：
+#         通道 1：/competition/planning/exploration_complete 布尔（必须先 false 后 true）
+#         通道 2：任务状态消息，按 task_id + 时间戳单调性记录"succeeded and confirmed"
+#       两者都新鲜且为真时，才把该层标记为完成。
+# 为什么必须双证 + 新鲜度：探索完成信号存在瞬时抖动与陈旧重发，单通道判定会
+#       造成"假完成"并让任务提前返航；判据不新鲜时宁可冻结运动，也不放行。
+# 为什么必须纯逻辑：本文件不做任何几何、ROS 或环境服务调用，才能对"完成判定"
+#       做确定性验证（不依赖 Gazebo/SDK）。
+# 结构导航：FloorLifecycle（行 7 起）→ __init__（行 8-38，推导 home_floor 与
+#       required 集合并对非法公开场景抛错）→ activate（行 40-53，调用者必须先
+#       证明"已到达/已建图"）→ observe_bool / observe_status（行 55-75，两通道）
+#       → consume（行 76-85，双证新鲜且为真才消费）。
+# =============================================================================
 """Current-floor completion gate; no geometry, ROS or environment service calls."""
 import math
 import threading

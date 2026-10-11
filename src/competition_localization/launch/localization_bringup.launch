@@ -1,4 +1,19 @@
 <launch>
+  <!-- =====================================================================
+       中文说明（模块级）：localization_bringup.launch —— 正式定位链启动
+
+       职责：启动 FAST-LIO（laserMapping，输出 camera_init->body，body 即 IMU 帧）
+       与 competition_localization 的 localization_node（把结果适配成 world->base，
+       发布 /competition/localization/odom 与该 TF 链上唯一的动态 TF）。
+
+       为什么这样切分：FAST-LIO 只负责"世界系内的连续里程"；把"body 其实是 IMU
+       帧"这个事实、以及 base->livox_imu_link 外参补偿、启动期世界系对齐等
+       契约全部收敛到 localization_node 一个位置，便于审计"谁发布了 world->base"。
+
+       注意：本文件是 competition_system.launch 中 localization_enabled=true 时
+       内建使用的正式链路；若外层改用 localization_corrected.launch，则必须把
+       competition_system.launch 的 localization_enabled 置 false，避免双发布者。
+       ===================================================================== -->
   <!--
     localization_bringup.launch — canonical production localization bringup.
 

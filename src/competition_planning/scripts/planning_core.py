@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
 
+# =============================================================================
+# 模块说明（中文）：planning_core.py —— 与 ROS 无关的探索规划流水线
+#
+# 职责：把"占据栅格 + 机器人当前格位"变成"选中的目标 + 最短四连通路径"，
+#       并用状态码（成功/无 frontier/不可达）返回，供上层节点决定行为。
+# 为什么独立成文件：这些选择与 BFS/A* 逻辑可以脱离 ROS 单独验证，
+#       从而把"算法是否对"与"话题时序是否对"两类问题分开定位。
+# 结构导航：compress_collinear_path / path_cell_yaws（行 22-71，路径后处理与
+#       朝向生成）→ order_frontier_candidates（行 74-157）→ _bfs_reachability
+#       （行 160-217）→ _find_recovery_start（行 220-263）→
+#       _nearest_reachable_standoff（行 266-307，带最小路径长度约束的备选落点）
+#       → plan_to_goal*（行 310-478，返航/区域目标）→ plan_to_heading_goal*
+#       （行 481-611，朝向前向走廊内取最远可达）→ plan_to_frontier_with_status
+#       （行 614-930，主入口：打分选簇 + 排除/偏置 + standoff 回退）。
+# 输入：OccupancyGrid 数据与元数据、机器人格位、目标/朝向/半径等参数
+# 输出：(状态码, 路径/目标) 形式的纯 Python 结果
+# =============================================================================
+
 """ROS-independent exploration planning pipeline."""
 
 from collections import deque

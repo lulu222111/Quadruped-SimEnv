@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# =============================================================================
+# 模块说明（中文）：competition_loop_node —— 竞赛主控与状态机入口
+#
+# 职责：驱动顶层 FSM（WAITING/RUNNING/RETURNING/FINISHED/ERROR）、维护竞赛计时、
+#       做启动/运行时接口合规校验、把感知候选转成世界坐标并去重后写入结果文件，
+#       同时发布使能/急停等安全信号。
+# 为什么这样组织：本节点是"任务级"决策的唯一来源，但从不直接动速度；它通过
+#       状态机相位控制 cmd_vel_guard 的使能，实现"任务结束/异常 ⇒ 立即冻结运动"。
+# 关键设计：
+#   1) 构造期先把所有成员初始化、最后才创建 Timer，参数非法直接进入 ERROR，
+#      避免 tick 早于成员就绪触发 AttributeError。
+#   2) 危险源 z 归位（_snap_source_center_z）：在世界变换之后、去重之前把 z 校正到
+#      "地面 z + 源半径"，既缩小匹配距离又稳定去重键，防止同一物理源裂成多点。
+#   3) 返航到达判定要求多帧一致采样（return_arrival_samples）与容差内距离。
+# 结构导航：CompetitionLoopNode（行 96 起）→ 参数与路径解析（行 307-487）→
+#       候选路由装配（行 488-564）→ 候选回调与 z 归位（行 565-680）→ tick
+#       分派（行 749-940）→ 开始/结束（行 941-1067）。
+# 输入：/competition/hazard_candidates、定位与跟随状态、比赛状态
+# 输出：/competition/state、/competition/enabled、/competition/emergency_stop、
+#       results/detected_danger.json
+# =============================================================================
 """competition_loop_node — competition state machine entry point.
 
 Manages the FSM, timer, interface validation, result writing, and safety

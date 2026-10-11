@@ -1,5 +1,32 @@
 # competition_bringup — default parameters
 # Loaded by competition_system.launch into the ROS parameter server.
+#
+# =============================================================================
+# 中文说明（模块级）：竞赛系统默认参数集中配置
+#
+# 角色：本文件是"参数默认值的唯一来源"，由 competition_system.launch 载入参数
+#       服务器；launch 内的 <arg> 默认值与之保持一致，因此直接 roslaunch 得到
+#       的就是已标定的正式配置。
+#
+# 各段的含义与"为什么取这个值"：
+#   competition_loop : 任务级参数。max_time 是正式比赛预算（600 s，同时是评分
+#                      口径）；result_path 相对 workspace_root 解析；危险源
+#                      allowed_labels / 半径 / z 归位等参数决定误报口径。
+#   cmd_vel_guard    : 唯一的 /cmd_vel 网关参数（超时 + 三轴限幅）。
+#   mapping          : 栅格分辨率与尺寸、以及 min_height 高度窗——base 系地面
+#                      回波约在 -0.31..-0.18 m，若阈值取得太低会把楼板当成障碍，
+#                      因此这里只保留约 0.16 m 以上的点。
+#   planning         : Frontier 选择与有界主动视觉覆盖参数；视觉扫描是"到达目标
+#                      后在原地按 yaw 步进旋转扫描"的行为参数（步长、驻留、
+#                      超时、重试、位置去重半径、路线间距）。
+#   localization     : 坐标系契约（imu_frame=livox_imu_link、base_frame=base）
+#                      与固定外参 base->livox_imu_link（由 URDF 链推导）。
+#                      注意这是"外参"，不是可在线估计的量。
+#   perception       : HSV 阈值与最小置信度。
+#
+# 注意：修改本文件即改变正式默认行为；验证/基线复现请在 wrapper launch 中覆盖，
+#       不要直接改这里的默认值。
+# =============================================================================
 
 # --- Competition loop ---
 competition_loop:

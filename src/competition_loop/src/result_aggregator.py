@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# =============================================================================
+# 模块说明（中文）：result_aggregator.py —— 每物理源聚合成一个代表点
+#
+# 职责：把已接受的候选按 xy 近邻聚类，每个簇输出一个质心点（z 取均值、
+#       confidence 取最大、count 记录观测数）。
+# 为什么需要它：同一个真实危险源被多次观测时，反投影结果会在 ~0.9 m 内漂移。
+#       router 的去重半径较小、无法合并这些漂移点时，同一源会裂成多条，
+#       直接抬高误报率（误报分母按条数计）。因此聚类半径必须"大于同源漂移、
+#       小于异源最小间距"，默认取 1.0 m 就是这样定出来的。
+# 已知前提：候选的 z 已在 loop 侧归位到地面高度，因此仅用 xy 聚类即可。
+# 结构导航：AggregatedPoint（行 20-32）→ 取属性助手（行 35-44）→
+#       aggregate_candidates（行 47-93，单遍增量均值聚类）。
+# 输入：已接受的候选序列
+# 输出：每源一个代表点的列表
+# =============================================================================
 """result_aggregator.py — collapse accepted hazard candidates into one
 representative point per physical source before writing the final result.
 

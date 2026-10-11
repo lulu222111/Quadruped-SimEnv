@@ -1,4 +1,28 @@
 #!/usr/bin/env python3
+# =============================================================================
+# 模块说明（中文）：path_follower_node —— 带安全检查的路径跟随器
+#
+# 职责：读取 /competition/path 与上游状态、定位里程计，算出比例转向 + 前进速度，
+#       发布到 /competition/raw_cmd_vel（注意：本节点永不直接发布 /cmd_vel，
+#       也永不发布 control/status，唯一出口是 cmd_vel_guard）。
+# 为什么这样做：运动安全采用"单一 motion owner + 网关"结构——跟随器只提出
+#       期望速度，真正的下发权与限幅/急停判定在 cmd_vel_guard，便于集中审计。
+# 关键设计（为什么不能省）：
+#   1) 锁外计算、锁内复核：控制量在锁外算完，提交前重新比对 generation 与
+#      state_version；若期间有回调改写了输入，旧结果直接丢弃，绝不发布过期速度。
+#   2) 输入优先级门：planning 状态 -> localization 状态 -> odom/path，任一处失败
+#      立即 publish_stop（fail-safe），并校验 world/base 帧名。
+#   3) 卡死检测：同时看"指令积分进展"和"绝对位移"，两者都停滞才判卡死，
+#      触发一次性 stuck 上报与短暂后退回退，避免把正常慢速误判成卡死。
+# 结构导航：PathFollower（行 60 起）→ 回调（行 247-493）→ step（行 517-633，
+#       含 generation/state_version 复核）→ _check_inputs_locked（行 635-791）
+#       → _track_stuck_locked（行 797-902，双判据卡死）→ _compute_follow_snapshot
+#       （行 939-1013）→ 输入校验助手（行 1014-1191）→ 路径几何（行 1193-1289）。
+# 输入：/competition/path、/competition/planning/status、
+#       /competition/localization/odom 与 status
+# 输出：/competition/raw_cmd_vel、/competition/control/path_follower_status、
+#       /competition/planning/stuck 事件
+# =============================================================================
 """Safety-checked path follower for the competition control loop.
 
 Formal inputs:

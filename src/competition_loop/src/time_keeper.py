@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# =============================================================================
+# 模块说明（中文）：time_keeper.py —— 竞赛计时器（跟随 ROS 时间）
+#
+# 职责：以 rospy.Time.now()（use_sim_time=true 时为仿真 /clock）计算竞赛已用
+#       时间与剩余时间，并检测 ROS 时间回退。
+# 为什么需要专门处理回退：仿真时钟可能被重置（Gazebo 重启/回放），此时
+#       直接相减会得到负数 elapsed，进而让超时判定/日志全部失真。
+#       因此 elapsed 在检测到回退时返回 0（安全归零），且回退检测"始终更新
+#       比较基线"，避免用陈旧历史时间反复误判。
+# 结构导航：TimeKeeper（行 15 起）→ check_time_regression（行 74-103，回退检测
+#       并更新基线）→ elapsed（行 34-44，回退时归零）。
+# 输入：无（内部读 ROS 时间）；由 loop 节点驱动 start/stop/reset
+# 输出：elapsed / remaining / is_expired / regression_detected
+# =============================================================================
 """time_keeper.py — competition timer using ROS time (/clock when use_sim_time=true).
 
 Detects ROS time regression (sim clock jumping backwards) and exposes it

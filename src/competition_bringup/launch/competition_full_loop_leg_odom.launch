@@ -1,4 +1,18 @@
 <launch>
+  <!-- =====================================================================
+       中文说明（模块级）：competition_full_loop_leg_odom.launch —— 全链路装配
+       （腿式里程计校正版）
+
+       装配顺序：原始 Livox 点云 -> filter_livox -> FAST-LIO（/Odometry）；
+       A1 JointState + 躯干 IMU -> leg_odometry（/leg_odometry）；
+       两者汇入唯一 canonical 定位适配器（localization_node）得到 world->base；
+       再由 competition_system.launch 拉起感知/建图/规划/控制/任务状态机，
+       其中 localization_enabled 必须为 false，由本文件负责定位。
+
+       为什么用 wrapper 而不再改 production launch：定位链的"谁发布 world->base"
+       属于装配级决策，用 wrapper 表达可以保持 competition_system.launch 的
+       默认语义（MODE A）不被改写。
+       ===================================================================== -->
   <!--
     Self-contained full-loop bringup for the teammate-intended localization
     architecture:

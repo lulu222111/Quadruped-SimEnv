@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+# =============================================================================
+# 模块说明（中文）：frontier.py —— 纯函数式 Frontier 提取与选择
+#
+# 职责：在 OccupancyGrid 上找出"已知自由空间与未知空间的交界"格子，做 8 连通
+#       聚类，并按尺寸/距离/朝向（+可选房间偏置）选出最优簇，同时提供
+#       格 <-> 世界坐标的双向转换。
+# 为什么这样做：Frontier 是未知环境下"下一步去哪里"的最直接依据；把它做成无
+#       ROS 依赖的纯函数，才能用小型合成地图精确验证边界与打分逻辑。
+# 关键易错点：
+#   1) 坐标转换必须处理地图 origin 的 yaw（grid_cell_to_world / world_to_grid_cell
+#      行 125-154 与 241-271 是正/逆旋转的对照实现）。
+#   2) cluster_frontier_cells（行 69-106）会做确定性排序，因为上层以下标 0
+#      作为"代表格"的键，顺序不稳定会导致行为不可复现。
+#   3) select_best_frontier_cluster（行 156-239）的打分含朝向点积与房间偏置项，
+#      改动权重会直接改变探索路径。
+# 输入：grid data/width/height、分辨率与 origin、机器人位姿与候选参数
+# 输出：frontier 格列表/聚类/最优簇代表格、世界坐标
+# =============================================================================
 """Pure OccupancyGrid frontier extraction algorithms.
 
 This module deliberately has no ROS dependency so that the core algorithm can

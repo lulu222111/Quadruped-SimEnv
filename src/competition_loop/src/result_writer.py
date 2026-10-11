@@ -1,4 +1,23 @@
 #!/usr/bin/env python3
+# =============================================================================
+# 模块说明（中文）：result_writer.py —— detected_danger.json 结果写出
+#
+# 职责：收集通过门控的危险源候选，按官方 schema 写出 results/detected_danger.json。
+# 为什么用"临时文件 + 原子替换"：评估程序可能在任何时刻读取结果文件，必须保证
+#       读到的要么是完整旧版本、要么是完整新版本，绝不能看到写了一半的 JSON。
+#       因此先在同目录 mkstemp 写全并 flush，再用 os.replace 原子换名；异常时
+#       清理临时文件。
+# 关键约定：
+#   1) 只接受 frame_id == "world" 的候选（世界坐标变换由 router 负责），
+#      位置必须是有限数值；不满足即拒绝。
+#   2) 本模块绝不读取 danger_truth.json 或任何评估脚本/真值文件，输出格式即
+#      官方 schema（exploration_time + detected_danger_sources[].position）。
+# 结构导航：ResultWriter（行 23 起）→ accept_candidate（行 57-84，三重校验）
+#       → write（行 101-134，原子写）→ _build_output（行 136-152，输出格式唯一
+#       权威，可选调用聚合器生成最终源列表）。
+# 输入：已被 router 接受的候选、exploration_time
+# 输出：results/detected_danger.json
+# =============================================================================
 """result_writer.py — write detected_danger.json with atomic file replacement.
 
 This module only accepts HazardCandidates whose frame_id is "world" and

@@ -1,4 +1,24 @@
 #!/usr/bin/env python3
+# =============================================================================
+# 模块说明（中文）：localization_node —— 竞赛定位接口的 FAST-LIO 适配节点
+#
+# 职责：把 FAST-LIO 的 /Odometry（body 实为 IMU 帧）适配成竞赛冻结接口的
+#       /competition/localization/odom（world -> base），并作为该 TF 链上
+#       "唯一"的动态 world->base 发布者。
+# 为什么这样做：建图与规划需要的是"以 base 为原点、世界系水平、原点落在楼板上"
+#       的位姿；而 FAST-LIO 的 body 是 IMU 帧，因此必须显式补偿固定的
+#       base -> livox_imu_link 外参（compose_world_to_base 里的右乘逆变换），
+#       否则地图会整体倾斜/平移错位。
+# 关键约定：不使用 Gazebo 真值（/Odometry_gazebo、/ground_truth/*、
+#       /gazebo/get_model_state）做任何在线修正；校正只允许来自本体可观测源
+#       （腿式里程计），且时间戳不新鲜时 fail-closed（宁可不发布也不发错）。
+# 结构导航：四元数/齐次变换纯函数（行 74-236）→ transform_from_odom/
+#       compose_world_to_base（行 239-266，外参补偿核心）→ LocalizationAdapter
+#       节点主体（行 321 起）→ 校正状态机（行 738-888）→ 启动竖直参考
+#       （行 1260-1488，用 IMU 重力方向 + 启动期楼板回波定 z 原点）。
+# 输入：/Odometry（FAST-LIO）、可选校正里程计、启动期 trunk IMU 与原始点云
+# 输出：/competition/localization/odom、world->base TF、定位状态
+# =============================================================================
 """localization_node — FAST-LIO adapter for the competition localization interface.
 
 This node bridges FAST-LIO outputs to the team-frozen competition interface:

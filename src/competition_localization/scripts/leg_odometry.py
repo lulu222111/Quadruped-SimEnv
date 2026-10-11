@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+# =============================================================================
+# 模块说明（中文）：leg_odometry.py —— A1 腿式里程计（FAST-LIO 的校正源）
+#
+# 职责：只用自机本体感知（关节角/角速度 + 躯干 IMU）推算 10 Hz 的平面里程计
+#       （yaw + xy），发布到 /leg_odometry，供 localization_node 做高频校正。
+# 为什么这样做：仿真中 FAST-LIO 的位姿会缓慢漂移，而腿式里程计的短时平面精度
+#       更稳；但它只在"确有可靠支撑腿"时才可信，所以采用 fail-closed 策略。
+# 关键约定：发布一次校正必须同时满足——完整 JointState、源时间兼容的新鲜 IMU、
+#       且至少一条可靠支撑腿。任一条不满足就整帧跳过（绝不产生"新校正"），
+#       宁可让定位退化为纯 FAST-LIO，也不给出错误约束。
+# 结构导航：leg_fk/leg_jacobian（行 36-73，足端正运动学与雅可比）→
+#       LegOdometry（行 96 起）→ _js_cb 的源时间兼容门（行 242-289）→
+#       支撑腿筛选（行 314-334）→ ZUPT 状态机（行 341-368，静止时冻结积分
+#       位置，避免停车期间低通残差继续漂移）。
+# 输入：/joint_states(JointState)、坦克 IMU（/trunk_imu）
+# 输出：/leg_odometry(Odometry)
+# =============================================================================
 """Experimental A1 leg odometry used as a required FAST-LIO correction.
 
 Publishing requires a complete JointState sample paired with a fresh,

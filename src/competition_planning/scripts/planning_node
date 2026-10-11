@@ -1,5 +1,35 @@
 #!/usr/bin/env python3
 
+# =============================================================================
+# 模块说明（中文）：planning_node —— 自主探索/规划 ROS 编排节点
+#
+# 职责：订阅占据栅格、定位里程计、上游模块状态与比赛状态，维护"代际-故障"
+#       状态机，选择 Frontier 目标或执行确定性房间任务，管理有界主动视觉覆盖，
+#       并发布 /competition/path、/competition/navigation_goal、
+#       /competition/planning/status 与 /competition/planning/exploration_complete。
+# 为什么这样切分：与 ROS 无关的算法（frontier.py / path_planner.py /
+#       planning_core.py / visual_coverage.py）被剥离出去以便确定性验证；
+#       本文件只负责话题、状态机与"锁内提交"的发布纪律。
+# 关键设计（为什么不能简化）：
+#   1) 代际（generation）+ 故障模型：输入过期/时钟回退时推进 generation 并作废
+#      缓存，任何"计算期间发现已换代"的结果都会被丢弃，绝不发布陈旧路径
+#      （见 _observe_ros_time/_enter_new_generation 与 plan_callback 的门控）。
+#   2) 锁外计算、锁内复核提交：路径搜索与坐标变换在锁外完成，提交前再校验
+#      result_is_current，确保不会把过期快照写成运动指令。
+#   3) 接触学习（探索阶段）：物理楔住时把"撞到的横栏"记为学习障碍并叠加进
+#      地图副本，避免反复撞同一处；该学习只在探索阶段启用。
+#   4) 完成信号去抖：探索完成需要连续多次确认（exploration_complete_confirmations）
+#      且有终止扫描，避免瞬时"无 frontier"造成假完成。
+# 结构导航：常量 ROOM_MISSION_TARGETS（行 72-87）→ PlanningNode（行 103 起）
+#       → _load_parameters（行 330-749，参数 fail-fast 校验）→ 代际/故障
+#       （行 751-896）→ 房间任务与 Frontier 续程（行 898-1267）→ 视觉覆盖
+#       检查点与扫描（行 1273-1845）→ 接触学习（行 1923-2180）→ 卡死处理
+#       （行 2253-2303）→ 返航/探索完成（行 3393-4032）。
+# 输入：/competition/map、/competition/localization/odom、上游状态、比赛状态、
+#       /competition/planning/stuck、公开场景文件（team_scene_info.json）
+# 输出：/competition/path、导航目标、规划状态、探索完成信号
+# =============================================================================
+
 """ROS node for frontier exploration and grid-based path planning."""
 
 from __future__ import annotations

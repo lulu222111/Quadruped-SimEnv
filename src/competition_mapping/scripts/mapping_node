@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+# =============================================================================
+# 模块说明（中文）：mapping_node —— 2D 占据栅格的 ROS 安全封装
+#
+# 职责：把定位里程计 + LiDAR 点云（经带时间戳的 TF 查询）融合成一张固定尺寸的
+#       2D 占据栅格，发布 /competition/map 与 /competition/mapping/status。
+# 为什么这样设计：规划要求地图"可信"——宁可暂时不发新地图甚至冻结，也不能把
+#       过期/错帧/时钟回退的数据写进栅格。因此引入"代际（epoch）+ 故障"模型：
+#       输入过期或时间回退时进入故障并开启新一代，旧代候选一律不能被用于恢复，
+#       只有满足新代条件的数据才能解除故障。
+# 并发约定：时间戳 TF 查询与点云解码在锁外完成，融合前在锁内二次复核
+#       （代际/新鲜度/帧），避免长时间持锁同时仍拒绝过期快照；
+#       地图发布同样锁外构造、锁内用 map_version/epoch 校验后才提交。
+# 结构导航：MappingNode（行 25 起）→ 输入回调（行 231-457）→ 融合定时器
+#       （行 458-623，含 pending cloud 复用）→ _enter_fault_locked（行 670-716，
+#       代际模型中枢）→ 状态/地图定时器（行 786-925）。
+# 输入：/competition/localization/odom、点云、/competition/localization/status
+# 输出：/competition/map、/competition/mapping/status
+# =============================================================================
 """Safe ROS wrapper for the competition 2D occupancy-grid mapper."""
 
 from __future__ import annotations

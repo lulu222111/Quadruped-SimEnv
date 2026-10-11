@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# =============================================================================
+# 模块说明（中文）：perception_node —— RGB-D 危险源感知的 ROS 封装
+#
+# 职责：用 message_filters 近似同步订阅 RGB、深度图与各自的 CameraInfo，
+#       经过"新鲜度/代际/超时"状态机准入后，调用 perception_core 做检测，
+#       发布 /competition/hazard_candidates 与 /competition/perception/status。
+# 为什么把算法剥到 perception_core.py：检测与深度数学可以脱离 ROS 验证，
+#       本文件只承担订阅同步、代际闸门与发布纪律。
+# 关键设计：
+#   1) 两阶段准入：先做代际闸门（快速拒绝），处理完再在锁内复核 entry_generation，
+#      若期间已换代则丢弃本次结果，绝不把过期帧的检测结果发布出去。
+#   2) 时钟回退（rollback）：先发布一次 valid=false/TIMEOUT，随后重建同步订阅，
+#      使缓存时间戳与新一代对齐；aux_stamp_sane 会严格拒绝属于旧代际的辅助流。
+#   3) 深度编码：兼容 16UC1（毫米）与 32FC1（米），后者必须做可写拷贝。
+# 结构导航：PerceptionNode（行 128 起）→ 订阅装配/回滚重建（行 300-401）
+#       → valid_camera_info（行 428-483）→ aux_stamp_sane（行 485-567）
+#       → image_callback（行 571-947，同步主入口）→ build_candidate（行 949-972）
+#       → watchdog_callback（行 976-1025）→ depth_to_meters（行 1029-1069）。
+# 输入：/real_sense/rgb/image_raw、/real_sense/depth/image_raw 及 CameraInfo
+# 输出：/competition/hazard_candidates、/competition/perception/status
+# =============================================================================
 
 """
 perception_node — hazard source detection using RealSense RGB-D.
