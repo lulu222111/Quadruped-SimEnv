@@ -1,0 +1,37 @@
+# ROS / catkin build outputs
+/build/
+/devel/
+/install/
+/log/
+/logs/
+
+# Competition runtime outputs and judge truth files
+/generated_building/
+/results/
+
+# Runtime temporary files
+*.pid
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# IDE and operating system files
+.idea/
+.vscode/
+.DS_Store
+*~
+
+# Local setup logs, reports, downloads and temporary files
+/artifacts/
+
+# Local Docker Compose settings
+
+/.env

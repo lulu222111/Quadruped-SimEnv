@@ -1,0 +1,68 @@
+<launch>
+  <!-- =====================================================================
+       中文说明（模块级）：competition_full_loop_leg_odom.launch —— 全链路装配
+       （腿式里程计校正版）
+
+       装配顺序：原始 Livox 点云 -> filter_livox -> FAST-LIO（/Odometry）；
+       A1 JointState + 躯干 IMU -> leg_odometry（/leg_odometry）；
+       两者汇入唯一 canonical 定位适配器（localization_node）得到 world->base；
+       再由 competition_system.launch 拉起感知/建图/规划/控制/任务状态机，
+       其中 localization_enabled 必须为 false，由本文件负责定位。
+
+       为什么用 wrapper 而不再改 production launch：定位链的"谁发布 world->base"
+       属于装配级决策，用 wrapper 表达可以保持 competition_system.launch 的
+       默认语义（MODE A）不被改写。
+       ===================================================================== -->
+  <!--
+    Self-contained full-loop bringup for the teammate-intended localization
+    architecture:
+
+      raw Livox -> filter_livox -> FAST-LIO (/Odometry)
+      A1 JointState + trunk IMU -> leg_odometry (/leg_odometry)
+      FAST-LIO + leg odometry -> canonical localization adapter
+      canonical competition topics -> perception/mapping/planning/follower
+
+    This launch deliberately disables the second localization include in
+    competition_system.launch, leaving exactly one canonical adapter.  It
+    does not read Gazebo truth or expose private competition interfaces.
+  -->
+
+  <arg name="competition_mode" default="true" />
+  <arg name="auto_start" default="true" />
+  <arg name="team_scene_info_path" default="generated_building/team_scene_info.json" />
+  <!-- A08 showed that the 10-cell search still intermittently returned
+       reachable_frontier_count=0 even when an offline safe standoff existed.
+       Use the smallest radius that produced a route in the captured maps. -->
+  <arg name="planning_frontier_goal_search_radius_cells" default="11" />
+  <!-- A07 showed that a 4-cell guard can still select a 0.5 m local standoff
+       inside the visual tracker coverage radius, so the same frontier is
+       replanned indefinitely after covered checkpoints are suppressed.  On
+       the captured final map, guards 6, 10, and 11 still selected local
+       0.9 to 1.1 m routes; 12 cells is the smallest tested value that selects
+       a 3.5 m route to the next frontier cluster.  Keep this launch-only
+       value tied to the observed 1.0 m visual dedup radius, not to scene
+       coordinates or truth. -->
+  <arg name="planning_frontier_min_standoff_path_length_cells" default="12" />
+  <!-- Room-only visual scan zones (world metres); see competition_system. -->
+  <arg name="planning_room_scan_zones" default="" />
+
+  <include file="$(find competition_localization)/launch/localization_corrected.launch">
+    <arg name="rviz" value="false" />
+    <arg name="team_scene_info_path" value="$(arg team_scene_info_path)" />
+    <arg name="correction_enabled" value="true" />
+    <arg name="correction_mode" value="planar_relative" />
+  </include>
+
+  <include file="$(find competition_bringup)/launch/competition_system.launch">
+    <arg name="competition_mode" value="$(arg competition_mode)" />
+    <arg name="auto_start" value="$(arg auto_start)" />
+    <arg name="planning_frontier_goal_search_radius_cells"
+         value="$(arg planning_frontier_goal_search_radius_cells)" />
+    <arg name="planning_frontier_min_standoff_path_length_cells"
+         value="$(arg planning_frontier_min_standoff_path_length_cells)" />
+    <arg name="localization_enabled" value="false" />
+    <arg name="floor_lifecycle_enabled" value="true" />
+    <arg name="planning_room_scan_zones"
+         value="$(arg planning_room_scan_zones)" />
+  </include>
+</launch>

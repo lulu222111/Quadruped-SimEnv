@@ -1,0 +1,67 @@
+<?xml version="1.0"?>
+<!--
+  VALIDATION-ONLY wrapper — FLOOR0 clean full reproduction at
+  commit 3503f44e617385c56f264875575d8ca8b68c3b36
+  ("fix(building-generator): fully clear main entrance when open").
+
+  This file is an ARTIFACT, not production source.  It changes NO algorithm and
+  NO scene content.  It only *selects* parameters that already exist in
+  committed production launch files, exactly like
+  tools/baselines/floor0_4room_v1/floor0_4room_replay.launch (the frozen
+  floor0-4room-v1 baseline wrapper), with two documented differences:
+
+    1. /competition_loop/max_time is set AFTER the competition_system include,
+       so it actually overrides the node's hard-coded 600.0 s.  The frozen
+       baseline set it BEFORE the include and roslaunch let the node-local
+       <param> win, which bounded that run at 600 s.  This run must not be
+       hard-truncated at 600 s, so the override is placed last.
+
+    2. GUI is handled by the harness (auto.sh GUI=true), not here.
+
+  Frozen Floor0 configuration is unchanged from the validated baseline:
+    SEED=77  FLOOR_COUNT=1  ROOMS_PER_FLOOR=4
+    localization_corrected.launch  correction_enabled=true  correction_mode=planar_relative
+    competition_system.launch      localization_enabled=false
+                                   floor_lifecycle_enabled=true
+                                   planning_room_mission_enabled=true
+                                   planning_room_scan_zones = 4 boxes
+                                   planning_visual_scan_route_spacing=4.0
+-->
+<launch>
+
+  <arg name="max_time" default="7200.0" />
+  <arg name="team_scene_info_path" default="generated_building/team_scene_info.json" />
+
+  <!-- Room-only visual scan zones, world metres, recovered verbatim from
+       tools/baselines/floor0_4room_v1/floor0_4room_replay.launch:
+       [[1.1,9.5,7.9,21.9],[-9.5,-1.1,7.9,21.9],
+        [1.1,9.5,21.9,35.9],[-9.5,-1.1,21.9,35.9]] -->
+  <arg name="planning_room_scan_zones"
+       default="[[1.1,9.5,7.9,21.9],[-9.5,-1.1,7.9,21.9],[1.1,9.5,21.9,35.9],[-9.5,-1.1,21.9,35.9]]" />
+
+  <!-- 1. Canonical localization chain (the ONLY /competition/localization/odom
+          publisher in this run). -->
+  <include file="$(find competition_localization)/launch/localization_corrected.launch">
+    <arg name="rviz" value="false" />
+    <arg name="team_scene_info_path" value="$(arg team_scene_info_path)" />
+    <arg name="correction_enabled" value="true" />
+    <arg name="correction_mode" value="planar_relative" />
+  </include>
+
+  <!-- 2. Competition stack with the frozen Floor0 args. -->
+  <include file="$(find competition_bringup)/launch/competition_system.launch">
+    <arg name="competition_mode" value="true" />
+    <arg name="auto_start" value="true" />
+    <arg name="localization_enabled" value="false" />
+    <arg name="floor_lifecycle_enabled" value="true" />
+    <arg name="planning_room_mission_enabled" value="true" />
+    <arg name="planning_room_scan_zones" value="$(arg planning_room_scan_zones)" />
+    <arg name="planning_visual_scan_route_spacing" value="4.0" />
+  </include>
+
+  <!-- AFTER the include: overrides the node's hard-coded
+       <param name="max_time" value="600.0"/>.  Verified live with
+       `rosparam get /competition_loop/max_time` (recorded in params.txt). -->
+  <param name="/competition_loop/max_time" value="$(arg max_time)" />
+
+</launch>

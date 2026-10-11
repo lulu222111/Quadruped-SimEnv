@@ -1,0 +1,75 @@
+diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
+index fc41408..56f1682 100644
+--- a/src/laserMapping.cpp
++++ b/src/laserMapping.cpp
+@@ -792,6 +792,9 @@ int main(int argc, char** argv)
+     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
+     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
+ 
++    // Keep the MARSIM PointCloud2 preprocessor on the same radial range contract
++    // as the mapping configuration; this also bounds the later VoxelGrid input.
++    p_pre->det_range = DET_RANGE;
+     p_pre->lidar_type = lidar_type;
+     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
+     
+diff --git a/src/preprocess.cpp b/src/preprocess.cpp
+index cf4400d..2ed4fc7 100644
+--- a/src/preprocess.cpp
++++ b/src/preprocess.cpp
+@@ -1,10 +1,12 @@
+ #include "preprocess.h"
+ 
++#include <cmath>
++
+ #define RETURN0     0x00
+ #define RETURN0AND1 0x10
+ 
+ Preprocess::Preprocess()
+-  :feature_enabled(0), lidar_type(AVIA), blind(0.01), point_filter_num(1)
++  :feature_enabled(0), lidar_type(AVIA), blind(0.01), det_range(300.0), point_filter_num(1)
+ {
+   inf_bound = 10;
+   N_SCANS   = 6;
+@@ -465,13 +467,16 @@ void Preprocess::sim_handler(const sensor_msgs::PointCloud2::ConstPtr &msg) {
+     int plsize = pl_orig.size();
+     pl_surf.reserve(plsize);
+     for (int i = 0; i < pl_orig.points.size(); i++) {
+-        double range = pl_orig.points[i].x * pl_orig.points[i].x + pl_orig.points[i].y * pl_orig.points[i].y +
+-                       pl_orig.points[i].z * pl_orig.points[i].z;
+-        if (range < blind * blind) continue;
++        const double x = static_cast<double>(pl_orig.points[i].x);
++        const double y = static_cast<double>(pl_orig.points[i].y);
++        const double z = static_cast<double>(pl_orig.points[i].z);
++        const double range = std::hypot(std::hypot(x, y), z);
++        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
++            !std::isfinite(range) || !(range > blind && range <= det_range)) continue;
+         PointType added_pt;
+-        added_pt.x = pl_orig.points[i].x;
+-        added_pt.y = pl_orig.points[i].y;
+-        added_pt.z = pl_orig.points[i].z;
++        added_pt.x = static_cast<float>(x);
++        added_pt.y = static_cast<float>(y);
++        added_pt.z = static_cast<float>(z);
+         added_pt.intensity = 0.0;
+         added_pt.normal_x = 0;
+         added_pt.normal_y = 0;
+diff --git a/src/preprocess.h b/src/preprocess.h
+index 35f3833..5088db9 100644
+--- a/src/preprocess.h
++++ b/src/preprocess.h
+@@ -101,7 +101,7 @@ class Preprocess
+   vector<orgtype> typess[128]; //maximum 128 line lidar
+   float time_unit_scale;
+   int lidar_type, point_filter_num, N_SCANS, SCAN_RATE, time_unit;
+-  double blind;
++  double blind, det_range;
+   bool feature_enabled, given_offset_time;
+   ros::Publisher pub_full, pub_surf, pub_corn;
+     
+@@ -127,4 +127,4 @@ class Preprocess
+   double smallp_intersect, smallp_ratio;
+   double vx, vy, vz;
+ };
+-#endif
+\ No newline at end of file
++#endif

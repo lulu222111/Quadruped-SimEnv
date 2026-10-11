@@ -1,0 +1,1099 @@
+#!/usr/bin/env python3
+"""Fail-closed ROS adapter for the frozen elevator V1 contract.
+
+Readiness-gated phases (READY_TO_ENTER / RIDING / READY_TO_EXIT) are wired to
+the only authorised observable evidence: the official building services
+``/call_elevator`` and ``/set_door_state`` (see elevator_service_sequence.py).
+A cabin arrival is evidenced by ``/call_elevator`` reporting the commanded
+floor; an open hall door is evidenced by ``/set_door_state`` reporting the
+open state.  No timing inference, simulator truth, or hidden geometry is
+used.  With ``~service_evidence_enabled=false`` the readiness-gated phases
+remain unwired and the executor keeps the frozen fail-closed behaviour.
+
+The only metadata read from team_scene_info.json is the V1-authorized
+semantic contract: elevator ``id``/``served_floors`` and the public
+``door_ids`` (kind == "elevator") identifiers.  Exact poses, headings,
+layout metadata, world/SDF, and simulator truth are never read.
+
+中文说明：
+    电梯执行器的 ROS 适配层（契约 V1，fail-closed）。
+    消费 /competition/elevator/mission，输出 /competition/elevator/status，
+    并通过 /competition/path 接收规划层给出的 transit 局部路径。
+
+    阶段与证据：
+        READY_TO_ENTER / RIDING / READY_TO_EXIT 这些“就绪”阶段必须由正式可观测
+        证据驱动，证据唯一来自官方 /call_elevator 与 /set_door_state 的响应
+        （见 elevator_service_sequence.py）。不使用时间推断、仿真真值或隐藏
+        几何。~service_evidence_enabled=false 时这些阶段不接线，执行器保持
+        冻结的 fail-closed 行为。
+
+    运动所有权（单一 motion owner）：
+        执行器通过 /path_follower/execution_mode 参数仲裁普通路径跟随器：
+            normal    —— 正常探索/返航，path follower 拥有运动权；
+            precision —— ENTERING/EXITING 阶段，执行器接管受约束局部运动；
+            hold      —— 其余电梯阶段（等待/乘梯），path follower 停止输出。
+        任何时刻只有一个控制器真正发布 /cmd_vel。
+
+    线程模型：
+        官方服务调用可能阻塞数十秒（开门动画），因此放在独立 daemon 线程执行；
+        结果回到主锁内重新校验 mission 身份与阶段后再应用，避免阻塞 FSM 定时器。
+        绝不在 worker 线程里持锁做阻塞调用。
+
+    元数据边界：
+        只读公开 team_scene_info 的电梯 id/served_floors 与 door_ids
+        (kind == "elevator")；不读位姿、朝向、layout metadata、world/SDF 或真值。
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import threading
+
+import nav_msgs.msg
+import rospy
+import std_msgs.msg
+
+from competition_interfaces.msg import (
+    ElevatorMission,
+    ElevatorStatus,
+    ModuleStatus,
+)
+from elevator_executor_core import (
+    ElevatorExecutorCore,
+    ElevatorPhase,
+    ExecutorTimeouts,
+    Mission,
+)
+from elevator_service_sequence import (
+    EvidenceError,
+    apply_pre_enter_evidence,
+    apply_ride_evidence,
+    plan_pre_enter_steps,
+    plan_ride_steps,
+    TransitStep,
+)
+
+
+class DoorElevatorExecutorNode:
+    """中文：电梯执行器 ROS 适配层；核心判定委托 ElevatorExecutorCore。"""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+
+        self._team_scene_info_path = rospy.get_param(
+            "~team_scene_info_path",
+            "generated_building/team_scene_info.json",
+        )
+        elevator_catalog = self._load_elevator_catalog(
+            self._team_scene_info_path
+        )
+        # Public floor -> elevator-kind hall door id bindings from
+        # team_scene_info.public_scene.door_ids (authorised identifiers).
+        self._door_for_floor = self._load_door_bindings(
+            self._team_scene_info_path
+        )
+
+        self._core = ElevatorExecutorCore(
+            ExecutorTimeouts(
+                approach=self._positive_param(
+                    "~approach_timeout",
+                    90.0,
+                ),
+                ready_wait=self._positive_param(
+                    "~ready_wait_timeout",
+                    60.0,
+                ),
+                enter=self._positive_param(
+                    "~enter_timeout",
+                    20.0,
+                ),
+                in_cabin=self._positive_param(
+                    "~in_cabin_timeout",
+                    30.0,
+                ),
+                ride=self._positive_param(
+                    "~ride_timeout",
+                    90.0,
+                ),
+                exit=self._positive_param(
+                    "~exit_timeout",
+                    20.0,
+                ),
+            ),
+            elevator_catalog=elevator_catalog,
+        )
+
+        self._mission_accept_max_age = self._positive_param(
+            "~mission_accept_max_age",
+            5.0,
+        )
+        self._future_stamp_tolerance = self._positive_param(
+            "~future_stamp_tolerance",
+            0.2,
+        )
+        self._safety_input_grace = self._positive_param(
+            "~safety_input_grace",
+            2.0,
+        )
+        self._localization_status_timeout = self._positive_param(
+            "~localization_status_timeout",
+            1.0,
+        )
+        self._planning_status_timeout = self._positive_param(
+            "~planning_status_timeout",
+            3.0,
+        )
+        self._path_follower_status_timeout = self._positive_param(
+            "~path_follower_status_timeout",
+            1.0,
+        )
+        self._status_rate = self._positive_param(
+            "~status_rate",
+            10.0,
+        )
+
+        self._path_follower_mode_param = rospy.get_param(
+            "~path_follower_execution_mode_param",
+            "/path_follower/execution_mode",
+        )
+
+        # Official-service evidence wiring (competition pipeline).  When
+        # disabled, the executor retains the frozen fail-closed behaviour:
+        # readiness-gated phases remain unwired.
+        self._service_evidence_enabled = bool(
+            rospy.get_param("~service_evidence_enabled", True)
+        )
+        self._service_call_timeout = self._positive_param(
+            "~service_call_timeout",
+            60.0,
+        )
+        self._call_elevator_proxy = None
+        self._set_door_state_proxy = None
+        self._evidence_thread = None
+        self._evidence_mission_id = None
+        if self._service_evidence_enabled:
+            try:
+                from building_generator_interfaces.srv import (
+                    CallElevator,
+                    SetDoorState,
+                )
+
+                self._call_elevator_proxy = rospy.ServiceProxy(
+                    "/call_elevator", CallElevator, persistent=True
+                )
+                self._set_door_state_proxy = rospy.ServiceProxy(
+                    "/set_door_state", SetDoorState, persistent=True
+                )
+            except Exception as exc:
+                rospy.logerr(
+                    "elevator service proxies unavailable (%s); "
+                    "readiness evidence remains unwired fail-closed",
+                    exc,
+                )
+                self._service_evidence_enabled = False
+
+        self._mission_received_at = None
+        self._motion_path_stamp = None
+        self._motion_path_received_at = None
+
+        self._control_enabled = None
+        self._emergency_stop = None
+
+        self._localization_status = None
+        self._localization_status_received_at = None
+        self._planning_status = None
+        self._planning_status_received_at = None
+        self._path_follower_status = None
+        self._path_follower_status_received_at = None
+
+        self._status_pub = rospy.Publisher(
+            "/competition/elevator/status",
+            ElevatorStatus,
+            queue_size=10,
+            latch=True,
+        )
+
+        rospy.Subscriber(
+            "/competition/elevator/mission",
+            ElevatorMission,
+            self._on_mission,
+            queue_size=10,
+        )
+        rospy.Subscriber(
+            "/competition/path",
+            nav_msgs.msg.Path,
+            self._on_path,
+            queue_size=1,
+        )
+        rospy.Subscriber(
+            "/competition/control/path_follower_status",
+            ModuleStatus,
+            self._on_path_follower_status,
+            queue_size=10,
+        )
+        rospy.Subscriber(
+            "/competition/planning/status",
+            ModuleStatus,
+            self._on_planning_status,
+            queue_size=10,
+        )
+        rospy.Subscriber(
+            "/competition/localization/status",
+            ModuleStatus,
+            self._on_localization_status,
+            queue_size=10,
+        )
+        rospy.Subscriber(
+            "/competition/control_enabled",
+            std_msgs.msg.Bool,
+            self._on_control_enabled,
+            queue_size=10,
+        )
+        rospy.Subscriber(
+            "/competition/emergency_stop",
+            std_msgs.msg.Bool,
+            self._on_emergency_stop,
+            queue_size=10,
+        )
+
+        self._set_path_follower_mode("normal")
+        self._publish_status()
+
+        self._timer = rospy.Timer(
+            rospy.Duration(1.0 / self._status_rate),
+            self._on_timer,
+        )
+        rospy.on_shutdown(self._on_shutdown)
+
+        rospy.loginfo(
+            "door_elevator_executor loaded %d public elevator id(s) from %s",
+            len(elevator_catalog),
+            self._team_scene_info_path,
+        )
+
+    # ------------------------------------------------------------------
+    # Mission / path inputs
+    # ------------------------------------------------------------------
+
+    def _on_mission(self, msg):
+        with self._lock:
+            now = rospy.Time.now().to_sec()
+            mission = Mission(
+                int(msg.mission_id),
+                str(msg.elevator_id),
+                int(msg.source_floor),
+                int(msg.target_floor),
+                self._stamp_sec(msg.header.stamp),
+            )
+
+            # Envelope freshness is checked BEFORE mutating mission identity.
+            # A delayed/replayed message must not poison _last_mission_id or
+            # convert an otherwise idle executor into FAILED.
+            # 中文：先校验时间戳新鲜度再改动 mission 身份 —— 延迟/重放的消息
+            # 不得污染 _last_mission_id，也不得把空闲执行器误置为 FAILED。
+            stamp_error = self._validate_mission_stamp(
+                mission.stamp,
+                now,
+            )
+            if stamp_error is not None:
+                rospy.logwarn(
+                    "elevator mission rejected without state mutation: %s",
+                    stamp_error,
+                )
+                self._publish_status()
+                return
+
+            accepted, reason = self._core.accept_mission(
+                mission,
+                now,
+            )
+            if accepted:
+                self._mission_received_at = now
+                self._motion_path_stamp = None
+                self._motion_path_received_at = None
+                self._set_path_follower_mode("normal")
+                rospy.loginfo(
+                    (
+                        "elevator mission accepted: id=%u elevator=%s "
+                        "%d->%d"
+                    ),
+                    mission.mission_id,
+                    mission.elevator_id,
+                    mission.source_floor,
+                    mission.target_floor,
+                )
+            elif reason == "duplicate mission":
+                rospy.logdebug(
+                    "duplicate immutable elevator mission ignored"
+                )
+            elif reason.startswith("stale mission_id"):
+                rospy.logwarn("%s", reason)
+            elif self._core.phase == ElevatorPhase.FAILED:
+                self._set_path_follower_mode("hold")
+                rospy.logerr(
+                    "elevator mission rejected fail-closed: %s",
+                    reason,
+                )
+            else:
+                rospy.logwarn(
+                    "elevator mission rejected: %s",
+                    reason,
+                )
+
+            self._publish_status()
+
+    def _on_path(self, msg):
+        with self._lock:
+            if (
+                self._core.phase not in ElevatorPhase.MOTION
+                or self._core.mission is None
+            ):
+                return
+
+            stamp = self._stamp_sec(msg.header.stamp)
+            if (
+                not math.isfinite(stamp)
+                or stamp <= 0.0
+                or stamp + 1.0e-9 < self._core.mission.stamp
+            ):
+                return
+
+            now = rospy.Time.now().to_sec()
+
+            # Frozen generic path semantics: an empty Path cancels the current
+            # PathFollower route.  Ignore the initial empty cancellation that
+            # may be used to stop frontier exploration before the first
+            # elevator path is published.  Once this executor has observed a
+            # fresh non-empty transit path, a newer empty Path is a real
+            # cancellation and becomes FAILED because ElevatorStatus V1 has no
+            # CANCELLED phase.
+            if not msg.poses:
+                if (
+                    self._motion_path_stamp is not None
+                    and stamp + 1.0e-9 >= self._motion_path_stamp
+                ):
+                    self._fail(
+                        (
+                            "active elevator path cancelled by empty "
+                            "/competition/path"
+                        ),
+                        now,
+                    )
+                return
+
+            if msg.header.frame_id != "world":
+                self._fail(
+                    "elevator path frame_id must be world",
+                    now,
+                )
+                return
+
+            for index, pose_stamped in enumerate(msg.poses):
+                if pose_stamped.header.frame_id != "world":
+                    self._fail(
+                        (
+                            "elevator path pose {} frame_id "
+                            "must be world"
+                        ).format(index),
+                        now,
+                    )
+                    return
+
+            self._motion_path_stamp = stamp
+            self._motion_path_received_at = now
+
+    def _on_path_follower_status(self, msg):
+        with self._lock:
+            now = rospy.Time.now().to_sec()
+            self._path_follower_status = msg
+            self._path_follower_status_received_at = now
+
+            if self._core.phase not in ElevatorPhase.ACTIVE:
+                return
+            if self._motion_path_stamp is None:
+                return
+
+            status_stamp = self._stamp_sec(msg.header.stamp)
+
+            # Do not let an old pre-transit PathFollower status abort or
+            # complete the current transit path.
+            if (
+                not math.isfinite(status_stamp)
+                or status_stamp <= 0.0
+                or status_stamp + 1.0e-9 < self._motion_path_stamp
+            ):
+                return
+
+            if (
+                not bool(msg.valid)
+                or msg.state
+                in (
+                    ModuleStatus.BLOCKED,
+                    ModuleStatus.TIMEOUT,
+                    ModuleStatus.FAILED,
+                )
+            ):
+                self._fail(
+                    (
+                        "PathFollower invalid during elevator motion: "
+                        "{}"
+                    ).format(msg.detail or msg.state),
+                    now,
+                )
+                return
+
+            if msg.state != ModuleStatus.SUCCEEDED:
+                return
+
+            if self._core.phase == ElevatorPhase.APPROACHING:
+                self._core.mark_approach_complete(now)
+                self._clear_motion_path()
+                self._set_path_follower_mode("hold")
+                self._publish_status()
+                self._start_evidence_worker("pre_enter")
+            elif self._core.phase == ElevatorPhase.ENTERING:
+                self._core.mark_in_cabin(now)
+                self._clear_motion_path()
+                self._set_path_follower_mode("hold")
+                self._publish_status()
+                self._start_evidence_worker("ride")
+            elif self._core.phase == ElevatorPhase.EXITING:
+                self._core.mark_complete(now)
+                self._clear_motion_path()
+                self._set_path_follower_mode("normal")
+                self._publish_status()
+
+    # ------------------------------------------------------------------
+    # Safety inputs
+    # ------------------------------------------------------------------
+
+    def _on_planning_status(self, msg):
+        with self._lock:
+            now = rospy.Time.now().to_sec()
+            self._planning_status = msg
+            self._planning_status_received_at = now
+
+            if (
+                self._core.phase in ElevatorPhase.MOTION
+                and self._message_is_current(
+                    msg,
+                    now,
+                    self._planning_status_timeout,
+                )
+                and not bool(msg.valid)
+            ):
+                self._fail(
+                    (
+                        "Planning invalid during elevator motion: "
+                        "{}"
+                    ).format(msg.detail or "invalid"),
+                    now,
+                )
+
+    def _on_localization_status(self, msg):
+        with self._lock:
+            now = rospy.Time.now().to_sec()
+            self._localization_status = msg
+            self._localization_status_received_at = now
+
+            if (
+                self._core.phase in ElevatorPhase.ACTIVE
+                and self._message_is_current(
+                    msg,
+                    now,
+                    self._localization_status_timeout,
+                )
+                and not bool(msg.valid)
+            ):
+                self._fail(
+                    (
+                        "Localization invalid during elevator transit: "
+                        "{}"
+                    ).format(msg.detail or "invalid"),
+                    now,
+                )
+
+    def _on_control_enabled(self, msg):
+        with self._lock:
+            now = rospy.Time.now().to_sec()
+            self._control_enabled = bool(msg.data)
+            if (
+                self._core.phase in ElevatorPhase.ACTIVE
+                and not self._control_enabled
+            ):
+                self._fail(
+                    "control disabled during elevator transit",
+                    now,
+                )
+
+    def _on_emergency_stop(self, msg):
+        with self._lock:
+            now = rospy.Time.now().to_sec()
+            self._emergency_stop = bool(msg.data)
+            if (
+                self._core.phase in ElevatorPhase.ACTIVE
+                and self._emergency_stop
+            ):
+                self._fail(
+                    "emergency_stop active during elevator transit",
+                    now,
+                )
+
+    # ------------------------------------------------------------------
+    # Timer / watchdogs
+    # ------------------------------------------------------------------
+
+    def _on_timer(self, _event):
+        with self._lock:
+            now = rospy.Time.now().to_sec()
+            if now <= 0.0:
+                self._publish_status()
+                return
+
+            if self._core.phase in ElevatorPhase.ACTIVE:
+                self._check_safety(now)
+                if self._core.phase in ElevatorPhase.ACTIVE:
+                    self._core.tick(now)
+
+            self._sync_path_follower_mode()
+            self._publish_status()
+
+    def _check_safety(self, now):
+        if self._emergency_stop is True:
+            self._fail(
+                "emergency_stop active",
+                now,
+            )
+            return
+
+        if self._control_enabled is False:
+            self._fail(
+                "control disabled",
+                now,
+            )
+            return
+
+        age = (
+            now - self._mission_received_at
+            if self._mission_received_at is not None
+            else float("inf")
+        )
+        grace = age > self._safety_input_grace
+
+        if self._control_enabled is None and grace:
+            self._fail(
+                "missing /competition/control_enabled",
+                now,
+            )
+            return
+
+        if self._emergency_stop is None and grace:
+            self._fail(
+                "missing /competition/emergency_stop",
+                now,
+            )
+            return
+
+        if not self._status_is_fresh_valid(
+            self._localization_status,
+            self._localization_status_received_at,
+            now,
+            self._localization_status_timeout,
+        ):
+            if grace:
+                self._fail(
+                    (
+                        "localization status missing, stale, "
+                        "or invalid"
+                    ),
+                    now,
+                )
+            return
+
+        if self._core.phase in ElevatorPhase.MOTION:
+            if not self._status_is_fresh_valid(
+                self._planning_status,
+                self._planning_status_received_at,
+                now,
+                self._planning_status_timeout,
+            ):
+                if grace:
+                    self._fail(
+                        "planning status missing, stale, or invalid",
+                        now,
+                    )
+                return
+
+            # Before the first transit path arrives, APPROACHING is allowed to
+            # wait for Planning (bounded by the approach phase timeout).  Once
+            # a path has arrived, lack of a fresh PathFollower status is a
+            # fail-closed watchdog condition.
+            if self._motion_path_stamp is not None:
+                path_age = (
+                    now - self._motion_path_received_at
+                    if self._motion_path_received_at is not None
+                    else float("inf")
+                )
+                if not self._path_follower_status_is_current_valid(now):
+                    if path_age > self._path_follower_status_timeout:
+                        self._fail(
+                            (
+                                "PathFollower status missing, stale, "
+                                "old-generation, or invalid during "
+                                "elevator motion"
+                            ),
+                            now,
+                        )
+                    return
+
+    def _path_follower_status_is_current_valid(self, now):
+        msg = self._path_follower_status
+        if msg is None or self._path_follower_status_received_at is None:
+            return False
+        if not bool(msg.valid):
+            return False
+
+        stamp = self._stamp_sec(msg.header.stamp)
+        if (
+            not math.isfinite(stamp)
+            or stamp <= 0.0
+            or self._motion_path_stamp is None
+            or stamp + 1.0e-9 < self._motion_path_stamp
+        ):
+            return False
+        if (
+            now - self._path_follower_status_received_at
+            > self._path_follower_status_timeout
+        ):
+            return False
+        if now - stamp > self._path_follower_status_timeout:
+            return False
+        if stamp - now > self._future_stamp_tolerance:
+            return False
+        return True
+
+    def _status_is_fresh_valid(
+        self,
+        msg,
+        received_at,
+        now,
+        timeout,
+    ):
+        if (
+            msg is None
+            or received_at is None
+            or not bool(msg.valid)
+        ):
+            return False
+
+        stamp = self._stamp_sec(msg.header.stamp)
+        return (
+            math.isfinite(stamp)
+            and stamp > 0.0
+            and now - received_at <= timeout
+            and now - stamp <= timeout
+            and stamp - now <= self._future_stamp_tolerance
+        )
+
+    def _message_is_current(self, msg, now, timeout):
+        stamp = self._stamp_sec(msg.header.stamp)
+        if not math.isfinite(stamp) or stamp <= 0.0:
+            return False
+        if now - stamp > timeout:
+            return False
+        if stamp - now > self._future_stamp_tolerance:
+            return False
+        if (
+            self._core.mission is not None
+            and stamp + 1.0e-9 < self._core.mission.stamp
+        ):
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Outputs / Control-internal mode
+    # ------------------------------------------------------------------
+
+    def _sync_path_follower_mode(self):
+        """中文：按电梯阶段设置 path follower 的 execution_mode。
+        normal 表示跟随器拥有运动权；precision 表示执行器接管；
+        hold 表示电梯阶段中跟随器必须保持静止，保证单一 motion owner。
+        """
+        phase = self._core.phase
+        if phase in (
+            ElevatorPhase.IDLE,
+            ElevatorPhase.APPROACHING,
+            ElevatorPhase.COMPLETE,
+        ):
+            mode = "normal"
+        elif phase in (
+            ElevatorPhase.ENTERING,
+            ElevatorPhase.EXITING,
+        ):
+            mode = "precision"
+        else:
+            mode = "hold"
+        self._set_path_follower_mode(mode)
+
+    def _set_path_follower_mode(self, mode):
+        rospy.set_param(
+            self._path_follower_mode_param,
+            str(mode),
+        )
+
+    def _publish_status(self):
+        msg = ElevatorStatus()
+        msg.header.stamp = rospy.Time.now()
+        (
+            msg.mission_id,
+            msg.elevator_id,
+            msg.source_floor,
+            msg.target_floor,
+        ) = self._core.status_identity()
+        msg.phase = int(self._core.phase)
+        msg.valid = bool(self._core.valid)
+        msg.detail = str(self._core.detail)
+        self._status_pub.publish(msg)
+
+    def _fail(self, reason, now):
+        if self._core.phase != ElevatorPhase.FAILED:
+            self._core.fail(
+                reason,
+                now,
+            )
+            self._clear_motion_path()
+            self._set_path_follower_mode("hold")
+            rospy.logerr(
+                "door_elevator_executor failed closed: %s",
+                reason,
+            )
+            self._publish_status()
+
+    def _clear_motion_path(self):
+        self._motion_path_stamp = None
+        self._motion_path_received_at = None
+
+    # ------------------------------------------------------------------
+    # Official-service evidence wiring (competition pipeline)
+    # ------------------------------------------------------------------
+
+    def _start_evidence_worker(self, kind):
+        """Launch the authorised-service evidence sequence for a phase.
+
+        Service calls block for tens of seconds (door motion), so they run
+        on a dedicated daemon thread; the result is applied under the main
+        lock with mission-identity and phase re-validation.
+
+        中文：官方服务调用会阻塞数十秒，必须在独立 daemon 线程中执行并保证
+        同一时刻只有一个证据线程；返回后回到主锁内重新校验 mission id 与阶段，
+        防止对已过期/已失败的任务应用证据。
+        """
+        if not self._service_evidence_enabled:
+            return
+        mission = self._core.mission
+        if mission is None:
+            return
+        if (
+            self._evidence_thread is not None
+            and self._evidence_thread.is_alive()
+        ):
+            return
+
+        try:
+            if kind == "pre_enter":
+                steps = plan_pre_enter_steps(mission, self._door_for_floor)
+                expected_phase = ElevatorPhase.AT_APPROACH
+            else:
+                steps = plan_ride_steps(mission, self._door_for_floor)
+                expected_phase = ElevatorPhase.IN_CABIN
+        except EvidenceError as exc:
+            self._fail(str(exc), rospy.Time.now().to_sec())
+            return
+
+        self._evidence_mission_id = mission.mission_id
+        self._evidence_thread = threading.Thread(
+            target=self._run_evidence_sequence,
+            args=(kind, steps, expected_phase, mission.mission_id),
+            daemon=True,
+            name="elevator-evidence-{}".format(kind),
+        )
+        self._evidence_thread.start()
+
+    def _run_evidence_sequence(
+        self, kind, steps, expected_phase, mission_id
+    ):
+        """Execute the ordered official-service calls, then apply evidence."""
+        responses = {}
+        try:
+            for step in steps:
+                response = self._call_building_service(step)
+                responses[id(step)] = response
+        except Exception as exc:
+            self._fail_from_worker(
+                "official-service evidence call failed: {}".format(exc),
+                mission_id,
+            )
+            return
+
+        with self._lock:
+            now = rospy.Time.now().to_sec()
+            if now <= 0.0:
+                return
+            if self._core.mission is None or (
+                self._core.mission.mission_id != mission_id
+            ):
+                return
+            if self._core.phase in (ElevatorPhase.FAILED, ElevatorPhase.COMPLETE):
+                return
+
+            try:
+                if kind == "pre_enter":
+                    if self._core.phase != expected_phase:
+                        return
+                    apply_pre_enter_evidence(
+                        self._core,
+                        call_response=responses[id(steps[0])],
+                        door_response=responses[id(steps[1])],
+                        now=now,
+                    )
+                else:
+                    if self._core.phase != expected_phase:
+                        return
+                    apply_ride_evidence(
+                        self._core,
+                        close_response=responses[id(steps[0])],
+                        call_response=responses[id(steps[1])],
+                        door_response=responses[id(steps[2])],
+                        now=now,
+                    )
+            except (EvidenceError, RuntimeError) as exc:
+                self._fail(str(exc), now)
+                return
+
+            # ENTERING/EXITING engage precision transit control; the next
+            # Planning transit path resumes motion.
+            self._sync_path_follower_mode()
+            self._publish_status()
+
+    def _call_building_service(self, step):
+        """Invoke one official building service call (blocking, bounded)."""
+        if step.kind == TransitStep.CALL_ELEVATOR:
+            response = self._call_elevator_proxy.call(
+                elevator_id=step.elevator_id,
+                target_floor=step.target_floor,
+                open_doors=False,
+            )
+            return {
+                "accepted": bool(response.accepted),
+                "current_floor": int(response.current_floor),
+                "state": str(response.state),
+                "message": str(response.message),
+            }
+        response = self._set_door_state_proxy.call(
+            door_id=step.door_id,
+            open=bool(step.open),
+        )
+        return {
+            "accepted": bool(response.accepted),
+            "state": str(response.state),
+            "message": str(response.message),
+        }
+
+    def _fail_from_worker(self, reason, mission_id):
+        with self._lock:
+            if self._core.mission is None or (
+                self._core.mission.mission_id != mission_id
+            ):
+                return
+            now = rospy.Time.now().to_sec()
+            if now <= 0.0:
+                now = 0.0
+            self._fail(reason, now)
+
+    @staticmethod
+    def _load_door_bindings(path):
+        """Parse public floor -> elevator-kind hall door id bindings.
+
+        Only authorised public identifiers are consumed
+        (team_scene_info public_scene.door_ids, kind == "elevator").
+        """
+        with open(path, "r", encoding="utf-8") as stream:
+            document = json.load(stream)
+        public_scene = document.get("public_scene") or {}
+        door_entries = public_scene.get("door_ids") or []
+        bindings = {}
+        for entry in door_entries:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("kind", "")) != "elevator":
+                continue
+            floor = entry.get("floor_index")
+            door_id = str(entry.get("id", "")).strip()
+            if isinstance(floor, bool) or not isinstance(floor, int):
+                continue
+            if floor < 0 or not door_id:
+                continue
+            bindings[int(floor)] = door_id
+        return bindings
+
+    # ------------------------------------------------------------------
+    # Frozen-contract validation helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_elevator_catalog(path):
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                document = json.load(stream)
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "failed to read public team_scene_info.json '{}': {}".format(
+                    path,
+                    exc,
+                )
+            ) from exc
+
+        if not isinstance(document, dict):
+            raise ValueError("team_scene_info root must be an object")
+
+        public_scene = document.get("public_scene")
+        if not isinstance(public_scene, dict):
+            raise ValueError(
+                "team_scene_info public_scene must be an object"
+            )
+
+        elevators = public_scene.get("elevators")
+        if not isinstance(elevators, list):
+            raise ValueError(
+                "team_scene_info public_scene.elevators must be a list"
+            )
+
+        catalog = {}
+        for index, item in enumerate(elevators):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    "public elevator {} must be an object".format(index)
+                )
+
+            elevator_id = str(item.get("id", "")).strip()
+            served_floors = item.get("served_floors")
+
+            if not elevator_id:
+                raise ValueError(
+                    "public elevator {} has empty id".format(index)
+                )
+            if elevator_id in catalog:
+                raise ValueError(
+                    "duplicate public elevator id '{}'".format(
+                        elevator_id
+                    )
+                )
+            if not isinstance(served_floors, list):
+                raise ValueError(
+                    (
+                        "public elevator '{}' served_floors "
+                        "must be a list"
+                    ).format(elevator_id)
+                )
+
+            checked_floors = []
+            for floor in served_floors:
+                if isinstance(floor, bool) or not isinstance(floor, int):
+                    raise ValueError(
+                        (
+                            "public elevator '{}' served_floors "
+                            "must contain integers"
+                        ).format(elevator_id)
+                    )
+                if floor < 0:
+                    raise ValueError(
+                        (
+                            "public elevator '{}' served_floors "
+                            "must be non-negative"
+                        ).format(elevator_id)
+                    )
+                checked_floors.append(int(floor))
+
+            if not checked_floors:
+                raise ValueError(
+                    "public elevator '{}' has no served floors".format(
+                        elevator_id
+                    )
+                )
+
+            catalog[elevator_id] = checked_floors
+
+        if not catalog:
+            raise ValueError(
+                "team_scene_info exposes no public elevators"
+            )
+        return catalog
+
+    def _validate_mission_stamp(self, stamp, now):
+        if not math.isfinite(stamp) or stamp <= 0.0:
+            return (
+                "ElevatorMission header.stamp must be "
+                "non-zero and finite"
+            )
+        if now <= 0.0:
+            return "ROS time is not ready"
+
+        age = now - stamp
+        if age > self._mission_accept_max_age:
+            return "ElevatorMission is stale by {:.3f}s".format(age)
+        if age < -self._future_stamp_tolerance:
+            return (
+                "ElevatorMission timestamp is too far in the future"
+            )
+        return None
+
+    @staticmethod
+    def _stamp_sec(stamp):
+        try:
+            return float(stamp.to_sec())
+        except (AttributeError, TypeError, ValueError):
+            try:
+                return float(stamp)
+            except (TypeError, ValueError):
+                return float("nan")
+
+    @staticmethod
+    def _positive_param(name, default):
+        value = float(rospy.get_param(name, default))
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                "{} must be positive and finite".format(name)
+            )
+        return value
+
+    def _on_shutdown(self):
+        try:
+            self._set_path_follower_mode("hold")
+        except Exception:
+            pass
+
+
+def main():
+    rospy.init_node("door_elevator_executor")
+    try:
+        DoorElevatorExecutorNode()
+    except (TypeError, ValueError) as exc:
+        rospy.logfatal(
+            "door_elevator_executor configuration error: %s",
+            exc,
+        )
+        return 2
+
+    rospy.loginfo(
+        (
+            "door_elevator_executor V1 ready; "
+            "readiness-dependent phases are fail-closed"
+        )
+    )
+    rospy.spin()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

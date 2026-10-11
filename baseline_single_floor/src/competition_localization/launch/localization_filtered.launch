@@ -1,0 +1,65 @@
+<launch>
+  <!--
+    localization_filtered.launch : 调试用，让 FAST-LIO 消费过滤后的点云。
+    与 localization_bringup.launch 相同，但 /common/lid_topic 指向
+    /livox/Pointcloud2_filtered（由包内 scripts/filter_livox.py 发布）。
+
+    用法:
+      rosrun competition_localization filter_livox.py
+      roslaunch competition_localization localization_filtered.launch
+  -->
+
+  <arg name="rviz" default="false" />
+  <arg name="lid_topic" default="/livox/Pointcloud2_filtered" />
+  <arg name="imu_topic" default="/livox/imu" />
+  <arg name="odom_input_topic" default="/Odometry" />
+  <arg name="team_scene_info_path" default="generated_building/team_scene_info.json" />
+  <arg name="filter_size_surf" default="0.2" />
+  <arg name="filter_size_map" default="0.3" />
+  <arg name="correction_enabled" default="false" />
+  <arg name="correction_odom_topic" default="/c2r28/proprio_fastlio_shadow/odom" />
+  <arg name="correction_mode" default="full_pose" />
+
+  <rosparam command="load" file="$(find fast_lio)/config/mid360_sim.yaml" />
+
+  <!-- 覆盖 lid_topic 到过滤后的话题（FAST-LIO 按 /common/lid_topic 订阅） -->
+  <param name="common/lid_topic" type="string" value="$(arg lid_topic)" />
+
+  <!-- 生产外参修正（同 localization_bringup.launch） -->
+  <rosparam param="mapping/extrinsic_T" subst_value="True">[0.011, 0.02329, -0.04412]</rosparam>
+  <rosparam param="mapping/extrinsic_R" subst_value="True">[1, 0, 0,
+                                                             0, 1, 0,
+                                                             0, 0, 1]</rosparam>
+  <param name="mapping/extrinsic_est_en" type="bool" value="false" />
+  <param name="feature_extract_enable" type="bool" value="0"/>
+  <param name="point_filter_num" type="int" value="3"/>
+  <param name="max_iteration" type="int" value="3" />
+  <param name="filter_size_surf" type="double" value="$(arg filter_size_surf)" />
+  <param name="filter_size_map" type="double" value="$(arg filter_size_map)" />
+  <param name="cube_side_length" type="double" value="1000" />
+  <param name="runtime_pos_log_enable" type="bool" value="0" />
+  <param name="pcd_save/pcd_save_en" type="bool" value="false" />
+
+  <node pkg="fast_lio" type="fastlio_mapping" name="laserMapping" output="screen"
+        respawn="false">
+    <remap from="/livox/lidar" to="$(arg lid_topic)" />
+    <remap from="/livox/imu" to="$(arg imu_topic)" />
+  </node>
+
+  <node pkg="competition_localization" type="localization_node" name="localization"
+        output="screen" respawn="false">
+    <param name="odom_input_topic" value="$(arg odom_input_topic)" />
+    <param name="team_scene_info_path" value="$(arg team_scene_info_path)" />
+    <param name="publish_tf" value="true" />
+    <param name="correction_enabled" value="$(arg correction_enabled)" />
+    <param name="correction_odom_topic" value="$(arg correction_odom_topic)" />
+    <param name="correction_mode" value="$(arg correction_mode)" />
+    <rosparam param="base_to_imu_translation">[0.223404, -0.023290, 0.118985]</rosparam>
+    <rosparam param="base_to_imu_rotation_rpy">[0.0, 0.785, 0.0]</rosparam>
+  </node>
+
+  <group if="$(arg rviz)">
+    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz"
+          args="-d $(find fast_lio)/rviz_cfg/loam_livox.rviz" />
+  </group>
+</launch>

@@ -1,0 +1,1109 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+perception_node — hazard source detection using RealSense RGB-D.
+
+Allowed inputs:
+  /real_sense/rgb/image_raw        sensor_msgs/Image
+  /real_sense/rgb/camera_info      sensor_msgs/CameraInfo
+  /real_sense/depth/image_raw      sensor_msgs/Image
+  /real_sense/depth/camera_info    sensor_msgs/CameraInfo
+
+Processing:
+  1. synchronize RGB image, RGB CameraInfo, depth image and depth
+     CameraInfo (approximate time sync);
+  2. run the freshness / generation / timeout state machine on the
+     observation stamps (see perception_core.ObservationGate);
+  3. convert the RGB image to HSV and extract red / green masks;
+  4. denoise the masks morphologically;
+  5. extract contours and compute area, circularity and aspect ratio;
+  6. read the median depth near each contour centroid;
+  7. back-project the centroid onto the depth camera frame using the
+     depth CameraInfo intrinsics;
+  8. classify each object (red_sphere / red_box / green_sphere) and
+     publish /competition/hazard_candidates;
+  9. publish /competition/perception/status.
+
+Status semantics (contract v0.2.0):
+  STARTING, valid=false  — no accepted observation yet;
+  RUNNING,  valid=true   — a fresh current-generation RGB-D pair was
+                           accepted; may carry zero candidates;
+  TIMEOUT,  valid=false  — input timed out or ROS /clock rolled back;
+                           recovery requires a fresh current-generation
+                           observation.
+
+Both the input timeout and a ROS /clock rollback start a NEW local
+generation (see perception_core.ObservationGate): the transition instant
+becomes the generation boundary and observations stamped at or before
+it are never consumed.  A rollback additionally publishes the single
+TIMEOUT/valid=false status immediately (while holding the state lock,
+BEFORE any subscription work) and then drops the message_filters
+synchronizer and its queued old-timeline buffers by unregistering the
+subscribers and rebuilding the subscriptions; while that reset is
+pending, no observation may be accepted.
+
+Concurrency: rospy.Timer callbacks run on a dedicated thread, so the
+watchdog and the synchronized image callback execute concurrently.  All
+shared-state access is serialized with ``self._lock``, every
+``rospy.Time.now()`` sample that feeds ``ObservationGate.check_clock``
+is taken while holding that lock (so thread interleavings can never
+make a monotonic clock look like a rollback), and each image callback
+records the generation it was admitted into so that an in-flight frame
+is dropped when a transition happens while it is being processed.
+
+A single malformed frame (bad timestamp, conversion failure, invalid
+CameraInfo) is skipped without invalidating the module: `valid` is the
+authoritative usability gate and the watchdog owns invalidation, so
+transient per-frame errors do not churn downstream consumers.
+
+The pipeline logic lives in perception_core.py so it can be exercised
+by deterministic unit tests without ROS or Gazebo.
+
+中文说明：
+    基于 RealSense RGB-D 的危险源检测节点。
+
+    数据流：
+        RGB 图 + RGB CameraInfo + 深度图 + 深度 CameraInfo（近似时间同步）
+        -> ObservationGate 判定观测是否新鲜/属于当前世代
+        -> HSV 颜色掩膜 -> 形态学去噪 -> 轮廓几何特征
+        -> 轮廓质心附近取中值深度 -> 用深度内参反投影为 3D 点
+        -> 分类（red_sphere / red_box / green_sphere）
+        -> 发布 /competition/hazard_candidates 与 /competition/perception/status
+
+    状态语义（契约 v0.2.0）：
+        STARTING valid=false —— 尚无被接受的观测；
+        RUNNING  valid=true  —— 已接受一组新鲜且属于当前世代的 RGB-D，
+                                候选数量可以为零；
+        TIMEOUT  valid=false —— 输入超时或 /clock 回退，恢复需要新的当前世代观测。
+
+    职责边界：
+        本节点只负责“产生观测候选”；跨帧/跨楼层去重与结果写入由
+        competition_loop 的 hazard_candidate_router / result_writer 负责。
+
+    并发：
+        watchdog 定时器与图像同步回调在不同线程，所有共享状态由 self._lock 串行化；
+        单个坏帧（时间戳异常/转换失败/CameraInfo 非法）只跳过该帧，不使模块失效 ——
+        valid 才是权威可用性门，失效由 watchdog 统一负责。
+"""
+
+from __future__ import annotations
+
+import math
+import sys
+import threading
+from pathlib import Path
+
+import cv2
+import message_filters
+import numpy as np
+import rospy
+
+from cv_bridge import CvBridge, CvBridgeError
+from sensor_msgs.msg import CameraInfo, Image
+
+from competition_interfaces.msg import (
+    HazardCandidate,
+    HazardCandidateArray,
+    ModuleStatus,
+)
+
+# Make the sibling pure-logic module importable (same directory in the
+# source tree, the devel space and the installed lib/<pkg> directory).
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+import perception_core  # noqa: E402
+
+
+def _validated_float_param(name, value, minimum, exclusive_minimum):
+    """
+    Validate a numeric ROS parameter and return it as float.
+
+    Raises ValueError with a clear message when the value is not a
+    finite number or does not satisfy the minimum bound, so that a
+    misconfigured launch fails fast instead of silently misbehaving.
+    """
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "parameter %s must be numeric, got %r" % (name, value)
+        )
+
+    if not math.isfinite(value):
+        raise ValueError(
+            "parameter %s must be finite, got %r" % (name, value)
+        )
+
+    if exclusive_minimum and value <= minimum:
+        raise ValueError(
+            "parameter %s must be > %s, got %r" % (name, minimum, value)
+        )
+
+    if not exclusive_minimum and value < minimum:
+        raise ValueError(
+            "parameter %s must be >= %s, got %r" % (name, minimum, value)
+        )
+
+    return value
+
+
+class PerceptionNode(object):
+    """ROS wrapper around the pure perception_core logic."""
+
+    def __init__(self):
+        rospy.init_node(
+            "perception_node",
+            log_level=rospy.INFO,
+        )
+
+        self.bridge = CvBridge()
+
+        # RealSense topics.
+        self.rgb_topic = rospy.get_param(
+            "~rgb_topic",
+            "/real_sense/rgb/image_raw",
+        )
+
+        self.rgb_info_topic = rospy.get_param(
+            "~rgb_info_topic",
+            "/real_sense/rgb/camera_info",
+        )
+
+        self.depth_topic = rospy.get_param(
+            "~depth_topic",
+            "/real_sense/depth/image_raw",
+        )
+
+        self.depth_info_topic = rospy.get_param(
+            "~depth_info_topic",
+            "/real_sense/depth/camera_info",
+        )
+
+        # Output topics.
+        self.candidate_pub = rospy.Publisher(
+            "/competition/hazard_candidates",
+            HazardCandidateArray,
+            queue_size=10,
+        )
+
+        self.status_pub = rospy.Publisher(
+            "/competition/perception/status",
+            ModuleStatus,
+            queue_size=10,
+            latch=True,
+        )
+
+        # Algorithm parameters (validated: fail fast on bad config).
+        self.min_contour_area = _validated_float_param(
+            "~min_contour_area",
+            rospy.get_param("~min_contour_area", 150.0),
+            0.0,
+            exclusive_minimum=True,
+        )
+
+        self.min_depth = _validated_float_param(
+            "~min_depth",
+            rospy.get_param("~min_depth", 0.4),
+            0.0,
+            exclusive_minimum=False,
+        )
+
+        self.max_depth = _validated_float_param(
+            "~max_depth",
+            rospy.get_param("~max_depth", 8.0),
+            0.0,
+            exclusive_minimum=True,
+        )
+
+        if not (self.max_depth > self.min_depth):
+            raise ValueError(
+                "parameter ~max_depth must be > ~min_depth, got "
+                "max_depth=%r min_depth=%r"
+                % (self.max_depth, self.min_depth)
+            )
+
+        # Freshness / watchdog parameters (module-internal, tunable).
+        self.input_timeout_sec = _validated_float_param(
+            "~input_timeout_sec",
+            rospy.get_param("~input_timeout_sec", 1.0),
+            0.0,
+            exclusive_minimum=True,
+        )
+
+        self.watchdog_period_sec = _validated_float_param(
+            "~watchdog_period_sec",
+            rospy.get_param("~watchdog_period_sec", 0.1),
+            0.0,
+            exclusive_minimum=True,
+        )
+
+        self.future_stamp_tolerance_sec = _validated_float_param(
+            "~future_stamp_tolerance_sec",
+            rospy.get_param("~future_stamp_tolerance_sec", 0.5),
+            0.0,
+            exclusive_minimum=False,
+        )
+
+        self.max_input_age_sec = _validated_float_param(
+            "~max_input_age_sec",
+            rospy.get_param("~max_input_age_sec", 1.0),
+            0.0,
+            exclusive_minimum=True,
+        )
+
+        # HSV thresholds.
+        self.red_lower_1 = np.array([0, 80, 60], dtype=np.uint8)
+        self.red_upper_1 = np.array([10, 255, 255], dtype=np.uint8)
+        self.red_lower_2 = np.array([170, 80, 60], dtype=np.uint8)
+        self.red_upper_2 = np.array([179, 255, 255], dtype=np.uint8)
+        self.green_lower = np.array([35, 60, 50], dtype=np.uint8)
+        self.green_upper = np.array([90, 255, 255], dtype=np.uint8)
+
+        # Shared state + lock.  rospy.Timer callbacks run on a dedicated
+        # thread, so the watchdog and the synchronized image callback can
+        # execute concurrently.  Every shared-state read/modify below is
+        # serialized with this lock; every rospy.Time.now() sample that
+        # feeds ObservationGate.check_clock is taken while holding it, so
+        # thread interleavings can never pass a decreasing time sequence
+        # to the gate (no false rollbacks).  Status messages caused by
+        # state transitions (TIMEOUT / rollback) are published while
+        # holding the lock too, so the published status can never
+        # contradict the current state.
+        self.gate = perception_core.ObservationGate(
+            timeout_sec=self.input_timeout_sec,
+            future_tolerance_sec=self.future_stamp_tolerance_sec,
+            max_input_age_sec=self.max_input_age_sec,
+        )
+        self._lock = threading.RLock()
+
+        # True between a rollback being detected and the synchronized
+        # subscriptions being rebuilt.  While set, image callbacks must
+        # not accept observations or publish RUNNING/valid=true.
+        self.rollback_reset_pending = False
+
+        # Synchronized subscriptions (also rebuilt after a clock
+        # rollback, see _reset_subscriptions_after_rollback).
+        self._subscribers = []
+        self._sync = None
+        self._setup_subscriptions()
+
+        self.watchdog_timer = rospy.Timer(
+            rospy.Duration(self.watchdog_period_sec),
+            self.watchdog_callback,
+        )
+
+        self.publish_status(
+            ModuleStatus.STARTING,
+            False,
+            0.0,
+            (
+                "waiting for synchronized RGB image, RGB CameraInfo, "
+                "depth image and depth CameraInfo"
+            ),
+        )
+
+        rospy.loginfo("perception_node started")
+        rospy.loginfo("RGB image topic: %s", self.rgb_topic)
+        rospy.loginfo("RGB CameraInfo topic: %s", self.rgb_info_topic)
+        rospy.loginfo("Depth image topic: %s", self.depth_topic)
+        rospy.loginfo(
+            "Depth CameraInfo topic: %s",
+            self.depth_info_topic,
+        )
+        rospy.loginfo(
+            "Output candidate topic: /competition/hazard_candidates"
+        )
+        rospy.loginfo(
+            "Output status topic: /competition/perception/status"
+        )
+
+    # -- synchronized subscriptions --------------------------------------
+
+    def _setup_subscriptions(self):
+        """Create the four synchronized subscriptions."""
+
+        rgb_sub = message_filters.Subscriber(self.rgb_topic, Image)
+        rgb_info_sub = message_filters.Subscriber(
+            self.rgb_info_topic,
+            CameraInfo,
+        )
+        depth_sub = message_filters.Subscriber(self.depth_topic, Image)
+        depth_info_sub = message_filters.Subscriber(
+            self.depth_info_topic,
+            CameraInfo,
+        )
+
+        self._sync = message_filters.ApproximateTimeSynchronizer(
+            [
+                rgb_sub,
+                rgb_info_sub,
+                depth_sub,
+                depth_info_sub,
+            ],
+            queue_size=20,
+            slop=0.20,
+            allow_headerless=False,
+        )
+
+        self._sync.registerCallback(self.image_callback)
+        self._subscribers = [
+            rgb_sub,
+            rgb_info_sub,
+            depth_sub,
+            depth_info_sub,
+        ]
+
+    def _teardown_subscriptions(self):
+        """
+        Unsubscribe the current subscribers and drop the synchronizer
+        reference so its per-stamp queues are released.
+
+        message_filters.Subscriber.unregister() delegates to
+        rospy.Subscriber.unregister() (idempotent); this was verified
+        against the Noetic implementation at
+        /opt/ros/noetic/lib/python3/dist-packages/message_filters/
+        __init__.py.
+        """
+
+        for sub in getattr(self, "_subscribers", []):
+            try:
+                sub.unregister()
+            except Exception:
+                rospy.logwarn_throttle(
+                    5.0,
+                    "failed to unregister message_filters subscriber "
+                    "on %s",
+                    getattr(sub, "topic", "unknown"),
+                )
+
+        self._subscribers = []
+        self._sync = None
+
+    def _reset_subscriptions_after_rollback(self):
+        """
+        Rebuild the synchronized subscriptions after a ROS /clock
+        rollback.
+
+        Callers MUST have already, while holding the state lock:
+        invalidated the gate (new generation), set
+        ``rollback_reset_pending`` and published the single
+        TIMEOUT/valid=false status — so downstream sees the
+        invalidation BEFORE the subscription reset runs.  This method
+        itself is called WITHOUT the lock (network I/O) and must not
+        publish anything.
+
+        This also guarantees that old-timeline messages queued inside
+        message_filters can never be delivered to a callback in the new
+        generation: the old subscribers are unsubscribed and the old
+        synchronizer queues are released.  In-flight callbacks from the
+        old synchronizer are still rejected by the gate (generation
+        snapshot + future stamp check).
+
+        Returns True on success and clears ``rollback_reset_pending``
+        under the lock.  On failure the flag stays set, the module stays
+        invalid (no recovery is possible while the flag is set) and a
+        retry is attempted from the next watchdog tick.
+        """
+
+        try:
+            self._teardown_subscriptions()
+            self._setup_subscriptions()
+        except Exception as exc:
+            rospy.logerr(
+                "failed to reset synchronized subscriptions after "
+                "ROS clock rollback; perception will stay invalid "
+                "until a retry succeeds: %s",
+                str(exc),
+            )
+            return False
+
+        with self._lock:
+            self.rollback_reset_pending = False
+
+        return True
+
+    # -- status publishing -----------------------------------------------
+
+    def publish_status(
+        self,
+        state,
+        valid,
+        confidence,
+        detail,
+    ):
+        """Publish a ModuleStatus message.  Callers that mutate shared
+        state must invoke this while holding the state lock so the
+        message order matches the state transition order."""
+
+        msg = ModuleStatus()
+
+        msg.header.stamp = rospy.Time.now()
+        msg.state = state
+        msg.valid = bool(valid)
+        msg.confidence = perception_core.clamp_confidence(confidence)
+        msg.detail = str(detail)
+
+        self.status_pub.publish(msg)
+
+    # -- input validation ------------------------------------------------
+
+    def valid_camera_info(self, camera_info, name):
+        """
+        Check that a CameraInfo carries usable intrinsics and a frame.
+        """
+
+        if camera_info is None:
+            return False
+
+        if len(camera_info.K) < 9:
+            rospy.logwarn_throttle(
+                5.0,
+                "%s CameraInfo.K has fewer than 9 elements",
+                name,
+            )
+            return False
+
+        try:
+            fx = float(camera_info.K[0])
+            fy = float(camera_info.K[4])
+            cx = float(camera_info.K[2])
+            cy = float(camera_info.K[5])
+        except (TypeError, ValueError):
+            rospy.logwarn_throttle(
+                5.0,
+                "%s CameraInfo intrinsics are not numeric",
+                name,
+            )
+            return False
+
+        if not all(math.isfinite(value) for value in (fx, fy, cx, cy)):
+            rospy.logwarn_throttle(
+                5.0,
+                "%s CameraInfo intrinsics are not finite",
+                name,
+            )
+            return False
+
+        if fx <= 0.0 or fy <= 0.0:
+            rospy.logwarn_throttle(
+                5.0,
+                "%s CameraInfo has invalid focal length: fx=%f fy=%f",
+                name,
+                fx,
+                fy,
+            )
+            return False
+
+        if not camera_info.header.frame_id:
+            rospy.logwarn_throttle(
+                5.0,
+                "%s CameraInfo has empty frame_id",
+                name,
+            )
+            return False
+
+        return True
+
+    def aux_stamp_sane(self, stamp, name):
+        """
+        Validate one stream of the synchronized set: every one of the
+        four inputs (RGB image, RGB CameraInfo, depth image, depth
+        CameraInfo) must belong to the current generation, i.e. satisfy:
+
+          * nonzero;
+          * not far in the future (future tolerance);
+          * not stale (max input age);
+          * strictly after the generation boundary when one exists.
+
+        This intentionally does NOT apply the primary monotonic rules
+        (duplicate / out-of-order): those belong to the depth
+        observation stamp alone via ObservationGate.evaluate().  Any
+        auxiliary violation rejects the whole synchronized set, because
+        consuming a mixed-generation frame would poison the sync window.
+
+        The current time and the boundary are read while holding the
+        state lock so all clock reads share one serialized view.
+        """
+
+        if stamp == rospy.Time(0):
+            rospy.logwarn_throttle(
+                5.0,
+                "ignoring synchronized set: %s has zero timestamp",
+                name,
+            )
+            return False
+
+        with self._lock:
+            now = rospy.Time.now()
+            generation_start_stamp = self.gate.generation_start_stamp
+
+        if now == rospy.Time(0):
+            return True
+
+        stamp_sec = stamp.to_sec()
+        now_sec = now.to_sec()
+
+        if stamp_sec > now_sec + self.future_stamp_tolerance_sec:
+            rospy.logwarn_throttle(
+                5.0,
+                (
+                    "ignoring synchronized set: %s timestamp is too far "
+                    "in the future: stamp=%.6f now=%.6f"
+                ),
+                name,
+                stamp_sec,
+                now_sec,
+            )
+            return False
+
+        if stamp_sec < now_sec - self.max_input_age_sec:
+            rospy.logwarn_throttle(
+                5.0,
+                (
+                    "ignoring synchronized set: %s timestamp is stale: "
+                    "stamp=%.6f now=%.6f max_age=%.3f"
+                ),
+                name,
+                stamp_sec,
+                now_sec,
+                self.max_input_age_sec,
+            )
+            return False
+
+        if (
+            generation_start_stamp is not None
+            and stamp_sec <= generation_start_stamp
+        ):
+            rospy.logwarn_throttle(
+                5.0,
+                (
+                    "ignoring synchronized set: %s timestamp is "
+                    "pre-generation: stamp=%.6f boundary=%.6f"
+                ),
+                name,
+                stamp_sec,
+                generation_start_stamp,
+            )
+            return False
+
+        return True
+
+    # -- synchronized callback -------------------------------------------
+
+    def image_callback(
+        self,
+        rgb_msg,
+        rgb_info_msg,
+        depth_msg,
+        depth_info_msg,
+    ):
+        """Synchronized RGB-D processing entry point."""
+
+        # Clock rollback check + generation snapshot.  Both must be
+        # taken under the lock, with the time sampled inside it, so a
+        # concurrent watchdog tick can never make this callback observe
+        # a decreasing clock (false rollback), and the frame is bound
+        # to the generation it was admitted into.  On rollback the
+        # invalidation status is published and the reset is marked
+        # pending BEFORE the subscriptions are rebuilt.
+        rollback_detail = None
+        reset_pending = False
+
+        with self._lock:
+            now_sec = rospy.Time.now().to_sec()
+            rollback_detail = self.gate.check_clock(now_sec)
+            entry_generation = self.gate.generation_id
+
+            if rollback_detail is not None:
+                self.rollback_reset_pending = True
+                self.publish_status(
+                    ModuleStatus.TIMEOUT,
+                    False,
+                    0.0,
+                    rollback_detail,
+                )
+            else:
+                reset_pending = self.rollback_reset_pending
+
+        if rollback_detail is not None:
+            self._reset_subscriptions_after_rollback()
+            return
+
+        if reset_pending:
+            rospy.logwarn_throttle(
+                5.0,
+                (
+                    "ignoring RGB-D observation: synchronized "
+                    "subscriptions are being reset after a ROS clock "
+                    "rollback"
+                ),
+            )
+            return
+
+        # The depth stamp is the observation time for all outputs.
+        observation_stamp = depth_msg.header.stamp
+
+        for stamp, name in (
+            (rgb_msg.header.stamp, "RGB image"),
+            (rgb_info_msg.header.stamp, "RGB CameraInfo"),
+            (depth_msg.header.stamp, "depth image"),
+            (depth_info_msg.header.stamp, "depth CameraInfo"),
+        ):
+            if not self.aux_stamp_sane(stamp, name):
+                return
+
+        # Positions are produced from the depth stream, so candidates are
+        # expressed in the depth camera frame.
+        observation_frame = depth_info_msg.header.frame_id
+
+        if not observation_frame:
+            rospy.logwarn_throttle(
+                5.0,
+                "ignoring synchronized set: depth CameraInfo has "
+                "empty frame_id",
+            )
+            return
+
+        if (
+            depth_msg.header.frame_id
+            and depth_msg.header.frame_id != observation_frame
+        ):
+            rospy.logwarn_throttle(
+                5.0,
+                (
+                    "ignoring synchronized set: depth image and depth "
+                    "CameraInfo frame_id do not match"
+                ),
+            )
+            return
+
+        if not self.valid_camera_info(rgb_info_msg, "RGB"):
+            rospy.logwarn_throttle(
+                5.0,
+                "ignoring synchronized set: invalid RGB CameraInfo",
+            )
+            return
+
+        if not self.valid_camera_info(depth_info_msg, "depth"):
+            rospy.logwarn_throttle(
+                5.0,
+                "ignoring synchronized set: invalid depth CameraInfo",
+            )
+            return
+
+        # Phase 1 admission: freshness / generation gate (time sampled
+        # under the lock).
+        observation_stamp_sec = observation_stamp.to_sec()
+
+        with self._lock:
+            now_sec = rospy.Time.now().to_sec()
+            reason = self.gate.evaluate(now_sec, observation_stamp_sec)
+
+        if reason is not None:
+            rospy.logwarn_throttle(
+                5.0,
+                (
+                    "ignoring RGB-D observation (%s): "
+                    "stamp=%.6f now=%.6f"
+                ),
+                reason,
+                observation_stamp_sec,
+                now_sec,
+            )
+            return
+
+        # Conversion.  Per the module's skip-and-log semantics a single
+        # malformed frame must not kill the subscription callback, so
+        # numeric conversion errors are caught alongside CvBridgeError
+        # (an unhandled exception in a synchronized callback makes rospy
+        # unregister the subscription permanently).  This defensive catch
+        # is NOT a substitute for depth_to_meters() returning writable
+        # arrays: valid 32FC1 data must be processed, not skipped.
+        try:
+            bgr_image = self.bridge.imgmsg_to_cv2(
+                rgb_msg,
+                desired_encoding="bgr8",
+            )
+            depth_image = self.depth_to_meters(depth_msg)
+        except (CvBridgeError, ValueError, TypeError) as exc:
+            rospy.logwarn_throttle(
+                2.0,
+                "ignoring synchronized set: image conversion "
+                "failed: %s",
+                str(exc),
+            )
+            return
+
+        if bgr_image is None or depth_image is None:
+            rospy.logwarn_throttle(
+                2.0,
+                "ignoring synchronized set: RGB or depth image "
+                "conversion returned empty data",
+            )
+            return
+
+        if bgr_image.size == 0 or depth_image.size == 0:
+            rospy.logwarn_throttle(
+                2.0,
+                "ignoring synchronized set: RGB or depth image is empty",
+            )
+            return
+
+        if depth_image.ndim != 2:
+            rospy.logwarn_throttle(
+                2.0,
+                "ignoring synchronized set: depth image does not have "
+                "two dimensions",
+            )
+            return
+
+        if bgr_image.ndim != 3 or bgr_image.shape[2] != 3:
+            rospy.logwarn_throttle(
+                2.0,
+                "ignoring synchronized set: RGB image is not a "
+                "3-channel BGR image",
+            )
+            return
+
+        if (
+            rgb_info_msg.width > 0
+            and rgb_info_msg.height > 0
+            and (
+                rgb_info_msg.width != bgr_image.shape[1]
+                or rgb_info_msg.height != bgr_image.shape[0]
+            )
+        ):
+            rospy.logwarn_throttle(
+                5.0,
+                (
+                    "RGB CameraInfo size %dx%d differs from image "
+                    "size %dx%d"
+                ),
+                rgb_info_msg.width,
+                rgb_info_msg.height,
+                bgr_image.shape[1],
+                bgr_image.shape[0],
+            )
+
+        if (
+            depth_info_msg.width > 0
+            and depth_info_msg.height > 0
+            and (
+                depth_info_msg.width != depth_image.shape[1]
+                or depth_info_msg.height != depth_image.shape[0]
+            )
+        ):
+            rospy.logwarn_throttle(
+                5.0,
+                (
+                    "Depth CameraInfo size %dx%d differs from image "
+                    "size %dx%d"
+                ),
+                depth_info_msg.width,
+                depth_info_msg.height,
+                depth_image.shape[1],
+                depth_image.shape[0],
+            )
+
+        # Detection (pure logic, no ROS state touched).
+        try:
+            detections = perception_core.detect_objects(
+                bgr_image=bgr_image,
+                depth_image_m=depth_image,
+                fx=float(depth_info_msg.K[0]),
+                fy=float(depth_info_msg.K[4]),
+                cx=float(depth_info_msg.K[2]),
+                cy=float(depth_info_msg.K[5]),
+                min_contour_area=self.min_contour_area,
+                min_depth=self.min_depth,
+                max_depth=self.max_depth,
+                red_lower_1=self.red_lower_1,
+                red_upper_1=self.red_upper_1,
+                red_lower_2=self.red_lower_2,
+                red_upper_2=self.red_upper_2,
+                green_lower=self.green_lower,
+                green_upper=self.green_upper,
+            )
+        except (cv2.error, ValueError, TypeError, AttributeError) as exc:
+            rospy.logwarn_throttle(
+                2.0,
+                "perception algorithm failed: %s",
+                str(exc),
+            )
+            return
+
+        # Phase 2: re-validate under the lock (the watchdog or a clock
+        # rollback may have intervened while we were processing), then
+        # commit the state BEFORE publishing anything.  The time is
+        # sampled inside the lock, the generation is compared against
+        # the entry snapshot, and the candidate and status messages are
+        # published while still holding the lock so a watchdog
+        # transition can never interleave between the state commit and
+        # the outputs: the wire order always matches the state
+        # transition order.
+        array_msg = HazardCandidateArray()
+        array_msg.header.stamp = observation_stamp
+        array_msg.header.frame_id = observation_frame
+        array_msg.candidates = [
+            self.build_candidate(detection, observation_stamp,
+                                 observation_frame)
+            for detection in detections
+        ]
+
+        frame_confidence = max(
+            (
+                perception_core.clamp_confidence(
+                    detection["confidence"]
+                )
+                for detection in detections
+            ),
+            default=0.0,
+        )
+
+        if not detections:
+            detail = (
+                "RGB-D perception is ready; no candidate detected"
+            )
+        elif any(
+            detection["position_valid"]
+            for detection in detections
+        ):
+            detail = (
+                "RGB-D perception is ready and detecting candidates"
+            )
+        else:
+            detail = (
+                "RGB-D perception is ready; candidates detected but "
+                "positions are invalid"
+            )
+
+        recovered = False
+        rollback_detail = None
+
+        with self._lock:
+            now2_sec = rospy.Time.now().to_sec()
+            rollback_detail = self.gate.check_clock(now2_sec)
+
+            if rollback_detail is not None:
+                # Invalidate + publish + mark reset pending, all under
+                # the lock; the subscription rebuild runs after release.
+                self.rollback_reset_pending = True
+                self.publish_status(
+                    ModuleStatus.TIMEOUT,
+                    False,
+                    0.0,
+                    rollback_detail,
+                )
+            elif self.rollback_reset_pending:
+                # The subscription reset is still running: do not accept
+                # observations or publish RUNNING/valid=true.
+                rospy.logwarn_throttle(
+                    5.0,
+                    (
+                        "dropping in-flight RGB-D observation: "
+                        "subscription reset pending after ROS clock "
+                        "rollback"
+                    ),
+                )
+                return
+            elif self.gate.generation_id != entry_generation:
+                # A timeout or rollback transition happened while this
+                # frame was being processed: it belongs to an older
+                # generation and must be dropped.
+                rospy.logwarn_throttle(
+                    5.0,
+                    (
+                        "dropping in-flight RGB-D observation: "
+                        "generation changed during processing "
+                        "(entry=%d current=%d)"
+                    ),
+                    entry_generation,
+                    self.gate.generation_id,
+                )
+                return
+
+            else:
+                reason = self.gate.evaluate(
+                    now2_sec,
+                    observation_stamp_sec,
+                )
+                if reason is not None:
+                    rospy.logwarn_throttle(
+                        5.0,
+                        (
+                            "dropping RGB-D observation after "
+                            "processing (%s): stamp=%.6f now=%.6f"
+                        ),
+                        reason,
+                        observation_stamp_sec,
+                        now2_sec,
+                    )
+                    return
+
+                recovered = self.gate.accept(
+                    now2_sec,
+                    observation_stamp_sec,
+                )
+
+                # State committed: publish outputs while the watchdog is
+                # excluded.
+                self.candidate_pub.publish(array_msg)
+                self.publish_status(
+                    ModuleStatus.RUNNING,
+                    True,
+                    frame_confidence,
+                    detail,
+                )
+
+        if rollback_detail is not None:
+            # The invalidation status was already published under the
+            # lock above; now rebuild the subscriptions (no second
+            # status publish).
+            self._reset_subscriptions_after_rollback()
+            return
+
+        if recovered:
+            rospy.loginfo(
+                "perception recovered with a fresh current-generation "
+                "RGB-D observation"
+            )
+
+    # 中文：把一次检测结果封装成 HazardCandidate。frame_id 使用相机光学坐标系，
+    # 位置为反投影得到的相机坐标；最终 world 坐标由 loop 侧按该时间戳做 TF 变换。
+    def build_candidate(self, detection, observation_stamp,
+                        observation_frame):
+        """Convert a core detection dict into a HazardCandidate."""
+
+        candidate = HazardCandidate()
+
+        candidate.header.stamp = observation_stamp
+        candidate.header.frame_id = observation_frame
+
+        point = detection["position"]
+        if point is None:
+            candidate.position.x = 0.0
+            candidate.position.y = 0.0
+            candidate.position.z = 0.0
+        else:
+            candidate.position.x = point[0]
+            candidate.position.y = point[1]
+            candidate.position.z = point[2]
+
+        candidate.label = detection["label"]
+        candidate.confidence = detection["confidence"]
+        candidate.position_valid = detection["position_valid"]
+
+        return candidate
+
+    # -- watchdog ---------------------------------------------------------
+
+    def watchdog_callback(self, _event):
+        """Invalidate the module when accepted input goes silent."""
+
+        reset_needed = False
+
+        with self._lock:
+            now_sec = rospy.Time.now().to_sec()
+            rollback_detail = self.gate.check_clock(now_sec)
+
+            if rollback_detail is not None:
+                # The invalidation status is published and the reset is
+                # marked pending BEFORE the subscriptions are rebuilt:
+                # downstream must see valid=false immediately, and each
+                # rollback produces exactly one invalidation status.
+                self.rollback_reset_pending = True
+                self.publish_status(
+                    ModuleStatus.TIMEOUT,
+                    False,
+                    0.0,
+                    rollback_detail,
+                )
+                reset_needed = True
+
+            elif self.rollback_reset_pending:
+                # A previous subscription reset attempt failed; retry it
+                # from this tick.  The module stays invalid meanwhile.
+                rospy.logwarn_throttle(
+                    5.0,
+                    (
+                        "retrying synchronized subscription reset after "
+                        "ROS clock rollback"
+                    ),
+                )
+                reset_needed = True
+
+            else:
+                detail = self.gate.watchdog(now_sec)
+                if detail is not None:
+                    self.publish_status(
+                        ModuleStatus.TIMEOUT,
+                        False,
+                        0.0,
+                        detail,
+                    )
+
+        if reset_needed:
+            # Rebuild subscriptions outside the lock (network I/O).  No
+            # status is published here: the rollback TIMEOUT was already
+            # published under the lock above.
+            self._reset_subscriptions_after_rollback()
+
+    # -- depth conversion -------------------------------------------------
+
+    def depth_to_meters(self, depth_msg):
+        """
+        Convert a ROS depth image into a WRITABLE float32 metres array.
+        16UC1 / mono16: millimetres; 32FC1: metres.
+
+        The returned array never shares memory with the ROS message
+        backing buffer (cv_bridge passthrough views are read-only).
+        """
+
+        encoding = depth_msg.encoding.lower()
+
+        if encoding in ("16uc1", "mono16"):
+            depth = self.bridge.imgmsg_to_cv2(
+                depth_msg,
+                desired_encoding="passthrough",
+            )
+            depth = np.asarray(depth, dtype=np.float32) / 1000.0
+
+        elif encoding in ("32fc1", "32fc"):
+            depth = self.bridge.imgmsg_to_cv2(
+                depth_msg,
+                desired_encoding="passthrough",
+            )
+            # cv_bridge passthrough returns a READ-ONLY view of the ROS
+            # message backing buffer; the non-finite cleanup below writes
+            # in place, so take an owned, writable float32 copy instead
+            # (production blocker found by the real Gazebo/RealSense
+            # smoke: the competition plugin publishes 32FC1).
+            depth = np.array(depth, dtype=np.float32, copy=True)
+
+        else:
+            rospy.logwarn_throttle(
+                5.0,
+                "unsupported depth encoding: %s",
+                depth_msg.encoding,
+            )
+            return None
+
+        depth[~np.isfinite(depth)] = 0.0
+
+        return depth
+
+    # -- main loop --------------------------------------------------------
+
+    def spin(self):
+        """Enter the ROS event loop."""
+
+        rospy.spin()
+
+
+if __name__ == "__main__":
+    node = PerceptionNode()
+    node.spin()

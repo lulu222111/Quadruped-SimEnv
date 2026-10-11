@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""Test-only ROS/Gazebo coordinated teleport recovery harness.
+
+This executable owns the controller and DUT child process groups it manages.
+It never discovers or kills unrelated processes and is not referenced by any
+production launch file.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import shlex
+import signal
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+import rospy
+from competition_interfaces.msg import ModuleStatus
+from gazebo_msgs.msg import ModelState, ModelStates
+from gazebo_msgs.srv import SetModelState
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import OccupancyGrid, Odometry, Path as NavPath
+from sensor_msgs.msg import Imu, Joy, PointCloud2
+from std_msgs.msg import Bool
+from std_srvs.srv import Trigger
+
+from competition_recovery_testing.lifecycle import FreshEvidence, RecoveryLifecycle
+
+
+class OwnedProcess:
+    """One exact child process group plus line-buffered evidence log."""
+
+    def __init__(self, name, command, cwd, log_path, event_pattern=None,
+                 ready_pattern=None):
+        self.name = name
+        self.command = shlex.split(command)
+        if not self.command:
+            raise ValueError("{} command is empty".format(name))
+        self.cwd = cwd
+        self.log_path = Path(log_path)
+        self.event_pattern = event_pattern
+        self.ready_pattern = ready_pattern
+        self.process = None
+        self.event = threading.Event()
+        self.ready = threading.Event()
+        self._reader = None
+
+    @property
+    def running(self):
+        return self.process is not None and self.process.poll() is None
+
+    def start(self):
+        if self.running:
+            raise RuntimeError("{} is already running".format(self.name))
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        stream = open(self.log_path, "a", buffering=1)
+        stream.write("\n=== {} start wall={:.6f} ===\n".format(
+            self.name, time.time()))
+        self.event.clear()
+        self.ready.clear()
+        self.process = subprocess.Popen(
+            self.command,
+            cwd=self.cwd,
+            env=os.environ.copy(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+
+        def copy_output():
+            try:
+                for line in self.process.stdout:
+                    stream.write(line)
+                    if self.event_pattern and self.event_pattern in line:
+                        self.event.set()
+                    if self.ready_pattern and self.ready_pattern in line:
+                        self.ready.set()
+            finally:
+                stream.flush()
+                stream.close()
+
+        self._reader = threading.Thread(target=copy_output, daemon=True)
+        self._reader.start()
+
+    def replace_command(self, command):
+        if self.running:
+            raise RuntimeError("cannot replace running {} command".format(self.name))
+        parsed = shlex.split(command)
+        if not parsed:
+            raise ValueError("{} replacement command is empty".format(self.name))
+        self.command = parsed
+
+    def stop(self, timeout=15.0):
+        if not self.running:
+            return
+        process = self.process
+        os.killpg(process.pid, signal.SIGINT)
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5.0)
+        if self._reader is not None:
+            self._reader.join(timeout=2.0)
+
+
+class RosRecoveryBackend:
+    def __init__(self, args):
+        self.args = args
+        self.generation = 0
+        self._lock = threading.RLock()
+        self._messages = {}
+        self._sensor_counts = {"imu": 0, "cloud": 0}
+        self._last_sensor_stamp = {"imu": None, "cloud": None}
+        self._sensor_monotonic = {"imu": True, "cloud": True}
+        self._recovery_controller_selected = False
+        self._test_fall_event = threading.Event()
+        self._test_fall_consecutive = 0
+        self._joy_pub = rospy.Publisher("/joy", Joy, queue_size=2)
+
+        self.dut = OwnedProcess(
+            "pose-derived-dut", args.dut_command, args.cwd,
+            args.dut_log,
+        )
+        self.controller = OwnedProcess(
+            "controller", args.controller_command, args.cwd,
+            args.controller_log, args.fall_pattern, "controller dt:",
+        )
+
+        rospy.Subscriber("/Odometry", Odometry,
+                         lambda msg: self._store("fastlio", msg), queue_size=20)
+        rospy.Subscriber("/competition/localization/odom", Odometry,
+                         lambda msg: self._store("localization_odom", msg), queue_size=20)
+        rospy.Subscriber("/competition/localization/status", ModuleStatus,
+                         lambda msg: self._store("localization_status", msg), queue_size=20)
+        rospy.Subscriber("/competition/map", OccupancyGrid,
+                         lambda msg: self._store("map", msg), queue_size=5)
+        rospy.Subscriber("/competition/mapping/status", ModuleStatus,
+                         lambda msg: self._store("mapping_status", msg), queue_size=20)
+        rospy.Subscriber("/competition/path", NavPath,
+                         lambda msg: self._store("path", msg), queue_size=10)
+        rospy.Subscriber("/competition/planning/status", ModuleStatus,
+                         lambda msg: self._store("planning_status", msg), queue_size=20)
+        rospy.Subscriber("/competition/control_enabled", Bool,
+                         lambda msg: self._store("control_enabled", msg), queue_size=10)
+        rospy.Subscriber("/competition/emergency_stop", Bool,
+                         lambda msg: self._store("emergency_stop", msg), queue_size=10)
+        rospy.Subscriber("/cmd_vel", Twist,
+                         lambda msg: self._store("cmd_vel", msg), queue_size=50)
+        rospy.Subscriber("/livox/imu", Imu,
+                         lambda msg: self._sensor("imu", msg), queue_size=100)
+        rospy.Subscriber("/livox/Pointcloud2", PointCloud2,
+                         lambda msg: self._sensor("cloud", msg), queue_size=20)
+        if args.test_gazebo_fall_trigger:
+            rospy.Subscriber("/gazebo/model_states", ModelStates,
+                             self._gazebo_fall_sample, queue_size=10)
+
+    def now(self):
+        return rospy.Time.now().to_sec()
+
+    def _stamp(self, msg):
+        header = getattr(msg, "header", None)
+        return header.stamp.to_sec() if header is not None else self.now()
+
+    def _store(self, key, msg):
+        with self._lock:
+            self._messages[key] = (
+                self.generation, self._stamp(msg), self.now(), msg
+            )
+
+    def _sensor(self, key, msg):
+        stamp = self._stamp(msg)
+        with self._lock:
+            previous = self._last_sensor_stamp[key]
+            if previous is not None and stamp + 1.0e-9 < previous:
+                self._sensor_monotonic[key] = False
+            self._last_sensor_stamp[key] = stamp
+            self._sensor_counts[key] += 1
+            self._messages[key] = (self.generation, stamp, self.now(), msg)
+
+    def _gazebo_fall_sample(self, msg):
+        """Optional smoke-only fall trigger; never feeds pose into the DUT."""
+        try:
+            index = msg.name.index(self.args.model)
+        except ValueError:
+            return
+        with self._lock:
+            if msg.pose[index].position.z < self.args.test_fall_z_threshold:
+                self._test_fall_consecutive += 1
+                if self._test_fall_consecutive >= self.args.test_fall_samples:
+                    self._test_fall_event.set()
+            else:
+                self._test_fall_consecutive = 0
+
+    def clear_fall_trigger(self):
+        with self._lock:
+            self._test_fall_consecutive = 0
+            self._test_fall_event.clear()
+
+    def fall_source(self):
+        if self.controller.event.is_set():
+            return "controller"
+        if self._test_fall_event.is_set():
+            return "gazebo-test-harness"
+        return None
+
+    def begin_generation(self, generation):
+        with self._lock:
+            self.generation = generation
+            for key in (
+                "fastlio", "localization_odom", "localization_status",
+                "map", "mapping_status", "path", "planning_status",
+                "control_enabled", "emergency_stop", "cmd_vel",
+            ):
+                self._messages.pop(key, None)
+
+    def _wait(self, description, predicate, timeout=None):
+        deadline = time.monotonic() + (timeout or self.args.timeout)
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            value = predicate()
+            if value is not None and value is not False:
+                return value
+            time.sleep(0.05)
+        raise RuntimeError("timeout waiting for {}".format(description))
+
+    def request_safety_stop(self):
+        if self.args.localization_only:
+            return
+        try:
+            rospy.wait_for_service("/competition/finish", timeout=3.0)
+            rospy.ServiceProxy("/competition/finish", Trigger)()
+        except Exception:
+            # WAITING is already safe; wait_safety_stop validates actual topics.
+            pass
+
+    def wait_safety_stop(self):
+        if self.args.localization_only:
+            return
+
+        def safe():
+            with self._lock:
+                enabled = self._messages.get("control_enabled")
+                estop = self._messages.get("emergency_stop")
+                if enabled and estop and not enabled[3].data and estop[3].data:
+                    return True
+            return None
+
+        self._wait("control_enabled=false and emergency_stop=true", safe)
+
+    @staticmethod
+    def _is_zero_twist(msg):
+        values = (
+            msg.linear.x, msg.linear.y, msg.linear.z,
+            msg.angular.x, msg.angular.y, msg.angular.z,
+        )
+        return all(math.isfinite(value) and abs(value) <= 1.0e-6
+                   for value in values)
+
+    def wait_cmd_vel_zero(self):
+        if self.args.localization_only:
+            # No /cmd_vel publisher is launched in isolated S1.  A received
+            # value, if any, must still be zero.
+            with self._lock:
+                item = self._messages.get("cmd_vel")
+            if item and not self._is_zero_twist(item[3]):
+                raise RuntimeError("localization-only harness observed non-zero /cmd_vel")
+            return
+
+        deadline = time.monotonic() + self.args.timeout
+        consecutive = 0
+        last_observed = None
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            with self._lock:
+                item = self._messages.get("cmd_vel")
+            if item is not None and item[2] != last_observed:
+                last_observed = item[2]
+                consecutive = consecutive + 1 if self._is_zero_twist(item[3]) else 0
+                if consecutive >= self.args.zero_samples:
+                    return
+            time.sleep(0.02)
+        raise RuntimeError("did not observe {} consecutive zero /cmd_vel samples".format(
+            self.args.zero_samples))
+
+    def stop_controller(self): self.controller.stop()
+    def stop_pose_derived_dut(self): self.dut.stop()
+
+    def teleport(self):
+        rospy.wait_for_service("/gazebo/set_model_state", timeout=self.args.timeout)
+        request = ModelState()
+        request.model_name = self.args.model
+        request.reference_frame = "world"
+        request.pose.position.x = self.args.x
+        request.pose.position.y = self.args.y
+        request.pose.position.z = self.args.z
+        request.pose.orientation.z = math.sin(self.args.yaw / 2.0)
+        request.pose.orientation.w = math.cos(self.args.yaw / 2.0)
+        response = rospy.ServiceProxy("/gazebo/set_model_state", SetModelState)(request)
+        if not response.success:
+            raise RuntimeError("set_model_state failed: {}".format(
+                response.status_message))
+
+    def _publish_fixed_stand(self):
+        if not self.args.publish_fixed_stand:
+            return
+        deadline = time.monotonic() + min(10.0, self.args.timeout)
+        while not self.controller.ready.wait(timeout=0.05):
+            if not self.controller.running:
+                raise RuntimeError(
+                    "controller exited before full initialization"
+                )
+            if time.monotonic() >= deadline:
+                raise RuntimeError("controller initialization marker not observed")
+        self._publish_joy_button(1)
+        if not self.controller.running:
+            raise RuntimeError(
+                "controller exited during fixed-stand initialization"
+            )
+
+    def _publish_joy_button(self, button_index):
+        deadline = time.monotonic() + min(10.0, self.args.timeout)
+        while self._joy_pub.get_num_connections() == 0:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("controller did not subscribe to /joy")
+            time.sleep(0.05)
+        command = Joy()
+        command.axes = [0.0] * 6
+        command.buttons = [0] * 11
+        command.buttons[button_index] = 1
+        for _ in range(20):
+            command.header.stamp = rospy.Time.now()
+            self._joy_pub.publish(command)
+            time.sleep(0.05)
+        command.buttons[button_index] = 0
+        for _ in range(3):
+            command.header.stamp = rospy.Time.now()
+            self._joy_pub.publish(command)
+            time.sleep(0.05)
+
+    def start_controller_safe(self):
+        if (self.args.recovery_controller_command
+                and not self._recovery_controller_selected):
+            self.controller.replace_command(self.args.recovery_controller_command)
+            self._recovery_controller_selected = True
+        self.controller.start()
+        self._publish_fixed_stand()
+
+    def wait_sensors_stable(self, boundary):
+        with self._lock:
+            start_counts = dict(self._sensor_counts)
+
+        def stable():
+            with self._lock:
+                if not all(self._sensor_monotonic.values()):
+                    raise RuntimeError("sensor timestamp rollback during recovery")
+                imu = self._messages.get("imu")
+                cloud = self._messages.get("cloud")
+                enough = (
+                    self._sensor_counts["imu"] - start_counts["imu"] >= self.args.imu_samples
+                    and self._sensor_counts["cloud"] - start_counts["cloud"] >= self.args.cloud_samples
+                )
+                if enough and imu and cloud and imu[1] > boundary and cloud[1] > boundary:
+                    return True
+            return None
+
+        self._wait("fresh stable IMU and PointCloud2", stable)
+
+    def start_pose_derived_dut_safe(self):
+        if not self.args.localization_only:
+            command_text = " ".join(self.dut.command)
+            if "auto_start:=false" not in command_text:
+                raise RuntimeError(
+                    "full-stack DUT command must contain auto_start:=false"
+                )
+        with self._lock:
+            for key in (
+                "fastlio", "localization_odom", "localization_status",
+                "map", "mapping_status", "path", "planning_status",
+            ):
+                self._messages.pop(key, None)
+        self.dut.start()
+
+    def _fresh_item(self, key, boundary, generation, valid=None, nonempty=False):
+        with self._lock:
+            item = self._messages.get(key)
+            if item is None:
+                return None
+            msg_generation, stamp, observed, msg = item
+            if msg_generation != generation or stamp <= boundary:
+                return None
+            if valid is not None and bool(msg.valid) != valid:
+                return None
+            if nonempty and not msg.poses:
+                return None
+            return FreshEvidence(msg_generation, stamp, observed)
+
+    def wait_fresh_fastlio(self, boundary, generation):
+        return self._wait("fresh /Odometry", lambda: self._fresh_item(
+            "fastlio", boundary, generation))
+
+    def wait_fresh_localization(self, boundary, generation):
+        def fresh():
+            status = self._fresh_item(
+                "localization_status", boundary, generation, valid=True)
+            odom = self._fresh_item("localization_odom", boundary, generation)
+            if status and odom:
+                return FreshEvidence(generation, min(status.stamp, odom.stamp),
+                                     max(status.observed_at, odom.observed_at))
+            return None
+        return self._wait("fresh valid localization generation", fresh)
+
+    def wait_fresh_map(self, boundary, generation):
+        def fresh():
+            status = self._fresh_item(
+                "mapping_status", boundary, generation, valid=True)
+            grid = self._fresh_item("map", boundary, generation)
+            if status and grid:
+                return FreshEvidence(generation, min(status.stamp, grid.stamp),
+                                     max(status.observed_at, grid.observed_at))
+            return None
+        return self._wait("fresh valid map generation", fresh)
+
+    def wait_fresh_path(self, boundary, generation):
+        def fresh():
+            status = self._fresh_item(
+                "planning_status", boundary, generation, valid=True)
+            path = self._fresh_item(
+                "path", boundary, generation, nonempty=True)
+            if status and path:
+                return FreshEvidence(generation, min(status.stamp, path.stamp),
+                                     max(status.observed_at, path.observed_at))
+            return None
+        return self._wait("fresh valid non-empty planning path", fresh)
+
+    def reenable_control(self):
+        if self.args.localization_only:
+            raise RuntimeError("cannot re-enable control in localization-only mode")
+
+        deadline = time.monotonic() + self.args.timeout
+        last_error = "service unavailable"
+        while time.monotonic() < deadline and not rospy.is_shutdown():
+            try:
+                rospy.wait_for_service("/competition/start", timeout=1.0)
+                response = rospy.ServiceProxy("/competition/start", Trigger)()
+                if response.success:
+                    return
+                last_error = response.message
+            except Exception as exc:
+                last_error = str(exc)
+            time.sleep(0.25)
+        raise RuntimeError("competition start rejected: {}".format(last_error))
+
+    def wait_control_reenabled(self):
+        def enabled():
+            with self._lock:
+                control = self._messages.get("control_enabled")
+                estop = self._messages.get("emergency_stop")
+                if control and estop and control[3].data and not estop[3].data:
+                    return True
+            return None
+        self._wait("control_enabled=true and emergency_stop=false", enabled)
+        if self.args.enter_rl_after_control:
+            if not self.controller.ready.is_set() or not self.controller.running:
+                raise RuntimeError("controller is not ready for formal RL handover")
+            self.clear_fall_trigger()
+            self._publish_joy_button(3)  # official RL /cmd_vel mode
+
+    def enforce_safe_stop(self):
+        self.request_safety_stop()
+        if not self.args.localization_only:
+            try:
+                self.wait_safety_stop()
+                self.wait_cmd_vel_zero()
+                return
+            except Exception:
+                pass
+        # Exact owned child only.  Never use a global process matcher.
+        self.controller.stop()
+
+    def bootstrap(self, require_map, require_path, resume_control):
+        self.begin_generation(0)
+        boundary = self.now()
+        # Bootstrap may intentionally use a different controller command to
+        # reproduce a fall.  The recovery-only command is selected only after
+        # the first coordinated stop/teleport boundary.
+        self.controller.start()
+        self._publish_fixed_stand()
+        self.wait_sensors_stable(boundary)
+        self.start_pose_derived_dut_safe()
+        self.wait_fresh_fastlio(boundary, 0)
+        self.wait_fresh_localization(boundary, 0)
+        if require_map:
+            self.wait_fresh_map(boundary, 0)
+        if require_path:
+            self.wait_fresh_path(boundary, 0)
+        if resume_control:
+            self.reenable_control()
+            self.wait_control_reenabled()
+
+    def shutdown_owned(self):
+        try:
+            self.enforce_safe_stop()
+        finally:
+            self.controller.stop()
+            self.dut.stop()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="test-only coordinated Gazebo teleport recovery")
+    parser.add_argument("--dut-command", required=True)
+    parser.add_argument("--controller-command", required=True)
+    parser.add_argument("--recovery-controller-command")
+    parser.add_argument("--cwd", required=True)
+    parser.add_argument("--dut-log", required=True)
+    parser.add_argument("--controller-log", required=True)
+    parser.add_argument("--report", required=True)
+    parser.add_argument("--model", default="a1_gazebo")
+    parser.add_argument("--x", type=float, default=0.0)
+    parser.add_argument("--y", type=float, default=-3.2)
+    parser.add_argument("--z", type=float, default=0.6)
+    parser.add_argument("--yaw", type=float, default=1.5708)
+    parser.add_argument("--timeout", type=float, default=180.0)
+    parser.add_argument("--imu-samples", type=int, default=200)
+    parser.add_argument("--cloud-samples", type=int, default=8)
+    parser.add_argument("--zero-samples", type=int, default=5)
+    parser.add_argument("--fall-pattern", default="Robot appears to have fallen")
+    parser.add_argument("--fall-wall-timeout", type=float, default=900.0)
+    parser.add_argument("--test-gazebo-fall-trigger", action="store_true")
+    parser.add_argument("--test-fall-z-threshold", type=float, default=0.16)
+    parser.add_argument("--test-fall-samples", type=int, default=20)
+    parser.add_argument("--publish-fixed-stand", action="store_true")
+    parser.add_argument("--enter-rl-after-control", action="store_true")
+    parser.add_argument("--localization-only", action="store_true")
+    parser.add_argument("--no-require-map", action="store_true")
+    parser.add_argument("--no-require-path", action="store_true")
+    parser.add_argument("--no-resume-control", action="store_true")
+    parser.add_argument("--trigger-immediately", action="store_true")
+    parser.add_argument("--max-recoveries", type=int, default=1)
+    parser.add_argument("--hold-after-recovery-sim-seconds", type=float, default=0.0)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.timeout <= 0 or args.imu_samples <= 0 or args.cloud_samples <= 0:
+        raise SystemExit("timeouts and sensor sample counts must be positive")
+    if args.fall_wall_timeout <= 0 or args.zero_samples <= 0:
+        raise SystemExit("fall timeout and zero sample count must be positive")
+    if args.test_fall_z_threshold <= 0 or args.test_fall_samples <= 0:
+        raise SystemExit("test fall threshold and sample count must be positive")
+    if args.max_recoveries < 0 or args.hold_after_recovery_sim_seconds < 0.0:
+        raise SystemExit("recovery count and hold duration must be non-negative")
+    if args.localization_only and args.enter_rl_after_control:
+        raise SystemExit("localization-only mode cannot enter controlled RL motion")
+    require_map = not args.no_require_map and not args.localization_only
+    require_path = not args.no_require_path and not args.localization_only
+    resume_control = not args.no_resume_control and not args.localization_only
+
+    rospy.init_node("test_teleport_recovery_coordinator", anonymous=False)
+    backend = RosRecoveryBackend(args)
+    lifecycle = RecoveryLifecycle(
+        backend, require_map=require_map, require_path=require_path,
+        resume_control=resume_control,
+    )
+    report_path = Path(args.report)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        backend.bootstrap(require_map, require_path, resume_control)
+        for index in range(args.max_recoveries):
+            if not args.trigger_immediately:
+                fall_deadline = time.monotonic() + args.fall_wall_timeout
+                while not rospy.is_shutdown():
+                    if backend.controller.event.wait(timeout=0.05):
+                        break
+                    if backend._test_fall_event.wait(timeout=0.20):
+                        break
+                    if not backend.controller.running:
+                        raise RuntimeError("controller exited while waiting for fall")
+                    if time.monotonic() >= fall_deadline:
+                        raise RuntimeError("timeout waiting for current controller fall event")
+                if rospy.is_shutdown():
+                    break
+            source = backend.fall_source() or "explicit"
+            record = lifecycle.recover("{}-fall-{}".format(source, index + 1))
+            with open(report_path, "a") as stream:
+                stream.write(json.dumps(record.__dict__, sort_keys=True) + "\n")
+            args.trigger_immediately = False
+        if args.hold_after_recovery_sim_seconds > 0.0 and not rospy.is_shutdown():
+            hold_start = rospy.Time.now().to_sec()
+            while (not rospy.is_shutdown()
+                   and rospy.Time.now().to_sec() - hold_start
+                   < args.hold_after_recovery_sim_seconds):
+                if backend.fall_source() is not None:
+                    raise RuntimeError("controller fell during post-recovery hold")
+                time.sleep(0.1)
+    finally:
+        backend.shutdown_owned()
+
+
+if __name__ == "__main__":
+    main()

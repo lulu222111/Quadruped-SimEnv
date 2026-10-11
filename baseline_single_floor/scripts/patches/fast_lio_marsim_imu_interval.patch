@@ -1,0 +1,26 @@
+diff --git a/src/IMU_Processing.hpp b/src/IMU_Processing.hpp
+index c6fc093..0e40779 100644
+--- a/src/IMU_Processing.hpp
++++ b/src/IMU_Processing.hpp
+@@ -255,11 +255,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
+     auto &&head = *(it_imu);
+     auto &&tail = *(it_imu + 1);
+     
+-    if (lidar_type == MARSIM) {
+-        if (tail->header.stamp.toSec() < pcl_beg_time) continue;
+-    } else {
+-        if (tail->header.stamp.toSec() < last_lidar_end_time_)    continue;
+-    }
++    if (tail->header.stamp.toSec() < last_lidar_end_time_)    continue;
+     
+     angvel_avr<<0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
+                 0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
+@@ -272,7 +268,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
+ 
+     acc_avr     = acc_avr * G_m_s2 / mean_acc.norm(); // - state_inout.ba;
+ 
+-    double dt_anchor = (lidar_type == MARSIM) ? pcl_beg_time : last_lidar_end_time_;
++    double dt_anchor = last_lidar_end_time_;
+     if(head->header.stamp.toSec() < dt_anchor)
+     {
+       dt = tail->header.stamp.toSec() - dt_anchor;

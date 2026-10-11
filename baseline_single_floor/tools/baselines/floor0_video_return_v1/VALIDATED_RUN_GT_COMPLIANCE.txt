@@ -1,0 +1,47 @@
+### GT / referee-channel audit (captured live, 2026-09-14T15:39:51+08:00)
+### 1. forbidden help topics present?
+/Odometry_gazebo             publishers_present=no
+/ground_truth/odom           publishers_present=no
+/ground_truth/state          publishers_present=no
+/gazebo/model_states         publishers_present=yes
+/gazebo/link_states          publishers_present=yes
+
+### 2. does any PRODUCTION node subscribe to a truth channel?
+--- /gazebo/model_states
+Subscribers: None
+
+
+--- /gazebo/link_states
+Subscribers: None
+
+
+
+### 3. any topic whose name contains ground_truth / Odometry_gazebo?
+/ground_truth/FL_foot
+/ground_truth/FR_foot
+/ground_truth/RL_foot
+/ground_truth/RR_foot
+/ground_truth/base_trunk
+/ground_truth/base_w
+
+### 4. live node list
+/a1_gazebo/controller_spawner
+/building_generator_classic_control
+/cmd_vel_guard
+/competition_loop
+/doorfix_watcher_19310_1789371587290
+/filter_livox
+/gazebo
+/gazebo_gui
+/laserMapping
+/leg_odometry
+/localization
+/mapping
+/path_follower
+/perception
+/planning
+/pointcloud2livox
+/record_1789371587357297890
+/robot_state_publisher
+/rosout
+/unitree_gazebo_servo

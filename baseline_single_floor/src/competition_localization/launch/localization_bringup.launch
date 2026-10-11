@@ -1,0 +1,135 @@
+<launch>
+  <!-- =====================================================================
+       中文说明（模块级）：localization_bringup.launch —— 正式定位链启动
+
+       职责：启动 FAST-LIO（laserMapping，输出 camera_init->body，body 即 IMU 帧）
+       与 competition_localization 的 localization_node（把结果适配成 world->base，
+       发布 /competition/localization/odom 与该 TF 链上唯一的动态 TF）。
+
+       为什么这样切分：FAST-LIO 只负责"世界系内的连续里程"；把"body 其实是 IMU
+       帧"这个事实、以及 base->livox_imu_link 外参补偿、启动期世界系对齐等
+       契约全部收敛到 localization_node 一个位置，便于审计"谁发布了 world->base"。
+
+       注意：本文件是 competition_system.launch 中 localization_enabled=true 时
+       内建使用的正式链路；若外层改用 localization_corrected.launch，则必须把
+       competition_system.launch 的 localization_enabled 置 false，避免双发布者。
+       ===================================================================== -->
+  <!--
+    localization_bringup.launch — canonical production localization bringup.
+
+    Starts:
+      1. FAST-LIO `laserMapping` (estimates camera_init -> body; body = IMU frame)
+      2. competition_localization `localization_node` (adapts to world -> base,
+         publishes /competition/localization/odom + the single dynamic
+         world -> base TF)
+
+    Topic remaps:
+      FAST-LIO's mid360_sim.yaml already uses SimEnv topics; the remaps here
+      are a belt-and-suspenders guarantee.
+
+    Usage (standalone):
+      roslaunch competition_localization localization_bringup.launch rviz:=false
+
+    Production integration (from competition_system.launch):
+      <include file="$(find competition_localization)/launch/localization_bringup.launch">
+        <arg name="rviz" value="false"/>
+      </include>
+
+    Lifecycle: respawn is DISABLED for production.
+      FAST-LIO restart resets camera_init, which breaks the world alignment
+      without a re-alignment protocol.  Fail-fast is safer than silent drift.
+      The localization_node fails immediately on critical config errors
+      (missing extrinsic, bad scene file) in competition mode rather than
+      crash-looping forever.
+  -->
+
+  <arg name="rviz" default="false" />
+  <arg name="lid_topic" default="/livox/Pointcloud2" />
+  <arg name="imu_topic" default="/livox/imu" />
+  <arg name="odom_input_topic" default="/Odometry" />
+  <arg name="team_scene_info_path" default="generated_building/team_scene_info.json" />
+  <!-- Exposed only to make repeatable FAST-LIO configuration benchmarks possible.
+       Production defaults remain the retained MARSIM values. -->
+  <arg name="filter_size_surf" default="0.2" />
+  <arg name="filter_size_map" default="0.3" />
+  <arg name="correction_enabled" default="false" />
+  <arg name="correction_odom_topic" default="/c2r28/proprio_fastlio_shadow/odom" />
+  <arg name="correction_mode" default="full_pose" />
+
+  <!-- === FAST-LIO (SimEnv-tuned) === -->
+
+  <!-- Load the base config from the submodule (e6aeba1, unmodified).
+       The submodule's mid360_sim.yaml has extrinsic_T = [-0.011, -0.02329, 0.04412]
+       which is the raw URDF joint laser_livox->livox_imu origin.  This is the IMU
+       origin expressed in the LiDAR frame (T_lidar_imu).  FAST-LIO expects
+       Lidar_T_wrt_IMU (LiDAR origin in IMU frame) — see laserMapping.cpp:820
+       and IMU_Processing.hpp:343: p_imu = offset_R_L_I * p_lidar + offset_T_L_I.
+       Because the laser_livox -> livox_imu_link relative rotation is identity,
+       the translation must be NEGATED: T_imu_lidar = -T_lidar_imu.  We override
+       both extrinsic_T and extrinsic_R here so the fix lives in the parent repo
+       and does not require modifying the submodule. -->
+  <rosparam command="load" file="$(find fast_lio)/config/mid360_sim.yaml" />
+
+  <!-- Production: correct FAST-LIO extrinsic_T for our URDF chain.
+       Official competition doc / URDF (a1_description/xacro/robot.xacro):
+         laser_livox_joint (base->laser_livox)    t=[0.2, 0, 0.08], Ry(45°)
+         livox_imu_joint  (laser_livox->livox_imu) t=[-0.011, -0.02329, 0.04412], R=I
+       FAST-LIO expects Lidar_T_wrt_IMU:
+         extrinsic_T = -[-0.011, -0.02329, 0.04412] = [0.011, 0.02329, -0.04412]
+       NOTE: the submodule's mid360_sim.yaml default [-0.011, -0.02329, 0.04412]
+       is a KNOWN sign error (IMU-in-LiDAR used as LiDAR-in-IMU). Only this
+       canonical launch overrides it correctly - do NOT run FAST-LIO's own
+       mapping_mid360_sim.launch for production. -->
+  <rosparam param="mapping/extrinsic_T" subst_value="True">[0.011, 0.02329, -0.04412]</rosparam>
+  <rosparam param="mapping/extrinsic_R" subst_value="True">[1, 0, 0,
+                                                             0, 1, 0,
+                                                             0, 0, 1]</rosparam>
+  <param name="mapping/extrinsic_est_en" type="bool" value="false" />
+
+  <!-- Production overrides (belt-and-suspenders) -->
+  <param name="feature_extract_enable" type="bool" value="0"/>
+  <param name="point_filter_num" type="int" value="3"/>
+  <param name="max_iteration" type="int" value="3" />
+  <!-- Keep MARSIM's proven spatial detail: the simulator emits 10 Hz
+       instantaneous PointCloud2 batches, so the 0.5 m production override
+       discarded useful local planar constraints.  These match the package's
+       mapping_marsim.launch defaults and do not alter FAST-LIO logic. -->
+  <param name="filter_size_surf" type="double" value="$(arg filter_size_surf)" />
+  <param name="filter_size_map" type="double" value="$(arg filter_size_map)" />
+  <param name="cube_side_length" type="double" value="1000" />
+  <param name="runtime_pos_log_enable" type="bool" value="0" />
+  <param name="pcd_save/pcd_save_en" type="bool" value="false" />
+
+  <!-- Production: NO respawn.  See lifecycle note above. -->
+  <node pkg="fast_lio" type="fastlio_mapping" name="laserMapping" output="screen"
+        respawn="false">
+    <remap from="/livox/lidar" to="$(arg lid_topic)" />
+    <remap from="/livox/imu" to="$(arg imu_topic)" />
+  </node>
+
+  <!-- === Localization adapter (world -> base) === -->
+
+  <!-- Production: NO respawn. -->
+  <node pkg="competition_localization" type="localization_node" name="localization"
+        output="screen" respawn="false">
+    <param name="odom_input_topic" value="$(arg odom_input_topic)" />
+    <param name="team_scene_info_path" value="$(arg team_scene_info_path)" />
+    <param name="publish_tf" value="true" />
+    <param name="correction_enabled" value="$(arg correction_enabled)" />
+    <param name="correction_odom_topic" value="$(arg correction_odom_topic)" />
+    <param name="correction_mode" value="$(arg correction_mode)" />
+    <!-- Fixed extrinsic base -> livox_imu_link (a1_description URDF chain).
+         Computed: T_base_lidar = [0.2, 0, 0.08], Ry(45°)
+                   T_lidar_imu  = [-0.011, -0.02329, 0.04412]
+         Composed:  T_base_imu   = [0.223404, -0.023290, 0.118985], Ry(45°) -->
+    <rosparam param="base_to_imu_translation">[0.223404, -0.023290, 0.118985]</rosparam>
+    <rosparam param="base_to_imu_rotation_rpy">[0.0, 0.785, 0.0]</rosparam>
+  </node>
+
+  <!-- === RViz (off by default) === -->
+  <group if="$(arg rviz)">
+    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz"
+          args="-d $(find fast_lio)/rviz_cfg/loam_livox.rviz" />
+  </group>
+
+</launch>

@@ -1,0 +1,108 @@
+# competition_bringup — default parameters
+# Loaded by competition_system.launch into the ROS parameter server.
+#
+# =============================================================================
+# 中文说明（模块级）：竞赛系统默认参数集中配置
+#
+# 角色：本文件是"参数默认值的唯一来源"，由 competition_system.launch 载入参数
+#       服务器；launch 内的 <arg> 默认值与之保持一致，因此直接 roslaunch 得到
+#       的就是已标定的正式配置。
+#
+# 各段的含义与"为什么取这个值"：
+#   competition_loop : 任务级参数。max_time 是正式比赛预算（600 s，同时是评分
+#                      口径）；result_path 相对 workspace_root 解析；危险源
+#                      allowed_labels / 半径 / z 归位等参数决定误报口径。
+#   cmd_vel_guard    : 唯一的 /cmd_vel 网关参数（超时 + 三轴限幅）。
+#   mapping          : 栅格分辨率与尺寸、以及 min_height 高度窗——base 系地面
+#                      回波约在 -0.31..-0.18 m，若阈值取得太低会把楼板当成障碍，
+#                      因此这里只保留约 0.16 m 以上的点。
+#   planning         : Frontier 选择与有界主动视觉覆盖参数；视觉扫描是"到达目标
+#                      后在原地按 yaw 步进旋转扫描"的行为参数（步长、驻留、
+#                      超时、重试、位置去重半径、路线间距）。
+#   localization     : 坐标系契约（imu_frame=livox_imu_link、base_frame=base）
+#                      与固定外参 base->livox_imu_link（由 URDF 链推导）。
+#                      注意这是"外参"，不是可在线估计的量。
+#   perception       : HSV 阈值与最小置信度。
+#
+# 注意：修改本文件即改变正式默认行为；验证/基线复现请在 wrapper launch 中覆盖，
+#       不要直接改这里的默认值。
+# =============================================================================
+
+# --- Competition loop ---
+competition_loop:
+  max_time: 600.0            # Maximum exploration time (seconds)
+  start_delay: 5.0           # Delay before auto-start after all checks pass (seconds)
+  auto_start: true           # Auto-start after validation + delay complete
+  competition_mode: true     # true = competition, false = test
+  workspace_root: "/workspace/SimEnv"  # Root for resolving team_scene_info.json and results
+  result_path: "results/detected_danger.json"
+
+# --- cmd_vel guard ---
+cmd_vel_guard:
+  cmd_vel_timeout: 0.5       # Timeout for raw_cmd_vel (seconds)
+  max_linear_x: 0.5          # Max forward velocity (m/s)
+  max_linear_y: 0.3          # Max lateral velocity (m/s)
+  max_angular_z: 1.0         # Max yaw rate (rad/s)
+
+# --- Mapping ---
+mapping:
+  resolution: 0.1            # Grid resolution (m/cell)
+  map_width: 400             # Map width in cells
+  map_height: 400            # Map height in cells
+  update_rate: 2.0           # Map publish rate (Hz)
+  sensor_max_range: 20.0     # Max sensor range (m)
+  # Base-frame ground returns are around -0.31..-0.18 m in MARSIM.  The
+  # occupancy mapper has no ground classifier, so keep only obstacles at
+  # least about 0.16 m above the floor instead of marking the floor occupied.
+  min_height: -0.15
+
+# --- Planning ---
+planning:
+  frontier_min_size: 5
+  replan_interval: 2.0
+  goal_tolerance: 0.5
+  inflation_radius: 0.25
+  size_weight: 1.0
+  distance_weight: 1.0
+  obstacle_threshold: 50
+  map_timeout: 5.0
+  localization_timeout: 5.0
+  mapping_status_timeout: 3.0
+  localization_status_timeout: 3.0
+  future_stamp_tolerance: 0.5
+  status_heartbeat_interval: 1.0
+  exploration_complete_confirmations: 3
+  # Bounded active visual coverage at each newly reached exploration target.
+  visual_scan_enabled: true
+  visual_scan_yaw_step: 0.7853981634       # 45 deg; overlap for ~60 deg RGB-D FoV
+  visual_scan_yaw_tolerance: 0.15          # radians
+  visual_scan_dwell: 0.6                   # seconds per heading
+  visual_scan_heading_timeout: 4.0         # seconds, before one retry/skip
+  visual_scan_timeout: 45.0                # whole scan bound
+  visual_scan_failure_cooldown: 5.0        # seconds before retry at failed position
+  visual_scan_position_dedup_radius: 1.0   # metres
+  visual_scan_route_spacing: 2.0            # route checkpoint spacing (m)
+  visual_scan_target_tolerance: 0.35       # metres
+  visual_scan_max_heading_retries: 1
+  visual_scan_update_interval: 0.1
+  visual_scan_final_before_complete: true
+
+# --- Localization ---
+localization:
+  publish_tf: true         # Publish dynamic TF world -> base (only dynamic TF publisher)
+  imu_frame: "livox_imu_link"   # FAST-LIO `body` == IMU frame (team contract)
+  base_frame: "base"            # Robot base frame
+  # Fixed extrinsic base -> livox_imu_link. FAST-LIO body is the IMU frame, so
+  # the adapter composes T_world_base = T_world_body * (T_base_imu)^-1.
+  # Value derived from a1_description URDF chain:
+  #   base->laser_livox (0.2 0 0.08, rpy 0 0.785 0) *
+  #   laser_livox->livox_imu_link (-0.011 -0.02329 0.04412, rpy 0 0 0)
+  base_to_imu_translation: [0.223404, -0.023290, 0.118985]
+  base_to_imu_rotation_rpy: [0.0, 0.785, 0.0]
+
+# --- Perception ---
+perception:
+  red_hue_min: 0             # Red hue lower bound (HSV, 0-180 for OpenCV)
+  red_hue_max: 10            # Red hue upper bound (HSV)
+  min_confidence: 0.5        # Minimum detection confidence
+  publish_debug_image: false

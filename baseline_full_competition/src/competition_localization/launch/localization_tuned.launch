@@ -1,0 +1,67 @@
+<launch>
+  <!--
+    localization_tuned.launch : 方案2 - FAST-LIO 参数调优（调试用）。
+    基于 localization_filtered.launch（消费过滤后的点云），针对"运动欠跟踪 + 静止无界蠕变"调整参数：
+      - acc_cov/gyr_cov   : 0.1 -> 1.0   （增大 IMU 噪声，削弱对 IMU 积分的信任，增强点云校正权重）
+      - b_acc_cov/b_gyr_cov: 0.0001 -> 0.001 （加快加速度/陀螺偏置估计收敛，对抗恒定方向蠕变）
+      - max_iteration     : 3 -> 5      （增加点云配准迭代次数，提高运动时收敛精度）
+      - point_filter_num  : 3 -> 2      （保留更多点参与匹配）
+      - filter_size_surf/map: 0.2/0.3 -> 0.15/0.25 （更细的体素，保留更多几何细节）
+  -->
+
+  <arg name="rviz" default="false" />
+  <arg name="lid_topic" default="/livox/Pointcloud2_filtered" />
+  <arg name="imu_topic" default="/livox/imu" />
+  <arg name="odom_input_topic" default="/Odometry" />
+  <arg name="team_scene_info_path" default="generated_building/team_scene_info.json" />
+  <arg name="filter_size_surf" default="0.15" />
+  <arg name="filter_size_map" default="0.25" />
+  <arg name="correction_enabled" default="false" />
+  <arg name="correction_odom_topic" default="/c2r28/proprio_fastlio_shadow/odom" />
+  <arg name="correction_mode" default="full_pose" />
+
+  <rosparam command="load" file="$(find fast_lio)/config/mid360_sim.yaml" />
+
+  <!-- 覆盖 lid_topic 到过滤后的话题（FAST-LIO 按 /common/lid_topic 订阅） -->
+  <param name="common/lid_topic" type="string" value="$(arg lid_topic)" />
+
+  <!-- 生产外参修正（同 localization_bringup.launch） -->
+  <rosparam param="mapping/extrinsic_T" subst_value="True">[0.011, 0.02329, -0.04412]</rosparam>
+  <rosparam param="mapping/extrinsic_R" subst_value="True">[1, 0, 0,
+                                                             0, 1, 0,
+                                                             0, 0, 1]</rosparam>
+  <param name="mapping/extrinsic_est_en" type="bool" value="false" />
+
+  <!-- ===== 方案2 调优参数（命名空间 mapping/，见 mid360_sim.yaml） ===== -->
+  <param name="mapping/acc_cov" type="double" value="1.0" />
+  <param name="mapping/gyr_cov" type="double" value="1.0" />
+  <param name="mapping/b_acc_cov" type="double" value="0.001" />
+  <param name="mapping/b_gyr_cov" type="double" value="0.001" />
+
+  <param name="feature_extract_enable" type="bool" value="0"/>
+  <param name="point_filter_num" type="int" value="2"/>
+  <param name="max_iteration" type="int" value="5" />
+  <param name="filter_size_surf" type="double" value="$(arg filter_size_surf)" />
+  <param name="filter_size_map" type="double" value="$(arg filter_size_map)" />
+  <param name="cube_side_length" type="double" value="1000" />
+  <param name="runtime_pos_log_enable" type="bool" value="0" />
+  <param name="pcd_save/pcd_save_en" type="bool" value="false" />
+
+  <node pkg="fast_lio" type="fastlio_mapping" name="laserMapping" output="screen"
+        respawn="false">
+    <remap from="/livox/lidar" to="$(arg lid_topic)" />
+    <remap from="/livox/imu" to="$(arg imu_topic)" />
+  </node>
+
+  <node pkg="competition_localization" type="localization_node" name="localization"
+        output="screen" respawn="false">
+    <param name="odom_input_topic" value="$(arg odom_input_topic)" />
+    <param name="team_scene_info_path" value="$(arg team_scene_info_path)" />
+    <param name="publish_tf" value="true" />
+    <param name="correction_enabled" value="$(arg correction_enabled)" />
+    <param name="correction_odom_topic" value="$(arg correction_odom_topic)" />
+    <param name="correction_mode" value="$(arg correction_mode)" />
+    <rosparam param="base_to_imu_translation">[0.223404, -0.023290, 0.118985]</rosparam>
+    <rosparam param="base_to_imu_rotation_rpy">[0.0, 0.785, 0.0]</rosparam>
+  </node>
+</launch>

@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>competition_control</name>
+  <version>0.1.0</version>
+  <description>Motion control: path following, velocity limiting, watchdog timeout, and
+  the exclusive /cmd_vel publisher (cmd_vel_guard_node).</description>
+
+  <maintainer email="yangyuanhao@example.com">yangyuanhao</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <build_depend>rospy</build_depend>
+  <build_depend>std_msgs</build_depend>
+  <build_depend>geometry_msgs</build_depend>
+  <build_depend>nav_msgs</build_depend>
+  <build_depend>competition_interfaces</build_depend>
+
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>competition_interfaces</exec_depend>
+</package>

@@ -1,0 +1,10 @@
+### EFFECTIVE ROS PARAMS (captured live, 2026-09-14T15:39:51+08:00)
+/competition_loop/max_time = 1800.0
+/use_sim_time = true
+/competition_loop/return_arrival_tolerance = 0.25
+/planning/inflation_radius = 0.25
+/planning/room_mission_enabled = true
+/planning/visual_scan_route_spacing = 4.0
+
+### room_scan_zones
+'[[1.1,9.5,7.9,21.9],[-9.5,-1.1,7.9,21.9],[1.1,9.5,21.9,35.9],[-9.5,-1.1,21.9,35.9]]'

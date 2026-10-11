@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""mock_mapping_node — publish a synthetic OccupancyGrid for integration testing.
+
+ALL data is hard-coded. Forbidden to read any truth files or ground truth topics.
+Runs ONLY in test mode (competition_mode=false).
+"""
+
+from __future__ import annotations
+
+import sys
+
+import rospy
+import nav_msgs.msg
+from competition_interfaces.msg import ModuleStatus
+
+
+def main():
+    rospy.init_node("mock_mapping", log_level=rospy.INFO)
+
+    # Guard: competition_mode=true means official competition — refuse to run
+    competition_mode = rospy.get_param("/competition_loop/competition_mode", True)
+    if competition_mode:
+        rospy.logerr(
+            "mock_mapping: competition_mode=true — "
+            "mock nodes MUST NOT run in official competition. Refusing to start."
+        )
+        sys.exit(1)
+
+    rospy.loginfo("mock_mapping: publishing synthetic OccupancyGrid (TEST MODE ONLY).")
+
+    map_pub = rospy.Publisher(
+        "/competition/map", nav_msgs.msg.OccupancyGrid, queue_size=1, latch=True
+    )
+    status_pub = rospy.Publisher(
+        "/competition/mapping/status", ModuleStatus, queue_size=10, latch=True
+    )
+
+    # Build a simple 200x200 cell grid (20m x 20m at 0.1m resolution)
+    width = 200
+    height = 200
+    resolution = 0.1
+    data = [-1] * (width * height)
+
+    # Fill a free center area (simulate explored corridor)
+    for row in range(40, 160):
+        for col in range(20, 180):
+            data[row * width + col] = 0  # free
+
+    # Add some occupied walls
+    for col in range(20, 180):
+        data[40 * width + col] = 100  # top wall
+        data[159 * width + col] = 100  # bottom wall
+    for row in range(40, 160):
+        data[row * width + 20] = 100  # left wall
+        data[row * width + 179] = 100  # right wall
+
+    grid = nav_msgs.msg.OccupancyGrid()
+    grid.header.frame_id = "world"
+    grid.info.resolution = resolution
+    grid.info.width = width
+    grid.info.height = height
+    grid.info.origin.position.x = -10.0
+    grid.info.origin.position.y = -10.0
+    grid.info.origin.position.z = 0.0
+    grid.info.origin.orientation.w = 1.0
+    grid.data = data
+
+    status = ModuleStatus()
+    status.header.stamp = rospy.Time.now()
+    status.state = ModuleStatus.RUNNING
+    status.valid = True
+    status.confidence = 1.0
+    status.detail = "mock mapping (test mode only)"
+    status_pub.publish(status)
+
+    rate = rospy.Rate(1)
+    while not rospy.is_shutdown():
+        grid.header.stamp = rospy.Time.now()
+        map_pub.publish(grid)
+        rate.sleep()
+
+
+if __name__ == "__main__":
+    main()

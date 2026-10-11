@@ -1,0 +1,7 @@
+[submodule "src/fast_lio"]
+    path = src/fast_lio
+    url = https://github.com/Carl-Huang12138/jwh_FAST_LIO.git
+
+[submodule "src/livox_ros_driver"]
+    path = src/livox_ros_driver
+    url = https://github.com/Carl-Huang12138/livox_ros_driver.git
