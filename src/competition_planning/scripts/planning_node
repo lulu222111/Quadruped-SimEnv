@@ -170,6 +170,20 @@ class PlanningNode:
         self.room_mission_terminal = False
         # Bounded per-epoch budget of wedged service points that were skipped.
         self.room_mission_stuck_skips = 0
+        # Physical-contact learning: a follower stuck report is physical
+        # evidence of an obstacle the map does not contain.  The touched patch
+        # is remembered for the rest of the mission epoch so the replan of the
+        # *same* service point routes around the real obstacle instead of
+        # repeating a plan the robot cannot execute.  Bounded per epoch.
+        self.learned_blocked_cells = set()
+        self.room_mission_contact_marks = 0
+        # Consecutive cycles the active service point had to be approached
+        # blindly.  A second consecutive step is treated as evidence that the
+        # robot did not get through (see _mark_failed_approach_locked).
+        self.room_mission_approach_streak = 0
+        # Grid cells of the route the node last planned (used to derive the
+        # direction of travel at the moment a stuck report arrives).
+        self.last_planned_path_cells = []
         # Room-only visual scan zones: hazards spawn only inside rooms, so
         # outside (lobby/corridor/entry) scan stations are skipped.  Empty
         # list = scan anywhere (no gating).
@@ -447,6 +461,47 @@ class PlanningNode:
             self.room_mission_stuck_skip_limit = int(
                 rospy.get_param("~room_mission_stuck_skip_limit", 2)
             )
+            # Physical-contact learning (see ``learned_blocked_cells``).  Each
+            # stuck report marks the obstacle the robot just hit and the same
+            # target is retried; the marking budget is bounded per epoch, and
+            # once it is exhausted the ordinary bounded skip applies.
+            self.room_mission_contact_learning_enabled = bool(
+                rospy.get_param(
+                    "~room_mission_contact_learning_enabled", True
+                )
+            )
+            self.room_mission_contact_mark_limit = int(
+                rospy.get_param("~room_mission_contact_mark_limit", 12)
+            )
+            self.room_mission_contact_mark_ahead_cells = int(
+                rospy.get_param(
+                    "~room_mission_contact_mark_ahead_cells", 4
+                )
+            )
+            self.room_mission_contact_mark_depth_cells = int(
+                rospy.get_param(
+                    "~room_mission_contact_mark_depth_cells", 3
+                )
+            )
+            self.room_mission_contact_mark_half_width_cells = int(
+                rospy.get_param(
+                    "~room_mission_contact_mark_half_width_cells", 8
+                )
+            )
+            # A service point whose goal region is not known-free is not a
+            # dead end: the drive takes a bounded blind step toward it so the
+            # robot re-observes, the map grows, and the next replan can succeed.
+            self.room_mission_approach_enabled = bool(
+                rospy.get_param("~room_mission_approach_enabled", True)
+            )
+            self.room_mission_approach_distance = float(
+                rospy.get_param("~room_mission_approach_distance", 2.0)
+            )
+            # Sideways standoff used when repeated blind steps fail: the robot
+            # relocates along the obstacle so the learned patch sweeps it.
+            self.room_mission_relocation_distance = float(
+                rospy.get_param("~room_mission_relocation_distance", 1.5)
+            )
             raw_targets = rospy.get_param(
                 "~room_mission_targets", None
             )
@@ -622,6 +677,31 @@ class PlanningNode:
             raise ValueError(
                 "room_mission_stuck_skip_limit must not be negative"
             )
+        if self.room_mission_contact_mark_limit < 0:
+            raise ValueError(
+                "room_mission_contact_mark_limit must not be negative"
+            )
+        if self.room_mission_contact_mark_ahead_cells < 1:
+            raise ValueError(
+                "room_mission_contact_mark_ahead_cells must be positive"
+            )
+        if self.room_mission_contact_mark_depth_cells < 1:
+            raise ValueError(
+                "room_mission_contact_mark_depth_cells must be positive"
+            )
+        if self.room_mission_contact_mark_half_width_cells < 0:
+            raise ValueError(
+                "room_mission_contact_mark_half_width_cells must not be "
+                "negative"
+            )
+        if self.room_mission_approach_distance < 0.0:
+            raise ValueError(
+                "room_mission_approach_distance must not be negative"
+            )
+        if self.room_mission_relocation_distance < 0.0:
+            raise ValueError(
+                "room_mission_relocation_distance must not be negative"
+            )
         if not 1 <= self.obstacle_threshold <= 100:
             raise ValueError("obstacle_threshold must be in [1, 100]")
 
@@ -790,6 +870,12 @@ class PlanningNode:
         self.room_mission_idx = 0
         self.room_mission_terminal = False
         self.room_mission_stuck_skips = 0
+        # Contact learning is per mission epoch: the physically discovered
+        # obstacles belong to the map of this epoch.
+        self.room_mission_contact_marks = 0
+        self.learned_blocked_cells = set()
+        self.room_mission_approach_streak = 0
+        self.last_planned_path_cells = []
 
     def _clear_frontier_continuation_locked(self):
         """Drop the unfinished frontier route and its visual final marker."""
@@ -899,11 +985,86 @@ class PlanningNode:
             ),
             obstacle_threshold=self.obstacle_threshold,
         )
+        if result.get("status") == PLAN_SUCCESS:
+            with self.lock:
+                self.room_mission_approach_streak = 0
         if result.get("status") != PLAN_SUCCESS:
+            # Do not hold forever: take one bounded blind step toward the
+            # service point so the robot re-observes and the map grows.  Only
+            # when even that is impossible (no room to move at all) does the
+            # drive stay put for this cycle.
+            approach = self._room_mission_approach_result(
+                robot_cell, goal_cell, map_msg
+            )
+            if approach is not None:
+                with self.lock:
+                    streak = self.room_mission_approach_streak
+                    self.room_mission_approach_streak += 1
+                    if streak >= 1:
+                        # The previous blind step did not resolve anything, so
+                        # the robot did not get through: record the obstacle
+                        # (bounded) and replan from the corrected map.
+                        self._mark_failed_approach_locked(
+                            robot_cell, approach["path"][-1]
+                        )
+                if streak >= 1:
+                    # Marking the same bar again cannot help while the robot
+                    # stands still; relocate along the obstacle so the next
+                    # attempt contacts it somewhere new and the learned patch
+                    # sweeps along it.
+                    relocation = self._room_mission_relocation_result(
+                        robot_cell,
+                        goal_cell,
+                        map_msg,
+                        inflation_radius_cells,
+                    )
+                    if relocation is not None:
+                        rospy.logwarn_throttle(
+                            5.0,
+                            "planning_node: room_mission target %s still "
+                            "unreachable; relocating %.1f m sideways along the "
+                            "obstacle before retrying",
+                            (round(tx, 2), round(ty, 2)),
+                            self.room_mission_relocation_distance,
+                        )
+                        relocation["room_mission_idx"] = idx
+                        relocation["room_mission_total"] = len(targets)
+                        relocation["room_mission_terminal"] = False
+                        relocation["frontier_count"] = 0
+                        relocation["frontier_goal_cell"] = relocation[
+                            "goal_cell"
+                        ]
+                        relocation["frontier_goal_offset_used"] = False
+                        return relocation
+                # Release any held visual-scan checkpoint route exactly like
+                # the wedged-target skip does.  Otherwise the checkpoint
+                # branch keeps republishing its own held route in the cycles
+                # where it wins, the follower restarts at waypoint 1 every
+                # cycle, and the bounded step never actually presses into the
+                # obstacle that has to be learned.
+                with self.lock:
+                    self.visual_scan_checkpoint_path = None
+                    self.visual_scan_checkpoint_goal = None
+                    self.visual_scan_checkpoint_origin = None
+                rospy.logwarn_throttle(
+                    5.0,
+                    "planning_node: room_mission target %s unreachable "
+                    "(%s); taking a bounded %.1f m approach step toward it",
+                    (round(tx, 2), round(ty, 2)),
+                    result.get("detail", "no path"),
+                    self.room_mission_approach_distance,
+                )
+                approach["room_mission_idx"] = idx
+                approach["room_mission_total"] = len(targets)
+                approach["room_mission_terminal"] = False
+                approach["frontier_count"] = 0
+                approach["frontier_goal_cell"] = approach["goal_cell"]
+                approach["frontier_goal_offset_used"] = False
+                return approach
             rospy.logwarn_throttle(
                 5.0,
-                "planning_node: room_mission target %s unreachable; "
-                "holding",
+                "planning_node: room_mission target %s unreachable and no "
+                "approach step is available; holding",
                 (round(tx, 2), round(ty, 2)),
             )
             result = {
@@ -1749,6 +1910,275 @@ class PlanningNode:
         if completion_was_active or task_changed:
             self._publish_exploration_complete(False)
 
+    def _remember_planned_path_cells(self, path):
+        """Keep the grid cells of the route the node last planned.
+
+        The stuck callback needs the direction of travel at the instant the
+        follower reports no progress; the planned route is the only place that
+        direction is recorded (the stuck message carries no geometry).
+        """
+        if not path:
+            return
+        cells = [(int(c[0]), int(c[1])) for c in path]
+        with self.lock:
+            self.last_planned_path_cells = cells
+
+    def _map_with_learned_blocked_cells(self, map_msg):
+        """Return ``map_msg`` with the physically discovered obstacles applied.
+
+        A contact-marked cell is a fact about the world, so *every* planning
+        branch must see it.  Applying it in one place (the planning entry)
+        prevents the situation observed in the first validation run: the
+        deterministic drive saw the marked wall while another branch still saw
+        free space there, so the two published routes fought each other and the
+        robot oscillated in place.
+        """
+        with self.lock:
+            if not self.learned_blocked_cells:
+                return map_msg
+        width = map_msg.info.width
+        height = map_msg.info.height
+        data = list(map_msg.data)
+        if not self._apply_learned_blocked_cells(data, width, height):
+            return map_msg
+        clone = copy.copy(map_msg)
+        clone.data = data
+        return clone
+
+    def _apply_learned_blocked_cells(self, data, width, height):
+        """Overlay the physically discovered obstacles on a map copy.
+
+        ``learned_blocked_cells`` only ever contains cells the robot actually
+        collided with (see ``_mark_contact_obstacle_locked``), so this never
+        invents geometry: it is the robot's own contact experience added to a
+        map that failed to observe the same obstacle.  Returns True when at
+        least one cell changed.
+        """
+        with self.lock:
+            if not self.learned_blocked_cells:
+                return False
+            marked = list(self.learned_blocked_cells)
+        touched = False
+        for cell_x, cell_y in marked:
+            if 0 <= cell_x < width and 0 <= cell_y < height:
+                index = cell_y * width + cell_x
+                if data[index] != 100:
+                    data[index] = 100
+                    touched = True
+        return touched
+
+    def _contact_mark_direction_locked(self):
+        """Return (robot_cell, unit direction of travel) at the last plan."""
+        cells = self.last_planned_path_cells
+        if len(cells) < 2:
+            return None
+        robot_cell = cells[0]
+        next_cell = cells[1]
+        dx = next_cell[0] - robot_cell[0]
+        dy = next_cell[1] - robot_cell[1]
+        norm = hypot(dx, dy)
+        if norm <= 0.0:
+            return None
+        return robot_cell, (dx / norm, dy / norm)
+
+    def _mark_blocked_bar_locked(self, robot_cell, dir_x, dir_y, reason):
+        """Mark a transversal bar of blocked cells ahead of the robot.
+
+        Returns the number of newly learned cells (0 when the budget is
+        exhausted or the bar is already known).  Caller owns ``self.lock``.
+        """
+        if not self.room_mission_enabled:
+            return 0
+        if not self.room_mission_contact_learning_enabled:
+            return 0
+        if (
+            self.room_mission_contact_marks
+            >= self.room_mission_contact_mark_limit
+        ):
+            rospy.logwarn_throttle(
+                5.0,
+                "planning_node: contact-learning budget (%d) exhausted; "
+                "falling back to the bounded service-point skip",
+                self.room_mission_contact_mark_limit,
+            )
+            return 0
+        perp_x, perp_y = -dir_y, dir_x
+        ahead = self.room_mission_contact_mark_ahead_cells
+        depth = self.room_mission_contact_mark_depth_cells
+        half_width = self.room_mission_contact_mark_half_width_cells
+
+        added = 0
+        for along in range(ahead, ahead + depth):
+            for side in range(-half_width, half_width + 1):
+                cell_x = int(
+                    round(robot_cell[0] + dir_x * along + perp_x * side)
+                )
+                cell_y = int(
+                    round(robot_cell[1] + dir_y * along + perp_y * side)
+                )
+                if (cell_x, cell_y) not in self.learned_blocked_cells:
+                    self.learned_blocked_cells.add((cell_x, cell_y))
+                    added += 1
+        if added:
+            self.room_mission_contact_marks += 1
+            rospy.logwarn(
+                "planning_node: %s recorded as a learned obstacle "
+                "(%d new cells, mark %d/%d this epoch)",
+                reason,
+                added,
+                self.room_mission_contact_marks,
+                self.room_mission_contact_mark_limit,
+            )
+        return added
+
+    def _mark_contact_obstacle_locked(self):
+        """Record the obstacle patch the robot has physically collided with.
+
+        Returns True when cells were added, False when the marking budget is
+        exhausted or the direction is unknown (the caller then falls back to
+        the bounded skip).
+
+        Rationale (Floor0 owner control run, 2026-09-13): the planner planned a
+        2.6 m route straight through the 6.4 m corridor wall of room_1 because
+        the published map did not contain that wall; the follower commanded
+        0.25 m/s and the robot made 0.164 m of 2.000 m.  Replanning the same
+        target from the same map reproduces the same plan, so the only
+        recoverable action is to record what the robot felt and replan.
+        """
+        with self.lock:
+            contact = self._contact_mark_direction_locked()
+            if contact is None:
+                return False
+            robot_cell, (dir_x, dir_y) = contact
+            added = self._mark_blocked_bar_locked(
+                robot_cell,
+                dir_x,
+                dir_y,
+                "physical contact at %s" % (robot_cell,),
+            )
+        return bool(added)
+
+    def _mark_failed_approach_locked(self, robot_cell, approach_cell):
+        """Learn from a bounded step that had to be taken again.
+
+        A blind step that is still necessary on the *next* cycle is the same
+        physical evidence as a stuck report: the robot did not get through.
+        It also has to change the map, because an identical two-pose path is
+        treated by the follower as a heartbeat, which never re-arms its stuck
+        bookkeeping (observed in the 2026-09-14 02:28 validation attempt).
+
+        Caller owns ``self.lock``.
+        """
+        dx = approach_cell[0] - robot_cell[0]
+        dy = approach_cell[1] - robot_cell[1]
+        norm = hypot(dx, dy)
+        if norm <= 0.0:
+            return 0
+        return self._mark_blocked_bar_locked(
+            robot_cell,
+            dx / norm,
+            dy / norm,
+            "failed approach step at %s" % (robot_cell,),
+        )
+
+    def _room_mission_approach_result(self, robot_cell, goal_cell, map_msg):
+        """Return a bounded blind step toward a service point, or None.
+
+        A room-mission service point whose goal region is not known-free (the
+        area is still unmapped, or every candidate in the search region is)
+        used to produce a fabricated one-pose "success" that holds forever and
+        never generates another stuck report, so the task deadlocked
+        permanently.  One bounded step toward the point instead lets the robot
+        re-observe, grow the map, and let the next replan plan the real route.
+        """
+        if not self.room_mission_approach_enabled:
+            return None
+        if self.room_mission_approach_distance <= 0.0:
+            return None
+        info = map_msg.info
+        resolution = info.resolution
+        if resolution <= 0.0:
+            return None
+        robot_x, robot_y = robot_cell
+        goal_x, goal_y = goal_cell
+        dx = goal_x - robot_x
+        dy = goal_y - robot_y
+        distance = hypot(dx, dy)
+        if distance <= 0.0:
+            return None
+        step = min(
+            distance,
+            max(1.0, round(self.room_mission_approach_distance / resolution)),
+        )
+        approach_x = int(round(robot_x + dx / distance * step))
+        approach_y = int(round(robot_y + dy / distance * step))
+        approach_x = max(0, min(info.width - 1, approach_x))
+        approach_y = max(0, min(info.height - 1, approach_y))
+        if (approach_x, approach_y) == (robot_x, robot_y):
+            return None
+        return {
+            "status": PLAN_SUCCESS,
+            "path": [(robot_x, robot_y), (approach_x, approach_y)],
+            "goal_cell": (approach_x, approach_y),
+            "room_mission_approach": True,
+        }
+
+    def _room_mission_relocation_result(
+        self, robot_cell, goal_cell, map_msg, inflation_radius_cells
+    ):
+        """Plan a bounded sideways relocation when a blind step keeps failing.
+
+        Marking the blocked bar alone cannot make progress while the robot does
+        not move: the next approach step would be computed from the same pose,
+        mark the same cells, and change nothing.  Relocating the robot along the
+        obstacle is what turns the blocked direction into a *sweep*: each later
+        attempt contacts the obstacle at a new place, so the learned patch
+        grows along it and the planner's route is finally forced around it
+        (the room_1 corridor wall case: the sweep reaches the real door).
+
+        Both sides are validated with the planner itself, so the standoff is
+        always a reachable, known-free cell - no hardcoded geometry, no GT.
+        """
+        info = map_msg.info
+        resolution = info.resolution
+        if resolution <= 0.0:
+            return None
+        dx = goal_cell[0] - robot_cell[0]
+        dy = goal_cell[1] - robot_cell[1]
+        norm = hypot(dx, dy)
+        if norm <= 0.0:
+            return None
+        perp_x, perp_y = -dy / norm, dx / norm
+        side_cells = max(
+            1,
+            int(round(self.room_mission_relocation_distance / resolution)),
+        )
+        for side in (1.0, -1.0):
+            standoff = (
+                int(round(robot_cell[0] + perp_x * side * side_cells)),
+                int(round(robot_cell[1] + perp_y * side * side_cells)),
+            )
+            if standoff == tuple(robot_cell):
+                continue
+            result = plan_to_goal_with_status(
+                list(map_msg.data),
+                width=info.width,
+                height=info.height,
+                robot_cell=robot_cell,
+                goal_cell=standoff,
+                inflation_radius_cells=inflation_radius_cells,
+                start_recovery_radius_cells=self.start_recovery_radius_cells,
+                obstacle_threshold=self.obstacle_threshold,
+            )
+            if result.get("status") == PLAN_SUCCESS:
+                return {
+                    "status": PLAN_SUCCESS,
+                    "path": result["path"],
+                    "goal_cell": standoff,
+                    "room_mission_relocation": True,
+                }
+        return None
+
     def _skip_wedged_room_mission_target_locked(self):
         """Advance past a service point the robot physically cannot reach.
 
@@ -1787,6 +2217,8 @@ class PlanningNode:
         wedged = targets[self.room_mission_idx]
         self.room_mission_stuck_skips += 1
         self.room_mission_idx += 1
+        # A different service point starts with a fresh approach streak.
+        self.room_mission_approach_streak = 0
         # Release the bounded visual-station route prefix: it was planned
         # toward the wedged target, and keeping it would keep commanding the
         # same blocked motion.  Coverage bookkeeping is untouched, so the
@@ -1824,9 +2256,15 @@ class PlanningNode:
             return
         with self.lock:
             if not self.returning:
-                # Exploration-side recovery: the deterministic drive has no
-                # committed route to drop, so the wedged *target* is released
-                # instead (bounded, see the helper).
+                # Exploration-side recovery: the deterministic drive has a
+                # committed-like route that the follower keeps executing, so
+                # the plan (not the target) is what has to change.  First
+                # record the obstacle the robot physically hit and retry the
+                # same service point from the corrected map (bounded per
+                # epoch); only when that budget is exhausted is the wedged
+                # target released.
+                if self._mark_contact_obstacle_locked():
+                    return
                 self._skip_wedged_room_mission_target_locked()
                 return
             if not self.return_recommit_on_stuck_enabled:
@@ -2637,6 +3075,9 @@ class PlanningNode:
         ):
             return
 
+        # Physically discovered obstacles apply to every branch below.
+        map_msg = self._map_with_learned_blocked_cells(map_msg)
+
         info = map_msg.info
 
         if (
@@ -2939,6 +3380,9 @@ class PlanningNode:
             if self.path_compression_enabled
             else result["path"]
         )
+        # The stuck callback has no geometry of its own, so remember the route
+        # the robot is now executing (see _contact_mark_direction_locked).
+        self._remember_planned_path_cells(output_path)
         stamp = rospy.Time.now()
         path_yaws = path_cell_yaws(
             output_path,
