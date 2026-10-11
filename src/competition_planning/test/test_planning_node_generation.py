@@ -1,0 +1,2506 @@
+#!/usr/bin/env python3
+
+"""Deterministic generation-boundary tests for planning_node.
+
+These tests run without a ROS master: ``rospy`` and the ROS message
+modules are replaced by a small controllable fake, so the clock, every
+generation transition and every published message is fully
+deterministic. The planning node itself is loaded from the scripts
+directory next to this file.
+"""
+
+import importlib.machinery
+import importlib.util
+import copy
+import json
+import math
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+_PLANNING_NODE_PATH = SCRIPTS_DIR / "planning_node"
+
+_STATE = {
+    "clock": 100.0,
+    "params": {},
+    "published": {},
+    "timers": [],
+    "subscribers": [],
+}
+
+
+def _reset_fake_ros(clock=100.0):
+    _STATE["clock"] = float(clock)
+    _STATE["params"].clear()
+    _STATE["published"].clear()
+    del _STATE["timers"][:]
+    del _STATE["subscribers"][:]
+
+
+def set_clock(value):
+    _STATE["clock"] = float(value)
+
+
+class FakeTime:
+    def __init__(self, value=0.0):
+        self.secs = value.secs if isinstance(value, FakeTime) else float(value)
+
+    @staticmethod
+    def now():
+        return FakeTime(_STATE["clock"])
+
+    def is_zero(self):
+        return self.secs == 0.0
+
+    def to_sec(self):
+        return self.secs
+
+    def __sub__(self, other):
+        if isinstance(other, FakeTime):
+            return FakeDuration(self.secs - other.secs)
+        return NotImplemented
+
+    def __eq__(self, other):
+        return self.secs == other.secs
+
+    def __ne__(self, other):
+        return self.secs != other.secs
+
+    def __lt__(self, other):
+        return self.secs < other.secs
+
+    def __le__(self, other):
+        return self.secs <= other.secs
+
+    def __gt__(self, other):
+        return self.secs > other.secs
+
+    def __ge__(self, other):
+        return self.secs >= other.secs
+
+    def __hash__(self):
+        return hash(self.secs)
+
+    def __repr__(self):
+        return "FakeTime({:.3f})".format(self.secs)
+
+
+class FakeDuration:
+    def __init__(self, secs=0.0):
+        self.secs = float(secs)
+
+    def to_sec(self):
+        return self.secs
+
+
+class FakePublisher:
+    def __init__(self, topic, msg_class=None, **kwargs):
+        self.topic = topic
+        _STATE["published"].setdefault(topic, [])
+
+    def publish(self, msg):
+        _STATE["published"].setdefault(self.topic, []).append(msg)
+
+
+class FakeSubscriber:
+    def __init__(self, topic, msg_class=None, callback=None, **kwargs):
+        _STATE["subscribers"].append((topic, callback))
+
+
+class FakeTimer:
+    def __init__(self, period, callback=None, **kwargs):
+        _STATE["timers"].append((period, callback))
+
+
+def _fake_get_param(name, default=None):
+    key = name[1:] if name.startswith("~") else name
+    return _STATE["params"].get(key, default)
+
+
+def _fake_init_node(*args, **kwargs):
+    pass
+
+
+def _fake_spin():
+    pass
+
+
+def _fake_log(*args, **kwargs):
+    pass
+
+
+_ROSPY = types.ModuleType("rospy")
+_ROSPY.Time = FakeTime
+_ROSPY.Duration = FakeDuration
+_ROSPY.Publisher = FakePublisher
+_ROSPY.Subscriber = FakeSubscriber
+_ROSPY.Timer = FakeTimer
+_ROSPY.get_param = _fake_get_param
+_ROSPY.init_node = _fake_init_node
+_ROSPY.spin = _fake_spin
+_ROSPY.loginfo = _fake_log
+_ROSPY.logwarn = _fake_log
+_ROSPY.logerr = _fake_log
+_ROSPY.loginfo_throttle = _fake_log
+_ROSPY.logwarn_throttle = _fake_log
+_ROSPY.logerr_throttle = _fake_log
+
+
+class FakeHeader:
+    def __init__(self):
+        self.stamp = FakeTime(0.0)
+        self.frame_id = ""
+
+
+class FakePoint:
+    def __init__(self):
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+
+
+class FakeQuaternion:
+    def __init__(self):
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+        self.w = 1.0
+
+
+class FakePose:
+    def __init__(self):
+        self.position = FakePoint()
+        self.orientation = FakeQuaternion()
+
+
+class FakePoseStamped:
+    def __init__(self):
+        self.header = FakeHeader()
+        self.pose = FakePose()
+
+
+class FakePath:
+    def __init__(self):
+        self.header = FakeHeader()
+        self.poses = []
+
+
+class FakeMapMetaData:
+    def __init__(self):
+        self.map_load_time = FakeTime(0.0)
+        self.resolution = 1.0
+        self.width = 0
+        self.height = 0
+        self.origin = FakePose()
+
+
+class FakeOccupancyGrid:
+    def __init__(self):
+        self.header = FakeHeader()
+        self.info = FakeMapMetaData()
+        self.data = []
+
+
+class FakeOdometry:
+    def __init__(self):
+        self.header = FakeHeader()
+        self.child_frame_id = ""
+        self.pose = FakePoseStamped()
+
+
+class FakeModuleStatus:
+    STARTING = 1
+    RUNNING = 2
+    SUCCEEDED = 3
+    BLOCKED = 4
+    TIMEOUT = 5
+    FAILED = 6
+
+    def __init__(self):
+        self.header = FakeHeader()
+        self.state = self.STARTING
+        self.valid = False
+        self.confidence = 0.0
+        self.detail = ""
+
+
+class FakeCompetitionState:
+    WAITING = 0
+    RUNNING = 1
+    RETURNING = 2
+    FINISHED = 3
+    ERROR = 4
+
+    def __init__(self):
+        self.header = FakeHeader()
+        self.state = self.WAITING
+        self.detail = ""
+
+
+def _make_package(name, attributes):
+    package = types.ModuleType(name)
+    package.__path__ = []
+    for attr, value in attributes.items():
+        setattr(package, attr, value)
+    return package
+
+
+_CI_MSG = _make_package(
+    "competition_interfaces.msg",
+    {
+        "ModuleStatus": FakeModuleStatus,
+        "CompetitionState": FakeCompetitionState,
+    },
+)
+_CI = _make_package("competition_interfaces", {"msg": _CI_MSG})
+
+_NAV_MSG = _make_package(
+    "nav_msgs.msg",
+    {
+        "OccupancyGrid": FakeOccupancyGrid,
+        "Odometry": FakeOdometry,
+        "Path": FakePath,
+    },
+)
+_NAV = _make_package("nav_msgs", {"msg": _NAV_MSG})
+
+_GEO_MSG = _make_package("geometry_msgs.msg", {"PoseStamped": FakePoseStamped})
+_GEO = _make_package("geometry_msgs", {"msg": _GEO_MSG})
+
+
+class FakeBool:
+    def __init__(self, data=False):
+        self.data = data
+
+
+_STD_MSG = _make_package("std_msgs.msg", {"Bool": FakeBool})
+_STD = _make_package("std_msgs", {"msg": _STD_MSG})
+
+
+def _install_fake_modules():
+    # Deliberately shadow any real ROS python modules so this test file
+    # stays deterministic with or without a ROS installation.
+    sys.modules["rospy"] = _ROSPY
+    sys.modules["competition_interfaces"] = _CI
+    sys.modules["competition_interfaces.msg"] = _CI_MSG
+    sys.modules["nav_msgs"] = _NAV
+    sys.modules["nav_msgs.msg"] = _NAV_MSG
+    sys.modules["geometry_msgs"] = _GEO
+    sys.modules["geometry_msgs.msg"] = _GEO_MSG
+    sys.modules["std_msgs"] = _STD
+    sys.modules["std_msgs.msg"] = _STD_MSG
+
+
+_install_fake_modules()
+
+# planning_node is an extensionless Python script, so the source-file
+# loader must be given explicitly.
+_PLANNING_NODE_LOADER = importlib.machinery.SourceFileLoader(
+    "planning_node_fake_ros_test",
+    str(_PLANNING_NODE_PATH),
+)
+_PLANNING_NODE_SPEC = importlib.util.spec_from_file_location(
+    "planning_node_fake_ros_test",
+    str(_PLANNING_NODE_PATH),
+    loader=_PLANNING_NODE_LOADER,
+)
+PLANNING_NODE = importlib.util.module_from_spec(_PLANNING_NODE_SPEC)
+_PLANNING_NODE_SPEC.loader.exec_module(PLANNING_NODE)
+
+# Ensure the pure-python helpers imported by the node come from the
+# same scripts directory this test file ships with.
+assert (
+    str(Path(PLANNING_NODE.__file__).resolve()) == str(_PLANNING_NODE_PATH)
+)
+
+
+class PlanningNodeGenerationBoundaryTest(unittest.TestCase):
+    def setUp(self):
+        _reset_fake_ros(clock=100.0)
+        _STATE["params"].update(
+            {
+                "map_timeout": 1.0,
+                "localization_timeout": 2.0,
+                "mapping_status_timeout": 3.0,
+                "localization_status_timeout": 3.0,
+                "future_stamp_tolerance": 0.2,
+                "status_heartbeat_interval": 0.1,
+                "replan_interval": 2.0,
+            }
+        )
+        self.node = PLANNING_NODE.PlanningNode()
+
+    @staticmethod
+    def _make_map(stamp, frame_id="world"):
+        msg = FakeOccupancyGrid()
+        msg.header.stamp = FakeTime(stamp)
+        msg.header.frame_id = frame_id
+        msg.info.resolution = 1.0
+        msg.info.width = 5
+        msg.info.height = 5
+        msg.data = [
+            -1, -1, -1, -1, -1,
+            -1,  0,  0,  0, -1,
+            -1,  0,  0,  0, -1,
+            -1,  0,  0,  0, -1,
+            -1, -1, -1, -1, -1,
+        ]
+        return msg
+
+    @staticmethod
+    def _make_odom(stamp, frame_id="world", child_frame_id="base"):
+        msg = FakeOdometry()
+        msg.header.stamp = FakeTime(stamp)
+        msg.header.frame_id = frame_id
+        msg.child_frame_id = child_frame_id
+        msg.pose.pose.position.x = 2.5
+        msg.pose.pose.position.y = 2.5
+        return msg
+
+    @staticmethod
+    def _make_fully_known_map(stamp):
+        msg = FakeOccupancyGrid()
+        msg.header.stamp = FakeTime(stamp)
+        msg.header.frame_id = "world"
+        msg.info.resolution = 1.0
+        msg.info.width = 5
+        msg.info.height = 5
+        msg.data = [0] * 25
+        return msg
+
+    @staticmethod
+    def _set_odom_yaw(msg, yaw):
+        msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        return msg
+
+    @staticmethod
+    def _make_status(valid, stamp, detail="test"):
+        msg = FakeModuleStatus()
+        msg.header.stamp = FakeTime(stamp)
+        msg.state = (
+            FakeModuleStatus.RUNNING
+            if valid
+            else FakeModuleStatus.BLOCKED
+        )
+        msg.valid = valid
+        msg.confidence = 1.0 if valid else 0.0
+        msg.detail = detail
+        return msg
+
+    def _published(self, topic):
+        return _STATE["published"].get(topic, [])
+
+    def _last_path(self):
+        paths = self._published("/competition/path")
+        return paths[-1] if paths else None
+
+    def _last_status_msg(self):
+        statuses = self._published("/competition/planning/status")
+        return statuses[-1] if statuses else None
+
+    def _publish_healthy_generation(self, base_time):
+        set_clock(base_time)
+        self.node.mapping_status_callback(
+            self._make_status(True, base_time)
+        )
+        self.node.localization_status_callback(
+            self._make_status(True, base_time)
+        )
+        self.node.map_callback(self._make_map(base_time + 0.1))
+        self.node.odom_callback(self._make_odom(base_time + 0.1))
+        set_clock(base_time + 0.2)
+        self.node.plan_callback(None)
+
+    def test_start_recovery_parameter_defaults_disabled(self):
+        self.assertEqual(self.node.start_recovery_radius_cells, 0)
+
+    def test_new_reached_target_starts_stationary_visual_scan(self):
+        self.node.active_exploration_target = (2.5, 2.5)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+
+        self.assertTrue(self.node._handle_reached_exploration_target(odom))
+        self.assertTrue(self.node.visual_coverage.active)
+        path = self._last_path()
+        self.assertEqual(len(path.poses), 2)
+        self.assertAlmostEqual(path.poses[0].pose.position.x, 2.5)
+        self.assertAlmostEqual(path.poses[1].pose.position.x, 2.5)
+        self.assertAlmostEqual(path.poses[0].pose.position.y, 2.5)
+        self.assertAlmostEqual(path.poses[1].pose.position.y, 2.5)
+        self.assertEqual(self._last_status_msg().state, FakeModuleStatus.RUNNING)
+        self.assertTrue(self._last_status_msg().valid)
+
+    def test_planner_target_reached_via_callback_starts_scan(self):
+        """The real plan callback, rather than a helper call, owns the trigger."""
+        self._publish_healthy_generation(100.0)
+        initial_path = self._last_path()
+        self.assertIsNotNone(initial_path)
+        self.assertGreater(len(initial_path.poses), 0)
+
+        checkpoint = self.node.active_exploration_target
+        self.assertIsNotNone(checkpoint)
+        odom = self._make_odom(100.3)
+        odom.pose.pose.position.x = checkpoint[0]
+        odom.pose.pose.position.y = checkpoint[1]
+        set_clock(100.4)
+        self.node.odom_callback(odom)
+        self.node.plan_callback(None)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        scan_path = self._last_path()
+        self.assertEqual(len(scan_path.poses), 2)
+        self.assertAlmostEqual(
+            scan_path.poses[0].pose.position.x,
+            scan_path.poses[1].pose.position.x,
+        )
+        self.assertAlmostEqual(
+            scan_path.poses[0].pose.position.y,
+            scan_path.poses[1].pose.position.y,
+        )
+
+    def test_route_checkpoint_uses_spacing_not_every_grid_cell(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5, 4.0, 4.5):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        robot = self._make_odom(100.1).pose.pose.position
+        self.node.visual_scan_route_spacing = 2.0
+        self.node.visual_coverage.scanned_positions = [(0.0, 0.0)]
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            100.1,
+        )
+        self.assertEqual(checkpoint, (4.5, 2.5))
+
+    def test_first_route_checkpoint_anchors_initial_search_station(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5, 4.0):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        robot = self._make_odom(100.1).pose.pose.position
+        self.node.visual_scan_route_spacing = 2.0
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            100.1,
+        )
+        self.assertEqual(checkpoint, (2.5, 2.5))
+
+    def test_checkpoint_selector_skips_cooling_down_start_pose(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5, 4.0, 4.5):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        now = 100.1
+        robot = self._make_odom(now).pose.pose.position
+        self.node.visual_coverage.failed_position = (2.5, 2.5)
+        self.node.visual_coverage.retry_not_before = now + 5.0
+
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            now,
+        )
+
+        self.assertIsNotNone(checkpoint)
+        self.assertNotEqual(checkpoint, (2.5, 2.5))
+        self.assertFalse(
+            self.node.visual_coverage.position_is_cooling_down(
+                checkpoint,
+                now,
+            )
+        )
+        self.assertGreater(checkpoint[0], 2.5)
+
+    def test_checkpoint_selector_returns_none_when_route_is_inside_cooldown(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.4):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        now = 100.1
+        robot = self._make_odom(now).pose.pose.position
+        self.node.visual_coverage.failed_position = (2.5, 2.5)
+        self.node.visual_coverage.retry_not_before = now + 5.0
+
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            now,
+        )
+
+        self.assertIsNone(checkpoint)
+
+    def test_checkpoint_selector_skips_covered_route_positions(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5, 4.0):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        now = 100.1
+        robot = self._make_odom(now).pose.pose.position
+        self.node.visual_scan_route_spacing = 2.0
+        self.node.visual_coverage.scanned_positions = [(2.5, 2.5)]
+
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            now,
+        )
+
+        self.assertEqual(checkpoint, (4.0, 2.5))
+        self.assertFalse(
+            self.node.visual_coverage.position_is_covered(
+                checkpoint,
+            )
+        )
+
+    def test_checkpoint_selector_returns_none_when_route_is_covered(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        now = 100.1
+        robot = self._make_odom(now).pose.pose.position
+        self.node.visual_scan_route_spacing = 2.0
+        self.node.visual_coverage.scanned_positions = [(2.5, 2.5)]
+
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            now,
+        )
+
+        self.assertIsNone(checkpoint)
+
+    def test_short_route_checkpoint_falls_back_to_route_endpoint(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        robot = self._make_odom(100.1).pose.pose.position
+        self.node.visual_scan_route_spacing = 2.0
+        self.node.visual_coverage.scanned_positions = [(0.0, 0.0)]
+        checkpoint = self.node._select_visual_scan_checkpoint(
+            path,
+            robot,
+            100.1,
+        )
+        self.assertEqual(checkpoint, (3.5, 2.5))
+
+    def test_failed_initial_checkpoint_cooldown_allows_frontier_progress(self):
+        self.node.visual_coverage = PLANNING_NODE.VisualCoverageTracker(
+            enabled=True,
+            yaw_step=math.pi / 2.0,
+            yaw_tolerance=0.05,
+            dwell=0.0,
+            heading_timeout=0.05,
+            scan_timeout=20.0,
+            position_dedup_radius=1.0,
+            max_heading_retries=0,
+            failure_cooldown=5.0,
+        )
+        self.node.visual_scan_dwell = 0.0
+
+        self._publish_healthy_generation(100.0)
+        initial_path = self._last_path()
+        self.assertIsNotNone(initial_path)
+        self.assertGreater(len(initial_path.poses), 0)
+        failed_checkpoint = self.node.active_exploration_target
+        self.assertEqual(failed_checkpoint, (2.5, 2.5))
+
+        # The real planning callback reaches the initially selected station
+        # and starts a normal (non-final) visual scan.
+        reached = self._make_odom(100.3)
+        reached.pose.pose.position.x = failed_checkpoint[0]
+        reached.pose.pose.position.y = failed_checkpoint[1]
+        set_clock(100.4)
+        self.node.odom_callback(reached)
+        self.node.plan_callback(None)
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertFalse(self.node.visual_scan_final_pending)
+
+        # Keep the first required heading unreached so the tracker itself
+        # records a failed position and starts its cooldown.
+        failure_time = 100.46
+        set_clock(failure_time)
+        failed_odom = self._set_odom_yaw(
+            self._make_odom(failure_time),
+            0.7,
+        )
+        self.node.odom_callback(failed_odom)
+        self.node.visual_scan_callback(None)
+
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertEqual(self.node.visual_coverage.scanned_positions, [])
+        self.assertEqual(
+            self.node.visual_coverage.failed_position,
+            failed_checkpoint,
+        )
+        self.assertGreater(
+            self.node.visual_coverage.retry_not_before,
+            failure_time,
+        )
+        self.assertFalse(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+
+        # During the cooldown, feed a fresh healthy map/odom pair and run
+        # the real planner again.  The failed start pose must not become a
+        # new normal visual checkpoint or a rotation-only path.
+        resume_time = failure_time + 0.1
+        set_clock(resume_time)
+        self.node.map_callback(self._make_map(resume_time))
+        self.node.odom_callback(self._make_odom(resume_time))
+        self.node.plan_callback(None)
+
+        resumed_path = self._last_path()
+        self.assertIsNotNone(resumed_path)
+        self.assertGreater(len(resumed_path.poses), 0)
+        self.assertFalse(
+            self.node.visual_coverage.active,
+            "normal cooldown recovery must not restart a scan",
+        )
+        self.assertFalse(
+            len(resumed_path.poses) == 2
+            and resumed_path.poses[0].pose.position.x
+            == resumed_path.poses[1].pose.position.x
+            and resumed_path.poses[0].pose.position.y
+            == resumed_path.poses[1].pose.position.y,
+            "frontier progress must not be replaced by a scan-only path",
+        )
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertFalse(
+            self._published(
+                "/competition/planning/exploration_complete"
+            )[-1].data
+        )
+
+        active_target = self.node.active_exploration_target
+        if active_target is not None:
+            self.assertFalse(
+                self.node.visual_coverage.position_is_cooling_down(
+                    active_target,
+                    resume_time,
+                )
+            )
+        final_pose = resumed_path.poses[-1].pose.position
+        self.assertGreater(
+            math.hypot(
+                final_pose.x - failed_checkpoint[0],
+                final_pose.y - failed_checkpoint[1],
+            ),
+            self.node.visual_scan_target_tolerance,
+        )
+
+    def test_route_checkpoint_is_preserved_across_replans(self):
+        self._publish_healthy_generation(100.0)
+        checkpoint = self.node.active_exploration_target
+        self.assertIsNotNone(checkpoint)
+        first_path = self._last_path()
+        first_geometry = [
+            (
+                pose.pose.position.x,
+                pose.pose.position.y,
+                pose.pose.orientation.z,
+                pose.pose.orientation.w,
+            )
+            for pose in first_path.poses
+        ]
+        first_stamp = first_path.header.stamp.to_sec()
+
+        set_clock(100.4)
+        self.node.plan_and_publish(
+            self.node.map_msg,
+            self.node.odom_msg,
+            self.node.generation,
+            mission_epoch=self.node.mission_epoch,
+            returning=False,
+        )
+        self.assertEqual(self.node.active_exploration_target, checkpoint)
+        held_path = self._last_path()
+        held_geometry = [
+            (
+                pose.pose.position.x,
+                pose.pose.position.y,
+                pose.pose.orientation.z,
+                pose.pose.orientation.w,
+            )
+            for pose in held_path.poses
+        ]
+        self.assertEqual(held_geometry, first_geometry)
+        self.assertGreater(held_path.header.stamp.to_sec(), first_stamp)
+        self.assertIn(
+            "visual_scan_checkpoint_path_held",
+            self._last_status_msg().detail,
+        )
+
+    def test_stale_checkpoint_route_is_released_not_republished(self):
+        """A held route the live map blocks is released, not republished.
+
+        The held route is a planner output from an earlier map; the map
+        watchdogs gate its freshness, not its geometry.  Without the
+        revalidation the node republishes the same blocked geometry for ever
+        and the follower is commanded into the obstacle -- measured on run
+        p0c, 6 of 41 held poses sat inside inflated-blocked cells at the
+        room_1 doorway and the robot wedged on the jamb for ~50 s.
+        """
+        node = self.node
+        mapping = self._make_map(100.1)
+        resolution = mapping.info.resolution
+        origin_x = mapping.info.origin.position.x
+        origin_y = mapping.info.origin.position.y
+
+        def held_route(cell_x, cell_y):
+            msg = FakePath()
+            msg.header.stamp = FakeTime(100.1)
+            msg.header.frame_id = "world"
+            pose = FakePoseStamped()
+            pose.header.stamp = FakeTime(100.1)
+            pose.header.frame_id = "world"
+            pose.pose.position.x = origin_x + (cell_x + 0.5) * resolution
+            pose.pose.position.y = origin_y + (cell_y + 0.5) * resolution
+            msg.poses = [pose]
+            return msg
+
+        def arm(route):
+            node.active_exploration_target = (1.5, 1.5)
+            node.visual_scan_checkpoint_path = route
+            node.visual_scan_checkpoint_goal = copy.deepcopy(route.poses[-1])
+            node.visual_scan_checkpoint_origin = (0.5, 0.5)
+
+        # A route the current map leaves clear stays held.
+        arm(held_route(2, 2))
+        self.assertFalse(node._release_stale_visual_checkpoint(mapping, 2))
+        self.assertEqual(node.active_exploration_target, (1.5, 1.5))
+        self.assertIsNotNone(node.visual_scan_checkpoint_path)
+
+        # The same route, now inside the inflated footprint of an obstacle the
+        # live map has since recorded, is released so the freshly planned path
+        # is published instead.
+        mapping.data[2 * mapping.info.width + 1] = 100
+        self.assertTrue(node._release_stale_visual_checkpoint(mapping, 2))
+        self.assertIsNone(node.active_exploration_target)
+        self.assertIsNone(node.visual_scan_checkpoint_path)
+        self.assertIsNone(node.visual_scan_checkpoint_goal)
+        self.assertIsNone(node.visual_scan_checkpoint_origin)
+
+        # Nothing armed: the release is a no-op rather than an error.
+        self.assertFalse(node._release_stale_visual_checkpoint(mapping, 2))
+
+    def test_held_route_predicate_matches_the_planning_inflation(self):
+        """The revalidation predicate mirrors path_planner.inflate_obstacles."""
+        node = self.node
+        mapping = self._make_map(100.1)
+        resolution = mapping.info.resolution
+        origin_x = mapping.info.origin.position.x
+        origin_y = mapping.info.origin.position.y
+
+        def path_through(cell_x, cell_y):
+            msg = FakePath()
+            msg.header.stamp = FakeTime(100.1)
+            msg.header.frame_id = "world"
+            pose = FakePoseStamped()
+            pose.header.stamp = FakeTime(100.1)
+            pose.header.frame_id = "world"
+            pose.pose.position.x = origin_x + (cell_x + 0.5) * resolution
+            pose.pose.position.y = origin_y + (cell_y + 0.5) * resolution
+            msg.poses = [pose]
+            return msg
+
+        # Cell (2, 2) is free; the ring around it is unknown (-1), which is
+        # not an obstacle, so a radius-2 footprint stays clear.
+        self.assertTrue(
+            node._path_is_clear_of_inflated_obstacles(
+                path_through(2, 2), mapping, 2
+            )
+        )
+        # Occupying (1, 2) puts (2, 2) inside the radius-2 footprint of an
+        # obstacle -- exactly what inflate_obstacles would mark blocked.
+        mapping.data[2 * mapping.info.width + 1] = 100
+        self.assertFalse(
+            node._path_is_clear_of_inflated_obstacles(
+                path_through(2, 2), mapping, 2
+            )
+        )
+        # A radius that does not reach the obstacle still accepts the route.
+        self.assertTrue(
+            node._path_is_clear_of_inflated_obstacles(
+                path_through(2, 2), mapping, 0
+            )
+        )
+
+    def test_frontier_continuation_replans_same_goal_on_current_map(self):
+        self.node.frontier_continuation_goal_cell = (3, 2)
+        self.node.frontier_continuation_frontier_cell = (3, 2)
+        self.node.frontier_continuation_frontier_count = 7
+
+        result = self.node._plan_frontier_continuation(
+            self._make_map(100.1),
+            robot_cell=(2, 2),
+            inflation_radius_cells=0,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["status"], PLANNING_NODE.PLAN_SUCCESS)
+        self.assertEqual(result["goal_cell"], (3, 2))
+        self.assertEqual(result["path"][-1], (3, 2))
+        self.assertEqual(result["frontier_count"], 7)
+        self.assertTrue(result["frontier_continuation"])
+
+    def test_frontier_continuation_releases_invalid_goal(self):
+        self.node.frontier_continuation_goal_cell = (4, 2)
+        self.node.frontier_continuation_frontier_cell = (4, 2)
+
+        result = self.node._plan_frontier_continuation(
+            self._make_map(100.1),
+            robot_cell=(2, 2),
+            inflation_radius_cells=0,
+        )
+
+        self.assertIsNone(result)
+        self.assertIsNone(self.node.frontier_continuation_goal_cell)
+        self.assertIsNone(self.node.frontier_continuation_frontier_cell)
+
+    def test_frontier_continuation_retargets_within_cached_cluster(self):
+        self.node.frontier_continuation_goal_cell = (4, 2)
+        self.node.frontier_continuation_frontier_cell = (3, 2)
+        self.node.frontier_continuation_frontier_count = 7
+        fallback = {
+            "status": PLANNING_NODE.PLAN_SUCCESS,
+            "goal_cell": (3, 1),
+            "path": [(2, 2), (3, 2), (3, 1)],
+            "frontier_count": 8,
+            "frontier_goal_cell": (3, 2),
+            "frontier_goal_offset_used": True,
+        }
+
+        with patch.object(
+            PLANNING_NODE,
+            "plan_to_frontier_with_status",
+            return_value=fallback,
+        ) as planner:
+            result = self.node._plan_frontier_continuation(
+                self._make_map(100.1),
+                robot_cell=(2, 2),
+                inflation_radius_cells=0,
+                heading_yaw=0.0,
+            )
+
+        self.assertEqual(planner.call_count, 1)
+        self.assertTrue(result["frontier_continuation"])
+        self.assertTrue(result["frontier_continuation_retargeted"])
+        self.assertEqual(result["continuation_goal_cell"], (4, 2))
+        self.assertEqual(result["frontier_goal_cell"], (3, 2))
+
+    def test_checkpoint_route_is_bounded_at_selected_station(self):
+        path = FakePath()
+        for x in (2.5, 3.0, 3.5, 4.0):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = 2.5
+            path.poses.append(pose)
+
+        route, goal = self.node._checkpoint_route(path, (3.5, 2.5))
+
+        self.assertEqual(len(route.poses), 3)
+        self.assertAlmostEqual(route.poses[-1].pose.position.x, 3.5)
+        self.assertAlmostEqual(goal.pose.position.x, 3.5)
+
+    def test_route_checkpoint_is_kept_when_replan_drops_it(self):
+        self._publish_healthy_generation(100.0)
+        checkpoint = self.node.active_exploration_target
+        self.assertIsNotNone(checkpoint)
+
+        path = FakePath()
+        for x, y in ((8.0, 8.0), (8.0, 10.0), (10.0, 10.0)):
+            pose = FakePoseStamped()
+            pose.pose.position.x = x
+            pose.pose.position.y = y
+            path.poses.append(pose)
+
+        set_clock(100.4)
+        self.node.plan_and_publish(
+            self.node.map_msg,
+            self.node.odom_msg,
+            self.node.generation,
+            mission_epoch=self.node.mission_epoch,
+            returning=False,
+        )
+
+        self.assertEqual(
+            self.node.active_exploration_target,
+            checkpoint,
+        )
+
+    def test_missed_checkpoint_reanchors_after_bounded_progress(self):
+        self._publish_healthy_generation(100.0)
+        checkpoint = self.node.active_exploration_target
+        self.assertIsNotNone(checkpoint)
+        self.assertEqual(
+            self.node.visual_scan_checkpoint_origin,
+            (2.5, 2.5),
+        )
+
+        robot = self._make_odom(100.5).pose.pose.position
+        robot.x = 3.5
+        robot.y = 2.5
+        self.node.visual_scan_route_spacing = 1.0
+        self.assertTrue(
+            self.node._visual_checkpoint_should_reanchor_locked(robot)
+        )
+
+        self.node.active_exploration_target = checkpoint
+        self.node.visual_scan_checkpoint_origin = (2.5, 2.5)
+        robot_msg = self._make_odom(100.5)
+        robot_msg.pose.pose.position.x = 3.5
+        robot_msg.pose.pose.position.y = 2.5
+        self.node.plan_and_publish(
+            self.node.map_msg,
+            robot_msg,
+            self.node.generation,
+            mission_epoch=self.node.mission_epoch,
+            returning=False,
+        )
+        # Re-anchoring must not mark the old point as scanned or start a scan
+        # by itself; the next odometry callback owns the actual trigger.
+        self.assertEqual(self.node.visual_coverage.scanned_positions, [])
+        self.assertEqual(
+            self.node.active_exploration_target,
+            (3.5, 2.5),
+        )
+        self.assertEqual(
+            self.node.visual_scan_checkpoint_origin,
+            (3.5, 2.5),
+        )
+        self.assertIn(
+            "visual_scan_checkpoint_reanchored",
+            self._last_status_msg().detail,
+        )
+
+
+    def test_target_not_reached_does_not_start_scan(self):
+        self.node.active_exploration_target = (10.0, 10.0)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+
+        self.assertFalse(self.node._handle_reached_exploration_target(odom))
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertEqual(self.node.active_exploration_target, (10.0, 10.0))
+
+    def test_nearby_scanned_target_is_deduplicated(self):
+        self.node.visual_coverage.scanned_positions = [(2.5, 2.5)]
+        self.node.active_exploration_target = (2.6, 2.5)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+
+        self.assertFalse(self.node._handle_reached_exploration_target(odom))
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertIsNone(self.node.active_exploration_target)
+
+    def test_visual_scan_disabled_preserves_normal_planner_path(self):
+        self.node.visual_coverage.enabled = False
+        self.node.active_exploration_target = (2.5, 2.5)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+
+        self.assertFalse(self.node._handle_reached_exploration_target(odom))
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertIsNone(self.node.active_exploration_target)
+
+    def test_no_frontier_waits_for_final_scan_before_completion(self):
+        self.node.visual_coverage = PLANNING_NODE.VisualCoverageTracker(
+            enabled=True,
+            yaw_step=math.pi / 2.0,
+            yaw_tolerance=0.1,
+            dwell=0.0,
+            heading_timeout=2.0,
+            scan_timeout=20.0,
+            position_dedup_radius=1.0,
+            max_heading_retries=0,
+        )
+        self.node.visual_scan_dwell = 0.0
+        set_clock(100.0)
+        self.node.mapping_status_callback(self._make_status(True, 100.0))
+        self.node.localization_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.map_callback(self._make_fully_known_map(100.1))
+        self.node.odom_callback(self._make_odom(100.1))
+        set_clock(100.2)
+        self.node.plan_callback(None)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertFalse(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+        self.assertTrue(self._last_status_msg().valid)
+        self.assertIn("visual scan heading", self._last_status_msg().detail)
+
+        now = 100.3
+        while self.node.visual_coverage.active:
+            target_yaw = self.node.visual_coverage.current_heading
+            set_clock(now)
+            odom = self._set_odom_yaw(self._make_odom(now), target_yaw)
+            self.node.odom_callback(odom)
+            self.node.visual_scan_callback(None)
+            now += 0.01
+
+            if self.node.visual_coverage.active:
+                set_clock(now)
+                odom = self._set_odom_yaw(
+                    self._make_odom(now),
+                    self.node.visual_coverage.current_heading,
+                )
+                self.node.odom_callback(odom)
+                self.node.visual_scan_callback(None)
+                now += 0.01
+
+        self.assertEqual(
+            len(self.node.visual_coverage.scanned_positions),
+            1,
+        )
+        self.assertFalse(self.node.visual_scan_final_pending)
+
+        # Completion debounce starts only after the final scan ended.
+        for _ in range(3):
+            now += 0.05
+            set_clock(now)
+            self.node.plan_callback(None)
+        self.assertTrue(self.node._exploration_complete_active)
+        self.assertTrue(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+        true_messages = [
+            message.data
+            for message in self._published(
+                "/competition/planning/exploration_complete"
+            )
+            if message.data
+        ]
+        self.assertEqual(len(true_messages), 1)
+
+    def test_final_scan_timeout_does_not_allow_completion(self):
+        self.node.visual_coverage = PLANNING_NODE.VisualCoverageTracker(
+            enabled=True,
+            yaw_step=math.pi / 2.0,
+            yaw_tolerance=0.1,
+            dwell=0.0,
+            heading_timeout=2.0,
+            scan_timeout=0.05,
+            position_dedup_radius=1.0,
+            max_heading_retries=0,
+            failure_cooldown=0.5,
+        )
+        self.node.visual_scan_dwell = 0.0
+
+        set_clock(100.0)
+        self.node.mapping_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.localization_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.map_callback(self._make_fully_known_map(100.1))
+        self.node.odom_callback(self._make_odom(100.1))
+
+        set_clock(100.2)
+        self.node.plan_callback(None)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+
+        set_clock(100.3)
+        self.node.odom_msg = self._make_odom(100.3)
+        self.node.visual_scan_callback(None)
+
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertEqual(
+            self.node.visual_coverage.scanned_positions,
+            [],
+        )
+        self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertFalse(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+        self.assertFalse(self._last_status_msg().valid)
+        self.assertEqual(len(self._last_path().poses), 0)
+        self.assertIn(
+            "coverage was not recorded",
+            self._last_status_msg().detail,
+        )
+
+        # Even repeated no-frontier evidence cannot bypass the pending
+        # mandatory final scan.
+        for _ in range(
+            self.node.exploration_complete_confirmations
+        ):
+            self.node._record_exploration_complete(
+                self.node.generation,
+                self.node.mission_epoch,
+            )
+
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertFalse(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+
+        # An immediate planning cycle must not restart the failed scan.
+        set_clock(100.31)
+        self.node.plan_callback(None)
+
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertFalse(self._last_status_msg().valid)
+        self.assertEqual(len(self._last_path().poses), 0)
+        self.assertIn(
+            "retry cooldown",
+            self._last_status_msg().detail,
+        )
+
+        # Once the bounded cooldown expires, the uncovered position may
+        # start a fresh final scan.
+        set_clock(100.81)
+        self.node.plan_callback(None)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+
+    def test_any_heading_timeout_does_not_allow_completion(self):
+        self.node.visual_coverage = PLANNING_NODE.VisualCoverageTracker(
+            enabled=True,
+            yaw_step=math.pi / 2.0,
+            yaw_tolerance=0.05,
+            dwell=0.0,
+            heading_timeout=0.05,
+            scan_timeout=20.0,
+            position_dedup_radius=1.0,
+            max_heading_retries=0,
+        )
+        self.node.visual_scan_dwell = 0.0
+
+        set_clock(100.0)
+        self.node.mapping_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.localization_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.map_callback(self._make_fully_known_map(100.1))
+        self.node.odom_callback(self._make_odom(100.1))
+
+        set_clock(100.2)
+        self.node.plan_callback(None)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+
+        # The very first required heading cannot be reached.  Exhausting
+        # its retry budget must terminate the entire scan immediately.
+        now = 100.3
+        set_clock(now)
+        odom = self._set_odom_yaw(
+            self._make_odom(now),
+            0.7,
+        )
+        self.node.odom_msg = odom
+        self.node.visual_scan_callback(None)
+
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertEqual(
+            self.node.visual_coverage.scanned_positions,
+            [],
+        )
+        self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertFalse(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+        self.assertFalse(self._last_status_msg().valid)
+        self.assertEqual(len(self._last_path().poses), 0)
+        self.assertIn(
+            "heading timed out",
+            self._last_status_msg().detail,
+        )
+
+    def test_generation_reset_clears_visual_coverage(self):
+        self.node.active_exploration_target = (2.5, 2.5)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+        self.assertTrue(self.node._handle_reached_exploration_target(odom))
+        self.node.visual_coverage.scanned_positions.append((4.0, 4.0))
+        self.node.visual_scan_checkpoint_path = FakePath()
+        self.node.visual_scan_checkpoint_goal = FakePoseStamped()
+
+        self.node._enter_new_generation("test_reset", FakeTime(101.0))
+        self.assertFalse(self.node.visual_coverage.active)
+        self.assertEqual(self.node.visual_coverage.scanned_positions, [])
+        self.assertIsNone(self.node.active_exploration_target)
+        self.assertIsNone(self.node.visual_scan_checkpoint_path)
+        self.assertIsNone(self.node.visual_scan_checkpoint_goal)
+        self.assertFalse(self.node.visual_scan_final_pending)
+
+    def test_planning_status_stays_running_during_scan_progress(self):
+        self.node.active_exploration_target = (2.5, 2.5)
+        odom = self._make_odom(100.1)
+        self.node.odom_msg = odom
+        set_clock(100.2)
+        self.node._handle_reached_exploration_target(odom)
+        self.node.visual_scan_callback(None)
+
+        status = self._last_status_msg()
+        self.assertEqual(status.state, FakeModuleStatus.RUNNING)
+        self.assertTrue(status.valid)
+
+    def test_floor_task_edge_cancels_path_and_discards_old_floor_caches(self):
+        self.node._exploration_complete_active = True
+        self.node.frontier_continuation_goal_cell = (3, 4)
+        self.node.visual_coverage.scanned_positions = [(1., 2.)]
+        state = FakeCompetitionState()
+        state.state = FakeCompetitionState.RUNNING
+        state.exploration_task_id = 'floor-task-one'
+        state.floor_exploration_active = True
+        old_generation = self.node.generation
+        self.node.competition_state_callback(state)
+        self.assertGreater(self.node.generation, old_generation)
+        self.assertIsNone(self.node.map_msg)
+        self.assertIsNone(self.node.odom_msg)
+        self.assertIsNone(self.node.frontier_continuation_goal_cell)
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertEqual(self.node.visual_coverage.scanned_positions, [])
+        self.assertEqual(self._last_path().poses, [])
+        self.assertFalse(self._published('/competition/planning/exploration_complete')[-1].data)
+        generation = self.node.generation
+        self.node.competition_state_callback(state)
+        self.assertEqual(self.node.generation, generation)
+        state.floor_exploration_active = False
+        self.node.competition_state_callback(state)
+        self.node.plan_callback(None)
+        self.assertEqual(self._last_path().poses, [])
+        state.exploration_task_id = 'floor-task-two'
+        state.floor_exploration_active = True
+        self.node.competition_state_callback(state)
+        self.assertTrue(self.node.initial_forward_complete)
+
+    def test_floor_completion_status_echo_requires_existing_debounce(self):
+        self.node.exploration_task_id = 'task'
+        self.node.publish_status(FakeModuleStatus.SUCCEEDED, False, 1., 'no frontier')
+        self.assertEqual(self._last_status_msg().exploration_task_id, 'task')
+        self.assertFalse(self._last_status_msg().exploration_complete)
+        self.node._exploration_complete_active = True
+        self.node.publish_status(FakeModuleStatus.SUCCEEDED, False, 1., 'no frontier')
+        self.assertTrue(self._last_status_msg().exploration_complete)
+        self.node.publish_status(FakeModuleStatus.TIMEOUT, False, 0., 'stale map')
+        self.assertFalse(self._last_status_msg().exploration_complete)
+
+    def test_returning_state_loads_public_start_and_uses_goal_planner(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scene_path = Path(temp_dir) / "team_scene_info.json"
+            scene_path.write_text(
+                json.dumps(
+                    {
+                        "coordinate_frame": "world",
+                        "robot_start": {
+                            "x": 2.5,
+                            "y": 2.5,
+                            "z": 0.0,
+                            "yaw": 0.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _reset_fake_ros(clock=100.0)
+            _STATE["params"]["team_scene_info_path"] = str(scene_path)
+            node = PLANNING_NODE.PlanningNode()
+            self.node = node
+            state = FakeCompetitionState()
+            state.state = FakeCompetitionState.RETURNING
+            node.competition_state_callback(state)
+            self.assertTrue(node.returning)
+            self.assertEqual(node.return_start_pose["x"], 2.5)
+
+            calls = []
+            original = PLANNING_NODE.plan_to_goal_region_with_status
+
+            def capture_goal(*args, **kwargs):
+                calls.append(kwargs)
+                return {
+                    "status": PLANNING_NODE.PLAN_SUCCESS,
+                    "goal_cell": (2, 2),
+                    "path": [(2, 2)],
+                    "frontier_count": 0,
+                    "start_recovery_used": False,
+                    "start_recovery_cell": None,
+                    "robot_cell_raw_value": 0,
+                    "robot_cell_inflated_value": 0,
+                }
+
+            PLANNING_NODE.plan_to_goal_region_with_status = capture_goal
+            try:
+                self._publish_healthy_generation(100.0)
+            finally:
+                PLANNING_NODE.plan_to_goal_region_with_status = original
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["goal_cell"], (2, 2))
+            self.assertEqual(calls[0]["goal_search_radius_cells"], 2)
+
+    def test_return_path_commit_republishes_planner_geometry_without_replanning(self):
+        """A committed route survives map churn only while inputs stay valid."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scene_path = Path(temp_dir) / "team_scene_info.json"
+            scene_path.write_text(
+                json.dumps(
+                    {
+                        "coordinate_frame": "world",
+                        "robot_start": {
+                            "x": 1.5,
+                            "y": 1.5,
+                            "z": 0.0,
+                            "yaw": 0.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _reset_fake_ros(clock=100.0)
+            _STATE["params"].update(
+                {
+                    "team_scene_info_path": str(scene_path),
+                    "return_path_commit_enabled": True,
+                    "map_timeout": 1.0,
+                    "localization_timeout": 2.0,
+                    "mapping_status_timeout": 3.0,
+                    "localization_status_timeout": 3.0,
+                    "future_stamp_tolerance": 0.2,
+                    "status_heartbeat_interval": 0.1,
+                }
+            )
+            self.node = PLANNING_NODE.PlanningNode()
+            state = FakeCompetitionState()
+            state.state = FakeCompetitionState.RETURNING
+            self.node.competition_state_callback(state)
+            self._publish_healthy_generation(100.0)
+
+            initial_path = self._last_path()
+            self.assertIsNotNone(initial_path)
+            self.assertIsNotNone(self.node.return_committed_path)
+            self.assertIn("RETURNING path", self._last_status_msg().detail)
+
+            original = PLANNING_NODE.plan_to_goal_region_with_status
+
+            def should_not_replan(*args, **kwargs):
+                raise AssertionError("committed return route was replanned")
+
+            PLANNING_NODE.plan_to_goal_region_with_status = should_not_replan
+            try:
+                self._publish_healthy_generation(101.0)
+            finally:
+                PLANNING_NODE.plan_to_goal_region_with_status = original
+
+            committed_path = self._last_path()
+            self.assertEqual(
+                len(committed_path.poses), len(initial_path.poses)
+            )
+            self.assertIn(
+                "RETURNING committed planner path",
+                self._last_status_msg().detail,
+            )
+
+            # A committed route is not a way around upstream safety gates.
+            # Invalid localization must still block the follower path.
+            set_clock(102.0)
+            self.node.localization_status_callback(
+                self._make_status(False, 102.0)
+            )
+            self.node.plan_callback(None)
+            self.assertEqual(len(self._last_path().poses), 0)
+            self.assertFalse(self._last_status_msg().valid)
+
+    def test_stuck_report_drops_commit_once_then_recommits(self):
+        """A stuck notice clears the committed route once; the next healthy
+        generation re-commits and a repeat stuck report is ignored (budget)."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scene_path = Path(temp_dir) / "team_scene_info.json"
+            scene_path.write_text(
+                json.dumps(
+                    {
+                        "coordinate_frame": "world",
+                        "robot_start": {
+                            "x": 1.5,
+                            "y": 1.5,
+                            "z": 0.0,
+                            "yaw": 0.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _reset_fake_ros(clock=100.0)
+            _STATE["params"].update(
+                {
+                    "team_scene_info_path": str(scene_path),
+                    "return_path_commit_enabled": True,
+                    "return_recommit_on_stuck_enabled": True,
+                    "map_timeout": 1.0,
+                    "localization_timeout": 2.0,
+                    "mapping_status_timeout": 3.0,
+                    "localization_status_timeout": 3.0,
+                    "future_stamp_tolerance": 0.2,
+                    "status_heartbeat_interval": 0.1,
+                }
+            )
+            self.node = PLANNING_NODE.PlanningNode()
+            state = FakeCompetitionState()
+            state.state = FakeCompetitionState.RETURNING
+            self.node.competition_state_callback(state)
+            self._publish_healthy_generation(100.0)
+            self.assertIsNotNone(self.node.return_committed_path)
+
+            # Stuck True -> committed route cleared, plan invalidated.
+            stuck = FakeBool(data=True)
+            self.node.stuck_callback(stuck)
+            self.assertIsNone(self.node.return_committed_path)
+            self.assertFalse(self._last_status_msg().valid)
+
+            # Healthy generation replans and re-commits (full A* ran).
+            self._publish_healthy_generation(101.0)
+            self.assertIsNotNone(self.node.return_committed_path)
+            # A following generation republishes the committed route.
+            self._publish_healthy_generation(102.0)
+            self.assertIn(
+                "RETURNING committed planner path",
+                self._last_status_msg().detail,
+            )
+
+            # Repeat stuck in the same epoch is ignored (budget used).
+            self.node.stuck_callback(stuck)
+            self.assertIsNotNone(self.node.return_committed_path)
+
+    def test_stuck_report_ignored_when_disabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scene_path = Path(temp_dir) / "team_scene_info.json"
+            scene_path.write_text(
+                json.dumps(
+                    {
+                        "coordinate_frame": "world",
+                        "robot_start": {
+                            "x": 1.5,
+                            "y": 1.5,
+                            "z": 0.0,
+                            "yaw": 0.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _reset_fake_ros(clock=100.0)
+            _STATE["params"].update(
+                {
+                    "team_scene_info_path": str(scene_path),
+                    "return_path_commit_enabled": True,
+                    "return_recommit_on_stuck_enabled": False,
+                    "map_timeout": 1.0,
+                    "localization_timeout": 2.0,
+                    "mapping_status_timeout": 3.0,
+                    "localization_status_timeout": 3.0,
+                    "future_stamp_tolerance": 0.2,
+                    "status_heartbeat_interval": 0.1,
+                }
+            )
+            self.node = PLANNING_NODE.PlanningNode()
+            state = FakeCompetitionState()
+            state.state = FakeCompetitionState.RETURNING
+            self.node.competition_state_callback(state)
+            self._publish_healthy_generation(100.0)
+            self.assertIsNotNone(self.node.return_committed_path)
+            self.node.stuck_callback(FakeBool(data=True))
+            self.assertIsNotNone(self.node.return_committed_path)
+
+    def test_exploration_blocked_nudge_publishes_short_blind_path(self):
+        """PLAN_UNREACHABLE in exploration publishes a bounded nudge path."""
+        _reset_fake_ros(clock=100.0)
+        _STATE["params"].update(
+            {
+                "exploration_blocked_nudge_enabled": True,
+                "exploration_blocked_nudge_distance": 2.0,
+                "map_timeout": 1.0,
+                "localization_timeout": 2.0,
+                "mapping_status_timeout": 3.0,
+                "localization_status_timeout": 3.0,
+                "future_stamp_tolerance": 0.2,
+                "status_heartbeat_interval": 0.1,
+            }
+        )
+        self.node = PLANNING_NODE.PlanningNode()
+
+        # Robot (2,2) in a small free pocket fully enclosed by known occupied
+        # cells (no reachable frontier).  A separate free region (bottom-right)
+        # has an unknown frontier boundary but is unreachable -> PLAN_UNREACHABLE.
+        enclosed = FakeOccupancyGrid()
+        enclosed.header.stamp = FakeTime(100.1)
+        enclosed.header.frame_id = "world"
+        enclosed.info.resolution = 1.0
+        enclosed.info.width = 9
+        enclosed.info.height = 9
+        enclosed.data = [
+            100,100,100,100,100,100,100,100,100,
+            100,  0,  0,100,100,100,100,100,100,
+            100,  0,  0,100,100,100,100,100,100,
+            100,100,100,100,100,100,100,100,100,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+             -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        ]
+        set_clock(100.0)
+        self.node.mapping_status_callback(self._make_status(True, 100.0))
+        self.node.localization_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.map_callback(enclosed)
+        self.node.odom_callback(self._make_odom(100.1))
+        set_clock(100.2)
+        self.node.plan_callback(None)
+
+        nudge_path = self._last_path()
+        self.assertIsNotNone(nudge_path)
+        self.assertGreaterEqual(len(nudge_path.poses), 2)
+        detail = self._last_status_msg().detail
+        self.assertIn("nudging toward nearest frontier", detail)
+
+    def test_exploration_blocked_nudge_disabled_falls_back_to_blocked(self):
+        _reset_fake_ros(clock=100.0)
+        _STATE["params"].update(
+            {
+                "exploration_blocked_nudge_enabled": False,
+                "map_timeout": 1.0,
+                "localization_timeout": 2.0,
+                "mapping_status_timeout": 3.0,
+                "localization_status_timeout": 3.0,
+                "future_stamp_tolerance": 0.2,
+                "status_heartbeat_interval": 0.1,
+            }
+        )
+        self.node = PLANNING_NODE.PlanningNode()
+        enclosed = FakeOccupancyGrid()
+        enclosed.header.stamp = FakeTime(100.1)
+        enclosed.header.frame_id = "world"
+        enclosed.info.resolution = 1.0
+        enclosed.info.width = 9
+        enclosed.info.height = 9
+        enclosed.data = [
+            100,100,100,100,100,100,100,100,100,
+            100,  0,  0,100,100,100,100,100,100,
+            100,  0,  0,100,100,100,100,100,100,
+            100,100,100,100,100,100,100,100,100,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+            100,100,100,  0,  0,  0,  0,  0, -1,
+             -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        ]
+        set_clock(100.0)
+        self.node.mapping_status_callback(self._make_status(True, 100.0))
+        self.node.localization_status_callback(
+            self._make_status(True, 100.0)
+        )
+        self.node.map_callback(enclosed)
+        self.node.odom_callback(self._make_odom(100.1))
+        set_clock(100.2)
+        self.node.plan_callback(None)
+        self.assertIn(
+            "none is currently reachable", self._last_status_msg().detail
+        )
+        self.assertFalse(self._last_status_msg().valid)
+
+    def test_start_recovery_parameter_is_forwarded_to_core(self):
+        _reset_fake_ros(clock=100.0)
+        _STATE["params"]["start_recovery_radius_cells"] = 1
+        self.node = PLANNING_NODE.PlanningNode()
+        calls = []
+        original = PLANNING_NODE.plan_to_frontier_with_status
+
+        def capture_start_recovery_radius(*args, **kwargs):
+            calls.append(kwargs)
+            return original(*args, **kwargs)
+
+        PLANNING_NODE.plan_to_frontier_with_status = (
+            capture_start_recovery_radius
+        )
+        try:
+            self._publish_healthy_generation(100.0)
+        finally:
+            PLANNING_NODE.plan_to_frontier_with_status = original
+
+        self.assertEqual(self.node.start_recovery_radius_cells, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["start_recovery_radius_cells"], 1)
+
+    def test_negative_start_recovery_parameter_is_rejected(self):
+        _reset_fake_ros(clock=100.0)
+        _STATE["params"]["start_recovery_radius_cells"] = -1
+        with self.assertRaisesRegex(
+            ValueError,
+            "start_recovery_radius_cells must not be negative",
+        ):
+            PLANNING_NODE.PlanningNode()
+
+    def test_delayed_pre_generation_map_is_dropped(self):
+        node = self.node
+
+        self._publish_healthy_generation(100.0)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 0)
+
+        # Mapping invalid opens generation 1 with boundary 101.0.
+        set_clock(101.0)
+        node.mapping_status_callback(self._make_status(False, 101.0))
+        self.assertEqual(node.generation, 1)
+        self.assertAlmostEqual(
+            node.generation_start_stamp.to_sec(),
+            101.0,
+        )
+        self.assertFalse(node.last_status[1])
+
+        # A repeated invalid heartbeat must not advance the generation
+        # or move the boundary again.
+        set_clock(101.1)
+        node.mapping_status_callback(self._make_status(False, 101.1))
+        self.assertEqual(node.generation, 1)
+        self.assertAlmostEqual(
+            node.generation_start_stamp.to_sec(),
+            101.0,
+        )
+
+        # Delayed old Map: stamp <= boundary but well inside map_timeout.
+        # It must be dropped without touching the generation.
+        set_clock(101.2)
+        node.map_callback(self._make_map(100.5))
+        self.assertIsNone(node.map_msg)
+        self.assertEqual(node.generation, 1)
+
+        # Fresh generation-1 Odometry and valid statuses alone must not
+        # recover: the current-generation Map is still missing.
+        set_clock(101.3)
+        node.odom_callback(self._make_odom(101.3))
+        node.mapping_status_callback(self._make_status(True, 101.2))
+        node.localization_status_callback(
+            self._make_status(True, 101.2)
+        )
+        set_clock(101.4)
+        node.plan_callback(None)
+        self.assertFalse(node.last_status[1])
+        self.assertEqual(node.generation, 1)
+
+        # Only a fresh Map after the boundary enables recovery.
+        set_clock(101.5)
+        node.map_callback(self._make_map(101.5))
+        set_clock(101.6)
+        node.plan_callback(None)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 1)
+        self.assertGreater(len(self._last_path().poses), 0)
+
+    def test_delayed_pre_generation_odometry_is_dropped(self):
+        node = self.node
+
+        self._publish_healthy_generation(100.0)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 0)
+
+        # Localization invalid opens generation 1 with boundary 101.0.
+        set_clock(101.0)
+        node.localization_status_callback(
+            self._make_status(False, 101.0)
+        )
+        self.assertEqual(node.generation, 1)
+        self.assertAlmostEqual(
+            node.generation_start_stamp.to_sec(),
+            101.0,
+        )
+        self.assertFalse(node.last_status[1])
+
+        # Delayed old Odometry: stamp <= boundary, dropped silently.
+        set_clock(101.2)
+        node.odom_callback(self._make_odom(100.5))
+        self.assertIsNone(node.odom_msg)
+        self.assertEqual(node.generation, 1)
+
+        # Fresh generation-1 Map and valid statuses alone must not
+        # recover: the current-generation Odometry is still missing.
+        set_clock(101.3)
+        node.map_callback(self._make_map(101.3))
+        node.mapping_status_callback(self._make_status(True, 101.2))
+        node.localization_status_callback(
+            self._make_status(True, 101.2)
+        )
+        set_clock(101.4)
+        node.plan_callback(None)
+        self.assertFalse(node.last_status[1])
+        self.assertEqual(node.generation, 1)
+
+        # Only a fresh Odometry after the boundary enables recovery.
+        set_clock(101.5)
+        node.odom_callback(self._make_odom(101.5))
+        set_clock(101.6)
+        node.plan_callback(None)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 1)
+        self.assertGreater(len(self._last_path().poses), 0)
+
+    def test_stamp_equal_to_generation_boundary_is_rejected(self):
+        node = self.node
+
+        self._publish_healthy_generation(100.0)
+        self.assertTrue(node.last_status[1])
+
+        set_clock(101.0)
+        node.mapping_status_callback(self._make_status(False, 101.0))
+        self.assertEqual(node.generation, 1)
+        self.assertAlmostEqual(
+            node.generation_start_stamp.to_sec(),
+            101.0,
+        )
+
+        # stamp == boundary exactly: rejected for both Map and Odometry.
+        set_clock(101.3)
+        node.map_callback(self._make_map(101.0))
+        self.assertIsNone(node.map_msg)
+        node.odom_callback(self._make_odom(101.0))
+        self.assertIsNone(node.odom_msg)
+        self.assertEqual(node.generation, 1)
+
+        # A stamp just after the boundary is admitted.
+        node.map_callback(self._make_map(101.0001))
+        self.assertIsNotNone(node.map_msg)
+        self.assertEqual(node.map_generation, 1)
+        node.odom_callback(self._make_odom(101.0001))
+        self.assertIsNotNone(node.odom_msg)
+        self.assertEqual(node.odom_generation, 1)
+
+    def test_repeated_stale_timestamp_opens_new_generations(self):
+        node = self.node
+
+        self._publish_healthy_generation(100.0)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 0)
+
+        # First stale Map: admitted by the boundary (stamp > time 0)
+        # but older than map_timeout, so the watchdog raises the
+        # generic timestamp fault and opens generation 1.
+        set_clock(102.0)
+        node.map_callback(self._make_map(100.8))
+        node.heartbeat_callback(None)
+        self.assertEqual(node.generation, 1)
+        self.assertIn(
+            "message_timestamp_invalid",
+            node.active_faults,
+        )
+        self.assertFalse(node.last_status[1])
+
+        # Complete recovery with all-fresh inputs clears the fault.
+        set_clock(102.5)
+        node.mapping_status_callback(self._make_status(True, 102.5))
+        node.localization_status_callback(
+            self._make_status(True, 102.5)
+        )
+        node.map_callback(self._make_map(102.6))
+        node.odom_callback(self._make_odom(102.6))
+        set_clock(102.7)
+        node.plan_callback(None)
+        self.assertTrue(node.last_status[1])
+        self.assertNotIn(
+            "message_timestamp_invalid",
+            node.active_faults,
+        )
+        self.assertEqual(node.generation, 1)
+
+        # A second independent stale message must open generation 2
+        # instead of being absorbed by a leftover active fault.
+        set_clock(104.0)
+        node.map_callback(self._make_map(102.9))
+        node.heartbeat_callback(None)
+        self.assertEqual(node.generation, 2)
+        self.assertAlmostEqual(
+            node.generation_start_stamp.to_sec(),
+            104.0,
+        )
+        self.assertFalse(node.last_status[1])
+
+    def test_stale_no_frontier_result_is_discarded(self):
+        node = self.node
+
+        # This boundary test exercises the asynchronous planner result, not
+        # the planner-local visual checkpoint trigger.  Disable the optional
+        # scan so a reached initial checkpoint cannot short-circuit the
+        # deliberately stale plan computation below.
+        node.visual_scan_enabled = False
+        node.visual_coverage.enabled = False
+        self._publish_healthy_generation(100.0)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 0)
+
+        original = PLANNING_NODE.plan_to_frontier_with_status
+
+        def stale_result(*args, **kwargs):
+            # Generation 2 opens while the old computation is running.
+            set_clock(102.0)
+            node.mapping_status_callback(
+                self._make_status(False, 102.0)
+            )
+            return {
+                "status": PLANNING_NODE.PLAN_NO_FRONTIER,
+                "goal_cell": None,
+                "path": None,
+                "cluster": None,
+                "frontier_count": 0,
+            }
+
+        PLANNING_NODE.plan_to_frontier_with_status = stale_result
+        try:
+            set_clock(101.0)
+            node.plan_callback(None)
+        finally:
+            PLANNING_NODE.plan_to_frontier_with_status = original
+
+        # The stale SUCCEEDED must not be published in generation 1.
+        self.assertEqual(node.generation, 1)
+        self.assertFalse(node.last_status[1])
+        for msg in self._published("/competition/planning/status"):
+            self.assertNotEqual(
+                msg.state,
+                PLANNING_NODE.ModuleStatus.SUCCEEDED,
+            )
+
+    def test_stale_unreachable_result_is_discarded(self):
+        node = self.node
+
+        # Keep this generation-boundary test focused on stale planner
+        # results; visual coverage has its own callback/timeout tests.
+        node.visual_scan_enabled = False
+        node.visual_coverage.enabled = False
+        self._publish_healthy_generation(100.0)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 0)
+
+        original = PLANNING_NODE.plan_to_frontier_with_status
+
+        def stale_result(*args, **kwargs):
+            # Generation 2 opens while the old computation is running.
+            set_clock(102.0)
+            node.localization_status_callback(
+                self._make_status(False, 102.0)
+            )
+            return {
+                "status": PLANNING_NODE.PLAN_UNREACHABLE,
+                "goal_cell": None,
+                "path": None,
+                "cluster": None,
+                "frontier_count": 3,
+            }
+
+        PLANNING_NODE.plan_to_frontier_with_status = stale_result
+        try:
+            set_clock(101.0)
+            node.plan_callback(None)
+        finally:
+            PLANNING_NODE.plan_to_frontier_with_status = original
+
+        # The stale BLOCKED must not overwrite the new generation's
+        # invalidation status.
+        self.assertEqual(node.generation, 1)
+        self.assertFalse(node.last_status[1])
+        last = self._last_status_msg()
+        self.assertIn("localization status is invalid", last.detail)
+        for msg in self._published("/competition/planning/status"):
+            self.assertNotIn(
+                "none is currently reachable",
+                msg.detail,
+            )
+
+    def test_delayed_old_mapping_valid_status_is_dropped(self):
+        node = self.node
+
+        self._publish_healthy_generation(100.0)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 0)
+
+        # Mapping invalid opens generation 1 (boundary 101.0).
+        set_clock(101.0)
+        node.mapping_status_callback(self._make_status(False, 101.0))
+        self.assertEqual(node.generation, 1)
+        self.assertIn("mapping_invalid", node.active_faults)
+        self.assertFalse(node.last_status[1])
+        self.assertAlmostEqual(
+            node.last_mapping_status_stamp.to_sec(),
+            101.0,
+        )
+
+        # A delayed old valid=true mapping status (stamp before the last
+        # accepted invalid one) must be dropped: it must not overwrite
+        # the stored status, clear the fault, or open a generation.
+        set_clock(101.2)
+        node.mapping_status_callback(self._make_status(True, 100.5))
+        self.assertFalse(node.mapping_status.valid)
+        self.assertIn("mapping_invalid", node.active_faults)
+        self.assertEqual(node.generation, 1)
+        self.assertAlmostEqual(
+            node.last_mapping_status_stamp.to_sec(),
+            101.0,
+        )
+
+        # Even with fresh current-generation Map and Odometry the stale
+        # valid status must not enable recovery.
+        set_clock(101.3)
+        node.map_callback(self._make_map(101.3))
+        node.odom_callback(self._make_odom(101.3))
+        set_clock(101.4)
+        node.plan_callback(None)
+        self.assertFalse(node.last_status[1])
+        self.assertEqual(node.generation, 1)
+
+        # A subsequent real invalid heartbeat must not force an extra
+        # generation: previous_valid stayed False because the delayed
+        # old valid status was dropped.
+        set_clock(101.6)
+        node.mapping_status_callback(self._make_status(False, 101.6))
+        self.assertEqual(node.generation, 1)
+        self.assertAlmostEqual(
+            node.generation_start_stamp.to_sec(),
+            101.0,
+        )
+        self.assertFalse(node.last_status[1])
+
+        # A fresh valid mapping status (strictly after the last accepted
+        # one) enables recovery within the same generation.
+        set_clock(101.7)
+        node.mapping_status_callback(self._make_status(True, 101.7))
+        self.assertNotIn("mapping_invalid", node.active_faults)
+        set_clock(101.8)
+        node.plan_callback(None)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 1)
+        self.assertGreater(len(self._last_path().poses), 0)
+
+    def test_delayed_old_localization_valid_status_is_dropped(self):
+        node = self.node
+
+        self._publish_healthy_generation(100.0)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 0)
+
+        # Localization invalid opens generation 1 (boundary 101.0).
+        set_clock(101.0)
+        node.localization_status_callback(
+            self._make_status(False, 101.0)
+        )
+        self.assertEqual(node.generation, 1)
+        self.assertIn("localization_invalid", node.active_faults)
+        self.assertFalse(node.last_status[1])
+        self.assertAlmostEqual(
+            node.last_localization_status_stamp.to_sec(),
+            101.0,
+        )
+
+        # A delayed old valid=true localization status is dropped without
+        # touching any state.
+        set_clock(101.2)
+        node.localization_status_callback(
+            self._make_status(True, 100.5)
+        )
+        self.assertFalse(node.localization_status.valid)
+        self.assertIn("localization_invalid", node.active_faults)
+        self.assertEqual(node.generation, 1)
+        self.assertAlmostEqual(
+            node.last_localization_status_stamp.to_sec(),
+            101.0,
+        )
+
+        # Fresh current-generation Map/Odometry cannot recover either.
+        set_clock(101.3)
+        node.map_callback(self._make_map(101.3))
+        node.odom_callback(self._make_odom(101.3))
+        set_clock(101.4)
+        node.plan_callback(None)
+        self.assertFalse(node.last_status[1])
+        self.assertEqual(node.generation, 1)
+
+        # No forced extra generation from a later real invalid heartbeat.
+        set_clock(101.6)
+        node.localization_status_callback(
+            self._make_status(False, 101.6)
+        )
+        self.assertEqual(node.generation, 1)
+        self.assertAlmostEqual(
+            node.generation_start_stamp.to_sec(),
+            101.0,
+        )
+
+        # A fresh valid localization status enables recovery.
+        set_clock(101.7)
+        node.localization_status_callback(
+            self._make_status(True, 101.7)
+        )
+        self.assertNotIn("localization_invalid", node.active_faults)
+        set_clock(101.8)
+        node.plan_callback(None)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 1)
+        self.assertGreater(len(self._last_path().poses), 0)
+
+    def test_older_invalid_status_does_not_overwrite_newer_valid(self):
+        node = self.node
+
+        self._publish_healthy_generation(100.0)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 0)
+
+        # A fresh valid status advances the per-stream baseline.
+        set_clock(101.0)
+        node.mapping_status_callback(self._make_status(True, 101.0))
+        self.assertTrue(node.mapping_status.valid)
+        statuses_before = len(
+            self._published("/competition/planning/status")
+        )
+
+        # A delayed older invalid status (stamp < last accepted) must be
+        # dropped: it must not overwrite the newer valid status, open a
+        # generation, or publish an invalidation.
+        set_clock(101.2)
+        node.mapping_status_callback(self._make_status(False, 100.5))
+        self.assertTrue(node.mapping_status.valid)
+        self.assertNotIn("mapping_invalid", node.active_faults)
+        self.assertEqual(node.generation, 0)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(
+            len(self._published("/competition/planning/status")),
+            statuses_before,
+        )
+        self.assertAlmostEqual(
+            node.last_mapping_status_stamp.to_sec(),
+            101.0,
+        )
+
+    def test_duplicate_status_stamp_is_dropped(self):
+        node = self.node
+
+        self._publish_healthy_generation(100.0)
+        self.assertTrue(node.last_status[1])
+
+        # Mapping invalid at 101.0 advances the baseline to 101.0.
+        set_clock(101.0)
+        node.mapping_status_callback(self._make_status(False, 101.0))
+        self.assertEqual(node.generation, 1)
+        statuses_before = len(
+            self._published("/competition/planning/status")
+        )
+
+        # A re-delivered status with stamp == last accepted stamp is
+        # dropped: no state change, no new publication, no generation.
+        set_clock(101.2)
+        node.mapping_status_callback(self._make_status(False, 101.0))
+        self.assertEqual(node.generation, 1)
+        self.assertIn("mapping_invalid", node.active_faults)
+        self.assertEqual(
+            len(self._published("/competition/planning/status")),
+            statuses_before,
+        )
+        self.assertAlmostEqual(
+            node.last_mapping_status_stamp.to_sec(),
+            101.0,
+        )
+
+        # The first strictly newer status is accepted again.
+        set_clock(101.3)
+        node.mapping_status_callback(self._make_status(True, 101.3))
+        self.assertTrue(node.mapping_status.valid)
+        self.assertNotIn("mapping_invalid", node.active_faults)
+        self.assertEqual(node.generation, 1)
+
+    def test_clock_rollback_resets_status_baselines(self):
+        node = self.node
+
+        self._publish_healthy_generation(100.0)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 0)
+
+        # Clock rolls back to 90.0: the rollback generation opens and
+        # both per-stream baselines reset for the new timeline.
+        set_clock(90.0)
+        node.heartbeat_callback(None)
+        self.assertEqual(node.generation, 1)
+        self.assertIsNone(node.last_mapping_status_stamp)
+        self.assertIsNone(node.last_localization_status_stamp)
+        self.assertFalse(node.last_status[1])
+        self.assertIn(
+            "moved backwards",
+            self._last_status_msg().detail,
+        )
+
+        # A status on the new timeline (stamp 91.0, lower than the
+        # pre-rollback baseline 100.0) must be accepted; without the
+        # baseline reset it would have been dropped as out-of-order.
+        set_clock(91.0)
+        node.mapping_status_callback(self._make_status(True, 91.0))
+        node.localization_status_callback(
+            self._make_status(True, 91.0)
+        )
+        self.assertTrue(node.mapping_status.valid)
+        self.assertAlmostEqual(
+            node.last_mapping_status_stamp.to_sec(),
+            91.0,
+        )
+        self.assertAlmostEqual(
+            node.last_localization_status_stamp.to_sec(),
+            91.0,
+        )
+
+        # Fresh current-generation data after the new boundary (90.0)
+        # enables recovery on the new timeline.
+        set_clock(91.1)
+        node.map_callback(self._make_map(91.1))
+        node.odom_callback(self._make_odom(91.1))
+        set_clock(91.2)
+        node.plan_callback(None)
+        self.assertTrue(node.last_status[1])
+        self.assertGreater(len(self._last_path().poses), 0)
+
+    def test_same_generation_input_update_still_commits(self):
+        """Regression for the C2R2 live-integration starvation.
+
+        A completed planning result must still commit when fresh map/odom
+        objects arrive DURING planning while the generation is unchanged
+        (no rollback, no invalid upstream status, no timeout).
+
+        Pre-fix, ``plan_and_publish`` required ``self.map_msg is map_msg``
+        and ``self.odom_msg is odom_msg`` (object identity), so under live
+        odom streaming (~9 Hz) every plan was discarded and
+        /competition/path never advanced past its first commit (fix-C2R2
+        evidence: zero fresh paths, zero raw/guarded cmd_vel, no motion).
+        Post-fix the commit check uses map_generation / odom_generation.
+        """
+        node = self.node
+
+        self._publish_healthy_generation(100.0)
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 0)
+        self.assertIsNotNone(self._last_path())
+        paths_before = len(self._published("/competition/path"))
+
+        original = PLANNING_NODE.plan_to_frontier_with_status
+
+        def commit_with_mid_plan_input_update(*args, **kwargs):
+            # Compute the real plan from the captured snapshot, then
+            # simulate a live robot: fresh odom + map objects arrive
+            # while the result is still in flight.
+            result = original(*args, **kwargs)
+            set_clock(100.4)
+            node.odom_callback(self._make_odom(100.4))
+            node.map_callback(self._make_map(100.4))
+            return result
+
+        PLANNING_NODE.plan_to_frontier_with_status = (
+            commit_with_mid_plan_input_update
+        )
+        try:
+            set_clock(100.3)
+            node.plan_callback(None)
+        finally:
+            PLANNING_NODE.plan_to_frontier_with_status = original
+
+        # Same-generation instance updates must not starve the commit.
+        self.assertEqual(
+            len(self._published("/competition/path")),
+            paths_before + 1,
+        )
+        self.assertTrue(node.last_status[1])
+        self.assertEqual(node.generation, 0)
+
+
+class RoomMissionCompletionTest(unittest.TestCase):
+    """Deterministic tests for the room-mission terminal completion gate.
+
+    The drive owns the route while it runs, so the floor could never complete:
+    reaching the last service point only held position.  These tests pin the
+    required lifecycle ``final service -> exploration_complete`` and the
+    bounded wedged-target recovery that goes with it.
+    """
+
+    TARGETS = [(1.5, 1.5), (3.5, 3.5)]
+
+    def setUp(self):
+        _reset_fake_ros(clock=100.0)
+        _STATE["params"].update(
+            {
+                "map_timeout": 1.0,
+                "localization_timeout": 2.0,
+                "mapping_status_timeout": 3.0,
+                "localization_status_timeout": 3.0,
+                "future_stamp_tolerance": 0.2,
+                "status_heartbeat_interval": 0.1,
+                "replan_interval": 2.0,
+                "room_mission_enabled": True,
+                "room_mission_targets": json.dumps(self.TARGETS),
+                "visual_scan_enabled": True,
+                "visual_scan_yaw_step": math.pi / 2.0,
+                "visual_scan_yaw_tolerance": 0.1,
+                "visual_scan_dwell": 0.1,
+                "visual_scan_heading_timeout": 2.0,
+                "visual_scan_timeout": 20.0,
+                "visual_scan_max_heading_retries": 0,
+            }
+        )
+        self.node = PLANNING_NODE.PlanningNode()
+
+    @staticmethod
+    def _make_free_map(stamp):
+        msg = FakeOccupancyGrid()
+        msg.header.stamp = FakeTime(stamp)
+        msg.header.frame_id = "world"
+        msg.info.resolution = 1.0
+        msg.info.width = 5
+        msg.info.height = 5
+        msg.data = [0] * 25
+        return msg
+
+    @staticmethod
+    def _odom_at(stamp, x, y):
+        msg = FakeOdometry()
+        msg.header.stamp = FakeTime(stamp)
+        msg.header.frame_id = "world"
+        msg.child_frame_id = "base"
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        msg.pose.pose.orientation.w = 1.0
+        return msg
+
+    @staticmethod
+    def _status(valid, stamp):
+        msg = FakeModuleStatus()
+        msg.header.stamp = FakeTime(stamp)
+        msg.state = (
+            FakeModuleStatus.RUNNING if valid else FakeModuleStatus.BLOCKED
+        )
+        msg.valid = valid
+        msg.confidence = 1.0 if valid else 0.0
+        msg.detail = "test"
+        return msg
+
+    def _published(self, topic):
+        return _STATE["published"].get(topic, [])
+
+    def _last_status_msg(self):
+        return self._published("/competition/planning/status")[-1]
+
+    def _complete_published(self):
+        return [
+            message.data
+            for message in self._published(
+                "/competition/planning/exploration_complete"
+            )
+            if message.data
+        ]
+
+    def _cycle(self, now, x, y):
+        """Publish one fully healthy generation and run one planning tick.
+
+        Returns the clock value this cycle ended on, so callers can keep
+        simulated time monotonic (a rollback would open a new generation and
+        legitimately reset the drive).
+        """
+        set_clock(now)
+        self.node.mapping_status_callback(self._status(True, now))
+        self.node.localization_status_callback(self._status(True, now))
+        self.node.map_callback(self._make_free_map(now + 0.1))
+        self.node.odom_callback(self._odom_at(now + 0.1, x, y))
+        set_clock(now + 0.2)
+        self.node.plan_callback(None)
+        return now + 0.2
+
+    def _finish_active_visual_scan(self, start):
+        """Drive the active scan to completion with deterministic odometry."""
+        now = start
+        while self.node.visual_coverage.active:
+            set_clock(now)
+            yaw = self.node.visual_coverage.current_heading
+            odom = self._odom_at(now, 3.5, 3.5)
+            odom.pose.pose.orientation.z = math.sin(yaw / 2.0)
+            odom.pose.pose.orientation.w = math.cos(yaw / 2.0)
+            self.node.odom_callback(odom)
+            self.node.visual_scan_callback(None)
+            now += 0.01
+        return now
+
+    def test_drive_keeps_running_while_targets_remain(self):
+        # Mid-route: neither target is within arrival range, so the drive keeps
+        # its index and never claims terminal completion.
+        self._cycle(100.0, 2.5, 2.5)
+        self.assertEqual(self.node.room_mission_idx, 0)
+        self.assertFalse(self.node.room_mission_terminal)
+
+    def test_final_target_latches_terminal_instead_of_holding_route(self):
+        now = self._cycle(100.0, 1.5, 1.5)
+        self.assertEqual(self.node.room_mission_idx, len(self.TARGETS) - 1)
+        self.assertFalse(self.node.room_mission_terminal)
+
+        self._cycle(now + 0.1, 3.5, 3.5)
+        self.assertTrue(self.node.room_mission_terminal)
+        # The terminal gate must not publish a drive route; it starts the
+        # final visual exposure first (the drive path is never latched).
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertEqual(self._complete_published(), [])
+
+    def test_terminal_gate_completes_only_after_final_scan_and_debounce(self):
+        self.node.room_mission_idx = len(self.TARGETS) - 1
+        self.node.room_mission_terminal = True
+        now = self._cycle(100.0, 3.5, 3.5)
+
+        self.assertTrue(self.node.visual_coverage.active)
+        self.assertTrue(self.node.visual_scan_final_pending)
+        self.assertFalse(self.node._exploration_complete_active)
+        self.assertEqual(self._complete_published(), [])
+
+        now = self._finish_active_visual_scan(now + 0.1)
+        self.assertFalse(self.node.visual_scan_final_pending)
+
+        for _ in range(3):
+            now = self._cycle(now + 0.1, 3.5, 3.5)
+
+        self.assertTrue(self.node._exploration_complete_active)
+        self.assertEqual(self._complete_published(), [True])
+        # The confirming status the floor lifecycle consumes is published by
+        # the same SUCCEEDED commit, so the proof and the Bool edge agree.
+        self.assertEqual(
+            self._last_status_msg().state,
+            FakeModuleStatus.SUCCEEDED,
+        )
+        self.assertTrue(self._last_status_msg().exploration_complete)
+
+    def test_heartbeat_reasserts_completion_level_for_freshness(self):
+        """The floor lifecycle needs jointly-fresh Bool and status evidence."""
+        self._cycle(100.0, 2.5, 2.5)
+        before = len(self._complete_published())
+        self.node._exploration_complete_active = True
+        self.node.last_status = (
+            FakeModuleStatus.SUCCEEDED,
+            False,
+            1.0,
+            "room mission complete: no further route",
+        )
+        set_clock(100.3)
+        self.node.heartbeat_callback(None)
+        self.assertEqual(len(self._complete_published()), before + 1)
+        self.assertTrue(self._published(
+            "/competition/planning/exploration_complete"
+        )[-1].data)
+        self.assertTrue(self._last_status_msg().exploration_complete)
+        self.assertEqual(
+            self._last_status_msg().state,
+            FakeModuleStatus.SUCCEEDED,
+        )
+
+        # A stale-upstream heartbeat withdraws the completion evidence rather
+        # than re-asserting it, so the floor cannot complete on stale inputs.
+        set_clock(200.0)
+        self.node.heartbeat_callback(None)
+        self.assertFalse(self._last_status_msg().exploration_complete)
+
+    def test_stuck_skips_wedged_target_once_per_budget(self):
+        _reset_fake_ros(clock=100.0)
+        _STATE["params"].update(
+            {
+                "map_timeout": 1.0,
+                "localization_timeout": 2.0,
+                "mapping_status_timeout": 3.0,
+                "localization_status_timeout": 3.0,
+                "future_stamp_tolerance": 0.2,
+                "status_heartbeat_interval": 0.1,
+                "room_mission_enabled": True,
+                "room_mission_targets": json.dumps(self.TARGETS),
+                "room_mission_stuck_skip_limit": 1,
+            }
+        )
+        node = PLANNING_NODE.PlanningNode()
+        self.assertEqual(node.room_mission_stuck_skip_limit, 1)
+
+        node.stuck_callback(FakeBool(data=True))
+        self.assertEqual(node.room_mission_idx, 1)
+        self.assertEqual(node.room_mission_stuck_skips, 1)
+
+        # Budget exhausted: a repeat report must not move the route again.
+        node.room_mission_idx = 0
+        node.stuck_callback(FakeBool(data=True))
+        self.assertEqual(node.room_mission_idx, 0)
+        self.assertEqual(node.room_mission_stuck_skips, 1)
+
+    def test_stuck_never_skips_past_the_final_target(self):
+        self.node.room_mission_idx = len(self.TARGETS) - 1
+        self.node.stuck_callback(FakeBool(data=True))
+        self.assertEqual(self.node.room_mission_idx, len(self.TARGETS) - 1)
+        self.assertEqual(self.node.room_mission_stuck_skips, 0)
+
+    def test_stuck_ignored_when_room_mission_disabled(self):
+        _reset_fake_ros(clock=100.0)
+        _STATE["params"].update(
+            {
+                "map_timeout": 1.0,
+                "localization_timeout": 2.0,
+                "mapping_status_timeout": 3.0,
+                "localization_status_timeout": 3.0,
+                "future_stamp_tolerance": 0.2,
+                "status_heartbeat_interval": 0.1,
+            }
+        )
+        node = PLANNING_NODE.PlanningNode()
+        node.stuck_callback(FakeBool(data=True))
+        self.assertEqual(node.room_mission_idx, 0)
+        self.assertEqual(node.room_mission_stuck_skips, 0)
+
+    def test_terminal_latch_resets_at_generation_boundary(self):
+        self.node.room_mission_terminal = True
+        self.node.room_mission_stuck_skips = 2
+        self.node._reset_visual_coverage_locked()
+        self.assertFalse(self.node.room_mission_terminal)
+        self.assertEqual(self.node.room_mission_stuck_skips, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
