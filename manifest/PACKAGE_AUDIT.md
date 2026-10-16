@@ -9,9 +9,12 @@ PACKAGE_SHA256          = 见包外 sidecar 文件
                           /home/ubuntu/哈尔滨工业大学（深圳）-黄誉铭-危境智巡--面向高危未知场景的四足机器人自主探测导航系统-核心代码.zip.sha256
                           （本文件位于 ZIP 内部，容器哈希无法自指，故不在此写入；
                             该文件与环境自校验的摘要见下方 PACKAGE_SOURCE_DIGEST）
-PACKAGE_SOURCE_DIGEST   = dd6638acec7f2698390183bf02ab3e71d11a12e34b614281b5b0c3ab1b7b2dd5
+PACKAGE_SOURCE_DIGEST   = d669d4185367e9aad39c8200fdde86320cf1ffd8ca801c83838c66f7fe51110a
                           （= 包内**除 manifest/ 之外**全部文件的 SHA256 逐行清单再做一次 SHA256，
                             可自校验；复现命令见本文件第 7 节末）
+                          【安全净化后重新计算；**原始提交包**的对应值为
+                            dd6638acec7f2698390183bf02ab3e71d11a12e34b614281b5b0c3ab1b7b2dd5】
+                          净化说明与影响清单见本文件第 9 节
 
 BASELINE_A_SOURCE       = /home/ubuntu/SimEnv-floor0-video-return-v1
                           （branch video/huangym/floor0-double-pass-v1，BASE 3503f44e617385c56f264875575d8ca8b68c3b36，
@@ -26,7 +29,9 @@ BASELINE_B_SOURCE       = /home/ubuntu/SimEnv-competition-complete-v1
 BASELINE_B_HEAD         = ba662d2ef233250b4c3d79aaa44616ceea37afbc
 BASELINE_B_COMMENT_ONLY = true（来源已有较完整中文注释，仅对 17 个无中文文件补充简要模块说明）
 
-FILE_COUNT              = 2492
+FILE_COUNT              = 1551
+                          【安全净化后重新统计；**原始提交包**为 2492。
+                            两者差额 941 = 安全净化移除的文件数，明细见第 9 节】
 TEST_FILE_COUNT         = 0
 BROKEN_SYMLINK_COUNT    = 0（在 ROS Noetic 运行环境内实测；见第 5 节 G 项）
 MISSING_RUNTIME_FILE_COUNT = 0（见第 5 节 B/C/F 项）
@@ -250,3 +255,53 @@ SIMULATION_RUN                           = NOT RUN
 
 READY_FOR_SUBMISSION                     = true
 ```
+
+---
+
+## 9. 安全净化后再生成说明（2026-10-16）
+
+> 本节由安全净化流程追加。**第 1–8 节的构建与静态检查结论均针对"原始提交包"**；
+> 净化后**未重跑** `catkin_make` 与静态检查（见 9.3），**不得**视为对净化后包体的验证。
+
+### 9.1 净化性质
+
+本次净化对提交包**仅做删除**，未修改任何源码语句、参数、ROS 接口、消息 schema 或
+launch 运行语义。唯一的非删除改动是 `docs/附录A_素材.md` 的 `src/` 目录树清单中，
+移除已删除的 `uav_simulator/` 一行（因该目录已不存在）。
+
+### 9.2 移除清单（941 个常规文件）
+
+| 类别 | 数量 | 原因 |
+|---|---|---|
+| `src/uav_simulator/`（含两基线内同名路径） | 860 | **许可证不可确认**：`local_sensing`、`mockamap` 声明 **GPLv3**；`map_generator` 声明 **`TODO`**（等于未声明许可证）。经全仓引用检索（`git grep` 全部子包名 + `add_subdirectory`/`find_package`/launch/Docker/脚本），确认其**不被任何构建或运行入口引用** |
+| `*/artifacts/review/pr16-safety-hardening-v1/` | 24 | 内部代码评审材料，非公开发布所需 |
+| `*/src/generated_building/` | 22 | 运行时随机生成的场景产物，非源码 |
+| `*/docs/team/` | 16 | 内部团队协作文档 |
+| `*/reports/` | 13 | 内部实验与过程报告 |
+| `*/src/**/.vscode/` | 6 | IDE 配置（含 vendored 第三方仓库内的实例） |
+| **合计** | **941** | |
+
+### 9.3 未重跑的验证（如实声明）
+
+| 项 | 状态 |
+|---|---|
+| `BUILD_SINGLE_FLOOR` / `BUILD_FULL_COMPETITION` | 第 3 节结论针对**原始提交包**（2492 文件、221 个 catkin 目标）。净化后**未重跑**。移除 `uav_simulator` 会使 catkin 目标总数下降，但经引用检索确认无外部依赖，**理论上不影响其余目标**——此为推断，**非实测结论** |
+| `STATIC_CHECK_SINGLE_FLOOR` / `STATIC_CHECK_FULL_COMPETITION` | 同上，净化后**未重跑** |
+| `SIMULATION_RUN` | 仍为 `NOT RUN` |
+| `FILE_COUNT` / `PACKAGE_SOURCE_DIGEST` | 已按净化后实际内容**重新计算**（见本文件头部字段） |
+
+### 9.4 哈希口径（务必区分）
+
+- 本文件头部 `PACKAGE_SOURCE_DIGEST` 与 `manifest/SHA256SUMS.txt` 中的全部哈希，
+  均为**净化后**文件的重新计算结果。
+- **不得**将其与"原始提交包"的哈希混用或互相印证。原始提交包对应值为：
+
+```text
+原始 FILE_COUNT                = 2492
+原始 PACKAGE_SOURCE_DIGEST     = dd6638acec7f2698390183bf02ab3e71d11a12e34b614281b5b0c3ab1b7b2dd5
+原始 manifest/SHA256SUMS.txt   SHA256 = 2952c6b7a3e38be8ac0677f287e12d18f229f213f109e16ffd5363e373f83132
+原始 manifest/FILE_MANIFEST.txt SHA256 = c1da57eaf16bf4dd471414755d4f4f8e0f00b28e87bcf4984113e236246a26ab
+原始 manifest/PACKAGE_AUDIT.md  SHA256 = b7804671fb526ded09342e3efbf7aa6bf6466c5077e4fc2254c48baba59618c8
+```
+
+以上原始文件已备份于**私有不公开的审计目录**（未随本次提交发布）。

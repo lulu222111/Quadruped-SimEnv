@@ -103,8 +103,7 @@ src/
 ├── fast_lio/                     # LiDAR-惯性里程计（子模块，已实体化）
 ├── livox_ros_driver/             # Livox 驱动（子模块，已实体化）
 ├── Mid360_imu_sim/               # Gazebo 激光仿真插件与 Mid-360 模型
-├── unitree_guide/                # A1 四足模型/控制器（junior_ctrl，含 RL 策略权重）
-└── uav_simulator/                # 通用仿真工具与插件（PCL/可视化/工具库）
+└── unitree_guide/                # A1 四足模型/控制器（junior_ctrl，含 RL 策略权重）
 ```
 
 模式 B（`baseline_full_competition/`）目录结构相同，差异在包内文件：
